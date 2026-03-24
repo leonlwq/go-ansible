@@ -12,29 +12,38 @@ import (
 	"go-ansible/pkg/variable"
 )
 
+// pendingHandler 待执行的 handler
+type pendingHandler struct {
+	handler *Handler
+	host    *inventory.Host
+	vars    map[string]interface{}
+}
+
 // Executor Playbook 执行器
 type Executor struct {
-	inventory  *inventory.Inventory
-	pool       *ssh.ConnectionPool
-	registry   *module.Registry
-	varManager *variable.Manager
-	facts      map[string]map[string]interface{}
-	extraVars  map[string]interface{}
-	tags       []string
-	verbose    bool
-	mu         sync.RWMutex
+	inventory       *inventory.Inventory
+	pool            *ssh.ConnectionPool
+	registry        *module.Registry
+	varManager      *variable.Manager
+	facts           map[string]map[string]interface{}
+	extraVars       map[string]interface{}
+	tags            []string
+	verbose         bool
+	pendingHandlers []pendingHandler
+	mu              sync.RWMutex
 }
 
 // NewExecutor 创建新的执行器
 func NewExecutor(inv *inventory.Inventory) *Executor {
 	return &Executor{
-		inventory:  inv,
-		pool:       ssh.NewConnectionPool(nil),
-		registry:   module.NewRegistry(),
-		varManager: variable.NewManager(),
-		facts:      make(map[string]map[string]interface{}),
-		extraVars:  make(map[string]interface{}),
-		tags:       make([]string, 0),
+		inventory:       inv,
+		pool:            ssh.NewConnectionPool(nil),
+		registry:        module.NewRegistry(),
+		varManager:      variable.NewManager(),
+		facts:           make(map[string]map[string]interface{}),
+		extraVars:       make(map[string]interface{}),
+		tags:            make([]string, 0),
+		pendingHandlers: make([]pendingHandler, 0),
 	}
 }
 
@@ -187,7 +196,7 @@ func (e *Executor) ExecutePlay(play *Play) (*PlayResult, error) {
 			hostResult := e.getHostResult(result, host.Name)
 			for _, task := range play.PreTasks {
 				fmt.Printf("[EXECUTOR] Executing pre-task: %s\n", task.Name)
-				taskResults, _ := e.executeTask(host, task, playVars)
+				taskResults, _ := e.executeTask(host, task, playVars, play.Handlers)
 				hostResult.Tasks = append(hostResult.Tasks, taskResults...)
 			}
 		}
@@ -200,7 +209,7 @@ func (e *Executor) ExecutePlay(play *Play) (*PlayResult, error) {
 			hostResult := e.getHostResult(result, host.Name)
 			for _, task := range play.Tasks {
 				fmt.Printf("[EXECUTOR] Executing task: %s, Module: %s, Tags: %v\n", task.Name, task.ModuleName, task.Tags)
-				taskResults, _ := e.executeTask(host, task, playVars)
+				taskResults, _ := e.executeTask(host, task, playVars, play.Handlers)
 				for _, tr := range taskResults {
 					if tr != nil {
 						fmt.Printf("[EXECUTOR] Task result: Name=%s, Skipped=%v, Failed=%v, Changed=%v\n", tr.Name, tr.Skipped, tr.Failed, tr.Changed)
@@ -218,10 +227,161 @@ func (e *Executor) ExecutePlay(play *Play) (*PlayResult, error) {
 			hostResult := e.getHostResult(result, host.Name)
 			for _, task := range play.PostTasks {
 				fmt.Printf("[EXECUTOR] Executing post-task: %s\n", task.Name)
-				taskResults, _ := e.executeTask(host, task, playVars)
+				taskResults, _ := e.executeTask(host, task, playVars, play.Handlers)
 				hostResult.Tasks = append(hostResult.Tasks, taskResults...)
 			}
 		}
+	}
+
+	// 执行 pending handlers（去重）
+	fmt.Printf("[EXECUTOR] Pending handlers count: %d\n", len(e.pendingHandlers))
+	if len(e.pendingHandlers) > 0 {
+		// 去重：同一个 handler 对同一个 host 只执行一次
+		executedHandlers := make(map[string]bool)
+
+		for _, ph := range e.pendingHandlers {
+			handlerKey := fmt.Sprintf("%s-%s", ph.handler.Name, ph.host.Name)
+			if executedHandlers[handlerKey] {
+				fmt.Printf("[EXECUTOR] Handler already executed: %s\n", handlerKey)
+				continue
+			}
+			executedHandlers[handlerKey] = true
+
+			hostResult := e.getHostResult(result, ph.host.Name)
+			fmt.Printf("[EXECUTOR] Executing handler: %s on host: %s\n", ph.handler.Name, ph.host.Name)
+
+			// 检查 handler 是否有 loop/with_items
+			if ph.handler.Loop != nil {
+				fmt.Printf("[EXECUTOR] Handler has with_items, executing loop\n")
+				items := e.evaluateLoop(ph.handler.Loop, ph.vars)
+				fmt.Printf("[EXECUTOR] Handler items: %v\n", items)
+
+				for _, item := range items {
+					// 先解析 item 中的变量
+					resolvedItem := e.resolveValue(item, ph.vars)
+
+					loopVars := make(map[string]interface{})
+					for k, v := range ph.vars {
+						loopVars[k] = v
+					}
+					loopVars["item"] = resolvedItem
+
+					// 替换变量
+					params := e.resolveVariables(ph.handler.Params, loopVars)
+					fmt.Printf("[EXECUTOR] Handler params with item: %+v\n", params)
+
+					// 添加 become 参数
+					if ph.host.Become {
+						params["become"] = true
+					}
+
+					fmt.Printf("[EXECUTOR] Getting module: %s\n", ph.handler.ModuleName)
+					mod, err := e.registry.Get(ph.handler.ModuleName)
+					if err != nil {
+						fmt.Printf("[EXECUTOR] Handler module not found: %s, error: %v\n", ph.handler.ModuleName, err)
+						continue
+					}
+
+					fmt.Println("[EXECUTOR] Getting SSH client for handler...")
+					client := e.getOrCreateClient(ph.host)
+					if client == nil {
+						fmt.Println("[EXECUTOR] Failed to create SSH client for handler")
+						continue
+					}
+					fmt.Println("[EXECUTOR] SSH client ready, executing handler...")
+
+					modResult, err := mod.Execute(client, params)
+					if err != nil {
+						fmt.Printf("[EXECUTOR] Handler execution error: %v\n", err)
+					} else {
+						fmt.Println("[EXECUTOR] Handler execution completed")
+					}
+
+					taskResult := &TaskResult{
+						Name:  ph.handler.Name,
+						Host:  ph.host.Name,
+						Item:  resolvedItem,
+						Start: time.Now(),
+					}
+
+					if err != nil {
+						taskResult.Failed = true
+						taskResult.Message = err.Error()
+					}
+
+					if modResult != nil {
+						taskResult.Changed = modResult.Changed
+						taskResult.Stdout = modResult.Stdout
+						taskResult.Stderr = modResult.Stderr
+						taskResult.ExitCode = modResult.ExitCode
+					}
+
+					taskResult.End = time.Now()
+					hostResult.Tasks = append(hostResult.Tasks, taskResult)
+				}
+			} else {
+				// 没有 loop，直接执行
+				handler := &Task{
+					Name:       ph.handler.Name,
+					ModuleName: ph.handler.ModuleName,
+					Params:     ph.handler.Params,
+				}
+
+				// 替换变量
+				params := e.resolveVariables(handler.Params, ph.vars)
+				fmt.Printf("[EXECUTOR] Handler params: %+v\n", params)
+
+				// 添加 become 参数
+				if ph.host.Become {
+					params["become"] = true
+				}
+
+				fmt.Printf("[EXECUTOR] Getting module: %s\n", handler.ModuleName)
+				mod, err := e.registry.Get(handler.ModuleName)
+				if err != nil {
+					fmt.Printf("[EXECUTOR] Handler module not found: %s, error: %v\n", handler.ModuleName, err)
+					continue
+				}
+				fmt.Printf("[EXECUTOR] Module found: %s\n", handler.ModuleName)
+
+				fmt.Println("[EXECUTOR] Getting SSH client for handler...")
+				client := e.getOrCreateClient(ph.host)
+				if client == nil {
+					fmt.Println("[EXECUTOR] Failed to create SSH client for handler")
+					continue
+				}
+				fmt.Println("[EXECUTOR] SSH client ready, executing handler...")
+
+				modResult, err := mod.Execute(client, params)
+				if err != nil {
+					fmt.Printf("[EXECUTOR] Handler execution error: %v\n", err)
+				} else {
+					fmt.Println("[EXECUTOR] Handler execution completed")
+				}
+
+				taskResult := &TaskResult{
+					Name:  handler.Name,
+					Host:  ph.host.Name,
+					Start: time.Now(),
+				}
+
+				if err != nil {
+					taskResult.Failed = true
+					taskResult.Message = err.Error()
+				}
+
+				if modResult != nil {
+					taskResult.Changed = modResult.Changed
+					taskResult.Stdout = modResult.Stdout
+					taskResult.Stderr = modResult.Stderr
+					taskResult.ExitCode = modResult.ExitCode
+				}
+
+				taskResult.End = time.Now()
+				hostResult.Tasks = append(hostResult.Tasks, taskResult)
+			}
+		}
+		e.pendingHandlers = make([]pendingHandler, 0)
 	}
 
 	return result, nil
@@ -300,7 +460,7 @@ func getMapKeys2(m map[string]*inventory.Host) []string {
 }
 
 // executeTask 执行单个任务，返回结果列表（循环任务会返回多个结果）
-func (e *Executor) executeTask(host *inventory.Host, task *Task, vars map[string]interface{}) ([]*TaskResult, error) {
+func (e *Executor) executeTask(host *inventory.Host, task *Task, vars map[string]interface{}, handlers []*Handler) ([]*TaskResult, error) {
 	// 合并 extra vars 到 vars
 	allVars := make(map[string]interface{})
 	for k, v := range vars {
@@ -432,6 +592,12 @@ func (e *Executor) executeTask(host *inventory.Host, task *Task, vars map[string
 				itemResult.ExitCode = modResult.ExitCode
 			}
 
+			// notify handlers if changed
+			if task.Notify != nil && itemResult.Changed {
+				fmt.Printf("[EXECUTOR] Task changed, notifying handlers\n")
+				e.notifyHandlers(task.Notify, host, loopVars, handlers)
+			}
+
 			itemResult.End = time.Now()
 			results = append(results, itemResult)
 		}
@@ -518,8 +684,8 @@ func (e *Executor) executeTask(host *inventory.Host, task *Task, vars map[string
 	}
 
 	// notify handlers
-	if task.Notify != nil {
-		e.notifyHandlers(task.Notify)
+	if task.Notify != nil && result.Changed {
+		e.notifyHandlers(task.Notify, host, allVars, handlers)
 	}
 
 	result.End = time.Now()
@@ -814,8 +980,45 @@ func contains(s, substr string) bool {
 }
 
 // notifyHandlers 通知 handlers
-func (e *Executor) notifyHandlers(notify interface{}) {
-	// 实现 handler 通知逻辑
+func (e *Executor) notifyHandlers(notify interface{}, host *inventory.Host, vars map[string]interface{}, handlers []*Handler) {
+	fmt.Printf("[EXECUTOR] notifyHandlers called with: %v\n", notify)
+
+	if handlers == nil || len(handlers) == 0 {
+		fmt.Println("[EXECUTOR] No handlers defined")
+		return
+	}
+
+	// 获取 handler 名称
+	var handlerNames []string
+	switch n := notify.(type) {
+	case string:
+		handlerNames = []string{n}
+	case []string:
+		handlerNames = n
+	case []interface{}:
+		for _, h := range n {
+			handlerNames = append(handlerNames, fmt.Sprintf("%v", h))
+		}
+	default:
+		fmt.Printf("[EXECUTOR] Unknown notify type: %T\n", notify)
+		return
+	}
+
+	// 查找匹配的 handler
+	for _, name := range handlerNames {
+		fmt.Printf("[EXECUTOR] Looking for handler: %s\n", name)
+		for _, handler := range handlers {
+			if handler.Name == name {
+				fmt.Printf("[EXECUTOR] Found handler: %s, queuing for execution\n", handler.Name)
+				e.pendingHandlers = append(e.pendingHandlers, pendingHandler{
+					handler: handler,
+					host:    host,
+					vars:    vars,
+				})
+				break
+			}
+		}
+	}
 }
 
 // getHostResult 获取主机结果

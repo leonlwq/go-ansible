@@ -322,6 +322,15 @@ func (p *Parser) parseHandler(raw map[string]interface{}) (*Handler, error) {
 		handler.Listen = listen
 	}
 
+	// 解析 loop 和 with_items
+	if loop, ok := raw["loop"]; ok {
+		handler.Loop = loop
+	}
+	if withItems, ok := raw["with_items"]; ok {
+		handler.WithItems = withItems
+		handler.Loop = withItems
+	}
+
 	// 提取模块
 	moduleKeys := []string{
 		"shell", "command", "copy", "file", "template",

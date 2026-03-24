@@ -57,6 +57,8 @@ type Handler struct {
 	ModuleName string                 `yaml:"-" json:"-"`
 	Params     map[string]interface{} `yaml:"-" json:"-"`
 	Module     map[string]interface{} `yaml:",inline" json:"module"`
+	Loop       interface{}            `yaml:"loop" json:"loop"`
+	WithItems  interface{}            `yaml:"with_items" json:"with_items"`
 	Listen     string                 `yaml:"listen" json:"listen"`
 }
 
