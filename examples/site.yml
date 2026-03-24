@@ -1,0 +1,64 @@
+---
+- name: Example Playbook
+  hosts: webservers
+  become: true
+  vars:
+    app_name: myapp
+    app_port: 8080
+  tasks:
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Copy nginx config
+      copy:
+        src: files/nginx.conf
+        dest: /etc/nginx/nginx.conf
+        mode: '0644'
+        owner: root
+        group: root
+      notify: restart nginx
+
+    - name: Create app directory
+      file:
+        path: "/opt/{{ app_name }}"
+        state: directory
+        mode: '0755'
+
+    - name: Start nginx service
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Check nginx status
+      shell: systemctl status nginx
+      register: nginx_status
+      ignore_errors: true
+
+    - name: Print nginx status
+      debug:
+        var: nginx_status.stdout
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+- name: Database Setup
+  hosts: dbservers
+  become: true
+  tasks:
+    - name: Install MySQL
+      apt:
+        name: mysql-server
+        state: present
+
+    - name: Start MySQL service
+      service:
+        name: mysql
+        state: started
+        enabled: yes
