@@ -1,0 +1,423 @@
+---
+- name: Production Nginx Deployment and System Configuration
+  hosts: webservers
+  become: true
+  gather_facts: true
+  strategy: linear
+  serial: "50%"
+  max_fail_percentage: 20
+
+  vars:
+    app_name: "nginx"
+    app_version: "1.24.0"
+    app_user: "webapp"
+    app_group: "webapp"
+    app_root: "/opt/webapp"
+    nginx_config_dir: "/etc/nginx"
+    nginx_conf_file: "/etc/nginx/nginx.conf"
+    nginx_log_dir: "/var/log/nginx"
+    nginx_port: 8080
+    nginx_worker_processes: "auto"
+    nginx_worker_connections: 4096
+
+    deployment_timestamp: "{{ ansible_date_time.iso8601 }}"
+    deployment_id: "{{ ansible_date_time.epoch }}"
+
+    enable_firewall: false
+    enable_monitoring: true
+    enable_backup: true
+    enable_rollback: true
+
+    required_packages:
+      - nginx
+      - curl
+      - tar
+      - gzip
+      - rsync
+
+    application_directories:
+      - "{{ app_root }}"
+      - "{{ app_root }}/releases"
+      - "{{ app_root }}/shared"
+      - "{{ app_root }}/shared/logs"
+      - "{{ app_root }}/shared/uploads"
+      - "{{ app_root }}/config"
+
+    application_users:
+      - name: "{{ app_user }}"
+        shell: /usr/sbin/nologin
+        home: "{{ app_root }}"
+        system: true
+
+    sysctl_parameters:
+      net.core.somaxconn: "4096"
+      net.ipv4.tcp_max_syn_backlog: "8192"
+      net.ipv4.ip_local_port_range: "10240 65535"
+      fs.file-max: "2097152"
+
+    nginx_healthcheck_urls:
+      - "http://127.0.0.1:{{ nginx_port }}/"
+      - "http://127.0.0.1:{{ nginx_port }}/health"
+
+    nginx_custom_headers:
+      X-Frame-Options: "SAMEORIGIN"
+      X-Content-Type-Options: "nosniff"
+      Referrer-Policy: "strict-origin-when-cross-origin"
+
+  pre_tasks:
+    - name: Validate supported operating systems
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family in ["RedHat", "Debian"]
+        fail_msg: "Unsupported operating system: {{ ansible_distribution }}"
+        success_msg: "Operating system validation passed."
+      tags:
+        - always
+        - validation
+
+    - name: Validate deployment variables
+      ansible.builtin.assert:
+        that:
+          - nginx_port | int >= 1024
+          - nginx_port | int <= 65535
+          - app_name | length > 0
+          - app_user | length > 0
+          - application_directories | length > 0
+        fail_msg: "Invalid deployment configuration."
+      tags:
+        - always
+        - validation
+
+    - name: Display deployment information
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Architecture: {{ ansible_architecture }}"
+          - "Deployment ID: {{ deployment_id }}"
+          - "Deployment Time: {{ deployment_timestamp }}"
+          - "Target Port: {{ nginx_port }}"
+      tags:
+        - always
+        - info
+
+  tasks:
+    - name: Configure system limits
+      block:
+        - name: Configure kernel parameters
+          ansible.builtin.sysctl:
+            name: "{{ item.key }}"
+            value: "{{ item.value }}"
+            state: present
+            reload: true
+          loop: "{{ sysctl_parameters | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+          notify:
+            - Reload system configuration
+          tags:
+            - system
+            - sysctl
+
+        - name: Create application group
+          ansible.builtin.group:
+            name: "{{ app_group }}"
+            system: true
+            state: present
+          tags:
+            - system
+            - users
+
+        - name: Create application users
+          ansible.builtin.user:
+            name: "{{ item.name }}"
+            group: "{{ app_group }}"
+            shell: "{{ item.shell }}"
+            home: "{{ item.home }}"
+            create_home: false
+            system: "{{ item.system }}"
+            state: present
+          loop: "{{ application_users }}"
+          loop_control:
+            label: "{{ item.name }}"
+          tags:
+            - system
+            - users
+
+        - name: Create application directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0750"
+          loop: "{{ application_directories }}"
+          loop_control:
+            label: "{{ item }}"
+          tags:
+            - system
+            - directories
+
+      rescue:
+        - name: Report system configuration failure
+          ansible.builtin.debug:
+            msg: "System configuration failed on {{ inventory_hostname }}."
+
+        - name: Stop deployment after system configuration failure
+          ansible.builtin.fail:
+            msg: "Cannot continue deployment because system configuration failed."
+
+    - name: Install required packages
+      ansible.builtin.package:
+        name: "{{ required_packages }}"
+        state: present
+      register: package_install_result
+      retries: 3
+      delay: 5
+      until: package_install_result is succeeded
+      tags:
+        - packages
+        - install
+
+    - name: Ensure Nginx service account permissions
+      ansible.builtin.file:
+        path: "{{ nginx_log_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0750"
+      when: ansible_os_family in ["RedHat", "Debian"]
+      tags:
+        - permissions
+
+    - name: Create Nginx backup directory
+      ansible.builtin.file:
+        path: "/var/backups/nginx"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: enable_backup | bool
+      tags:
+        - backup
+
+    - name: Check whether the current Nginx configuration exists
+      ansible.builtin.stat:
+        path: "{{ nginx_conf_file }}"
+      register: nginx_config_stat
+      tags:
+        - backup
+        - configuration
+
+    - name: Backup existing Nginx configuration
+      ansible.builtin.copy:
+        src: "{{ nginx_conf_file }}"
+        dest: "/var/backups/nginx/nginx.conf.{{ deployment_id }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - enable_backup | bool
+        - nginx_config_stat.stat.exists
+      tags:
+        - backup
+
+    - name: Deploy Nginx configuration
+      block:
+        - name: Install Nginx configuration
+          ansible.builtin.template:
+            src: templates/nginx.conf.j2
+            dest: "{{ nginx_conf_file }}"
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+            validate: "nginx -t -c %s"
+          notify:
+            - Validate Nginx configuration
+            - Reload Nginx
+          tags:
+            - configuration
+            - nginx
+
+        - name: Install application health endpoint
+          ansible.builtin.copy:
+            dest: "{{ app_root }}/health.html"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0644"
+            content: |
+              {
+                "status": "healthy",
+                "application": "{{ app_name }}",
+                "deployment_id": "{{ deployment_id }}",
+                "deployment_time": "{{ deployment_timestamp }}",
+                "hostname": "{{ inventory_hostname }}"
+              }
+          tags:
+            - application
+            - healthcheck
+
+        - name: Ensure Nginx is enabled and running
+          ansible.builtin.service:
+            name: nginx
+            enabled: true
+            state: started
+          tags:
+            - service
+            - nginx
+
+      rescue:
+        - name: Restore previous Nginx configuration
+          ansible.builtin.copy:
+            src: "/var/backups/nginx/nginx.conf.{{ deployment_id }}"
+            dest: "{{ nginx_conf_file }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0644"
+          when:
+            - enable_rollback | bool
+            - enable_backup | bool
+            - nginx_config_stat.stat.exists
+
+        - name: Fail deployment when Nginx deployment fails
+          ansible.builtin.fail:
+            msg: "Nginx deployment failed on {{ inventory_hostname }}."
+
+    - name: Verify Nginx service status
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - nginx
+      register: nginx_service_status
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: nginx_service_status.rc == 0
+      tags:
+        - verification
+        - service
+
+    - name: Check Nginx listening port
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: "{{ nginx_port }}"
+        state: started
+        timeout: 30
+      tags:
+        - verification
+        - networking
+
+    - name: Perform HTTP health checks
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: GET
+        status_code: 200
+        return_content: true
+        timeout: 10
+      loop: "{{ nginx_healthcheck_urls }}"
+      loop_control:
+        label: "{{ item }}"
+      register: healthcheck_results
+      retries: 3
+      delay: 2
+      until: healthcheck_results.status == 200
+      tags:
+        - verification
+        - healthcheck
+
+    - name: Display health check results
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Nginx status: {{ nginx_service_status.stdout }}"
+          - "HTTP health checks completed."
+          - "Deployment ID: {{ deployment_id }}"
+      tags:
+        - verification
+        - info
+
+    - name: Configure optional firewall rules
+      block:
+        - name: Allow HTTP traffic through firewalld
+          ansible.posix.firewalld:
+            port: "{{ nginx_port }}/tcp"
+            permanent: true
+            immediate: true
+            state: enabled
+          when: ansible_os_family == "RedHat"
+
+      when: enable_firewall | bool
+      tags:
+        - firewall
+        - security
+
+    - name: Configure optional monitoring metadata
+      ansible.builtin.copy:
+        dest: "{{ app_root }}/deployment-metadata.json"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0640"
+        content: |
+          {
+            "application": "{{ app_name }}",
+            "version": "{{ app_version }}",
+            "hostname": "{{ inventory_hostname }}",
+            "deployment_id": "{{ deployment_id }}",
+            "deployment_time": "{{ deployment_timestamp }}",
+            "monitoring_enabled": {{ enable_monitoring | bool | to_json }}
+          }
+      when: enable_monitoring | bool
+      tags:
+        - monitoring
+        - metadata
+
+  post_tasks:
+    - name: Verify deployment completion
+      ansible.builtin.assert:
+        that:
+          - nginx_service_status.rc == 0
+          - healthcheck_results is succeeded
+        fail_msg: "Deployment verification failed."
+        success_msg: "Deployment completed successfully."
+      tags:
+        - always
+        - verification
+
+    - name: Print deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================"
+          - "Deployment completed"
+          - "Application: {{ app_name }}"
+          - "Version: {{ app_version }}"
+          - "Host: {{ inventory_hostname }}"
+          - "Port: {{ nginx_port }}"
+          - "Deployment ID: {{ deployment_id }}"
+          - "========================================"
+      tags:
+        - always
+        - summary
+
+  handlers:
+    - name: Validate Nginx configuration
+      ansible.builtin.command:
+        argv:
+          - nginx
+          - -t
+      changed_when: false
+
+    - name: Reload Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+    - name: Reload system configuration
+      ansible.builtin.command:
+        argv:
+          - sysctl
+          - --system
+      changed_when: true

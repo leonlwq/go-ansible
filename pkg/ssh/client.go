@@ -12,17 +12,22 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"go-ansible/pkg/inventory"
+	"go-ansible/pkg/util"
 )
 
 // Client SSH 客户端封装
 type Client struct {
-	host      *inventory.Host
-	client    *ssh.Client
-	config    *ssh.ClientConfig
-	mu        sync.Mutex
-	connected bool
+	host        *inventory.Host
+	client      *ssh.Client
+	config      *ssh.ClientConfig
+	authClosers []io.Closer
+	proxyJump   string
+	mu          sync.Mutex
+	connected   bool
 }
 
 // ClientConfig SSH 客户端配置
@@ -32,6 +37,13 @@ type ClientConfig struct {
 	RetryInterval   time.Duration
 	KeepAlive       bool
 	KeepAlivePeriod time.Duration
+}
+
+type sshCommonOptions struct {
+	StrictHostKeyChecking *bool
+	UserKnownHostsFile    string
+	ConnectTimeout        time.Duration
+	ProxyJump             string
 }
 
 // DefaultConfig 返回默认配置
@@ -52,6 +64,7 @@ func NewClient(host *inventory.Host, config *ClientConfig) (*Client, error) {
 	}
 
 	authMethods := make([]ssh.AuthMethod, 0)
+	authClosers := make([]io.Closer, 0)
 
 	// 优先使用密钥认证
 	if host.PrivateKey != "" {
@@ -94,8 +107,9 @@ func NewClient(host *inventory.Host, config *ClientConfig) (*Client, error) {
 
 	// 如果没有指定认证方式，尝试使用 SSH Agent
 	if len(authMethods) == 0 {
-		if agentAuth, err := sshAgentAuth(); err == nil {
+		if agentAuth, closer, err := sshAgentAuth(); err == nil {
 			authMethods = append(authMethods, agentAuth)
+			authClosers = append(authClosers, closer)
 		}
 	}
 
@@ -123,17 +137,135 @@ func NewClient(host *inventory.Host, config *ClientConfig) (*Client, error) {
 		user = "root"
 	}
 
+	timeout := config.Timeout
+	hostKeyCallback, err := resolveHostKeyCallback(host.SSHCommonArgs)
+	if err != nil {
+		return nil, err
+	}
+	proxyJump := ""
+	if opts, err := parseSSHCommonArgs(host.SSHCommonArgs); err != nil {
+		return nil, fmt.Errorf("parse ansible_ssh_common_args: %w", err)
+	} else {
+		if opts.ConnectTimeout > 0 {
+			timeout = opts.ConnectTimeout
+		}
+		if opts.ProxyJump != "" {
+			proxyJump = opts.ProxyJump
+		}
+	}
+
 	sshConfig := &ssh.ClientConfig{
 		User:            user,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         config.Timeout,
+		HostKeyCallback: hostKeyCallback,
+		Timeout:         timeout,
 	}
 
 	return &Client{
-		host:   host,
-		config: sshConfig,
+		host:        host,
+		config:      sshConfig,
+		authClosers: authClosers,
+		proxyJump:   proxyJump,
 	}, nil
+}
+
+func parseSSHCommonArgs(args string) (sshCommonOptions, error) {
+	opts := sshCommonOptions{}
+	if strings.TrimSpace(args) == "" {
+		return opts, nil
+	}
+
+	parts, err := util.SplitArgs(args)
+	if err != nil {
+		return opts, err
+	}
+
+	for i := 0; i < len(parts); i++ {
+		part := parts[i]
+		if part == "-o" {
+			if i+1 >= len(parts) {
+				return opts, fmt.Errorf("missing value after -o")
+			}
+			i++
+			if err := applySSHOption(&opts, parts[i]); err != nil {
+				return opts, err
+			}
+			continue
+		}
+		if strings.HasPrefix(part, "-o") && len(part) > 2 {
+			if err := applySSHOption(&opts, part[2:]); err != nil {
+				return opts, err
+			}
+		}
+	}
+
+	return opts, nil
+}
+
+func applySSHOption(opts *sshCommonOptions, option string) error {
+	key, value, ok := strings.Cut(option, "=")
+	if !ok {
+		return fmt.Errorf("invalid ssh option: %s", option)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "stricthostkeychecking":
+		parsed, ok := parseSSHBool(value)
+		if !ok {
+			return fmt.Errorf("unsupported StrictHostKeyChecking value: %s", value)
+		}
+		opts.StrictHostKeyChecking = &parsed
+	case "userknownhostsfile":
+		opts.UserKnownHostsFile = expandKeyPath(strings.TrimSpace(value))
+	case "proxyjump":
+		opts.ProxyJump = strings.TrimSpace(value)
+	case "connecttimeout":
+		timeoutValue := strings.TrimSpace(value)
+		seconds, err := time.ParseDuration(timeoutValue + "s")
+		if err != nil {
+			if duration, durationErr := time.ParseDuration(timeoutValue); durationErr == nil {
+				opts.ConnectTimeout = duration
+				return nil
+			}
+			return fmt.Errorf("invalid ConnectTimeout value: %s", value)
+		}
+		opts.ConnectTimeout = seconds
+	}
+
+	return nil
+}
+
+func parseSSHBool(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "yes", "true", "on":
+		return true, true
+	case "no", "false", "off":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func resolveHostKeyCallback(commonArgs string) (ssh.HostKeyCallback, error) {
+	opts, err := parseSSHCommonArgs(commonArgs)
+	if err != nil {
+		return nil, fmt.Errorf("parse ansible_ssh_common_args: %w", err)
+	}
+
+	if opts.StrictHostKeyChecking == nil || !*opts.StrictHostKeyChecking {
+		return ssh.InsecureIgnoreHostKey(), nil
+	}
+
+	knownHostsPath := opts.UserKnownHostsFile
+	if knownHostsPath == "" {
+		knownHostsPath = expandKeyPath("~/.ssh/known_hosts")
+	}
+
+	callback, err := knownhosts.New(knownHostsPath)
+	if err != nil {
+		return nil, fmt.Errorf("load known hosts %s: %w", knownHostsPath, err)
+	}
+	return callback, nil
 }
 
 // expandKeyPath 展开密钥路径中的 ~ 和环境变量
@@ -163,23 +295,20 @@ func expandKeyPath(path string) string {
 }
 
 // sshAgentAuth 返回 SSH Agent 认证方法
-func sshAgentAuth() (ssh.AuthMethod, error) {
+func sshAgentAuth() (ssh.AuthMethod, io.Closer, error) {
 	// Unix 系统使用 SSH_AUTH_SOCK 环境变量
 	sshAuthSock := os.Getenv("SSH_AUTH_SOCK")
 	if sshAuthSock == "" {
-		return nil, fmt.Errorf("SSH_AUTH_SOCK not set")
+		return nil, nil, fmt.Errorf("SSH_AUTH_SOCK not set")
 	}
 
 	conn, err := net.Dial("unix", sshAuthSock)
 	if err != nil {
-		return nil, fmt.Errorf("connect to SSH agent: %w", err)
+		return nil, nil, fmt.Errorf("connect to SSH agent: %w", err)
 	}
 
-	// 使用 golang.org/x/crypto/ssh/agent 包
-	// 这里简化处理，实际使用时需要导入 ssh/agent 包
-	_ = conn
-
-	return nil, fmt.Errorf("SSH agent auth not fully implemented")
+	agentClient := agent.NewClient(conn)
+	return ssh.PublicKeysCallback(agentClient.Signers), conn, nil
 }
 
 // Connect 连接到远程主机
@@ -192,6 +321,28 @@ func (c *Client) Connect() error {
 	}
 
 	addr := net.JoinHostPort(c.host.Address, fmt.Sprintf("%d", c.host.Port))
+
+	if c.proxyJump != "" {
+		jumpClient, err := dialJumpHost(c.proxyJump, c.config)
+		if err != nil {
+			return fmt.Errorf("ssh dial jump host %s: %w", c.proxyJump, err)
+		}
+		c.authClosers = append(c.authClosers, jumpClient)
+
+		conn, err := jumpClient.Dial("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("jump host %s dial target %s: %w", c.proxyJump, addr, err)
+		}
+		ncc, chans, reqs, err := ssh.NewClientConn(conn, addr, c.config)
+		if err != nil {
+			conn.Close()
+			return fmt.Errorf("ssh new client conn via jump host %s: %w", c.proxyJump, err)
+		}
+		c.client = ssh.NewClient(ncc, chans, reqs)
+		c.connected = true
+		return nil
+	}
+
 	client, err := ssh.Dial("tcp", addr, c.config)
 	if err != nil {
 		return fmt.Errorf("ssh dial %s: %w", addr, err)
@@ -203,19 +354,54 @@ func (c *Client) Connect() error {
 	return nil
 }
 
+func dialJumpHost(jumpSpec string, baseConfig *ssh.ClientConfig) (*ssh.Client, error) {
+	jumpSpec = strings.TrimSpace(jumpSpec)
+	user := baseConfig.User
+	hostPort := jumpSpec
+	if idx := strings.Index(jumpSpec, "@"); idx >= 0 {
+		user = jumpSpec[:idx]
+		hostPort = jumpSpec[idx+1:]
+	}
+	host := hostPort
+	port := "22"
+	if h, p, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+		port = p
+	}
+	addr := net.JoinHostPort(host, port)
+
+	jumpConfig := &ssh.ClientConfig{
+		User:            user,
+		Auth:            baseConfig.Auth,
+		HostKeyCallback: baseConfig.HostKeyCallback,
+		Timeout:         baseConfig.Timeout,
+	}
+
+	return ssh.Dial("tcp", addr, jumpConfig)
+}
+
 // Close 关闭连接
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.connected {
-		return nil
+	var lastErr error
+	if c.connected {
+		if err := c.client.Close(); err != nil {
+			lastErr = err
+		}
+		c.connected = false
+		c.client = nil
 	}
 
-	err := c.client.Close()
-	c.connected = false
-	c.client = nil
-	return err
+	for _, closer := range c.authClosers {
+		if err := closer.Close(); err != nil && lastErr == nil {
+			lastErr = err
+		}
+	}
+	c.authClosers = nil
+
+	return lastErr
 }
 
 // Execute 执行命令并返回输出
@@ -479,6 +665,8 @@ type Result struct {
 	Changed  bool
 	Failed   bool
 	Message  string
+	Diff     string
+	Data     map[string]interface{}
 }
 
 // IsChanged 判断是否有变更

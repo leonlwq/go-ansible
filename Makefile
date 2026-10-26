@@ -1,71 +1,122 @@
-APP="$(notdir $(CURDIR))"
-MAIN_PATH="cmd/${APP}/main.go"
-VERSION="$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
-COMMIT="$(shell git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-BUILD_TIME="$(shell date -u '+%Y-%m-%dT%H:%M:%SZ')"
-BUILD_DIR="bin"
-LDFLAGS="-X '${APP}/internal/version.Version=$(VERSION)' -X '${APP}/internal/version.Commit=$(COMMIT)' -X '${APP}/internal/version.BuildTime=$(BUILD_TIME)'"
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 'main')
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo 'unknown')
+BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+BUILD_DIR ?= bin
+DIST_DIR ?= $(BUILD_DIR)/dist
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 
-.PHONY: all build clean run test lint fmt vet install darwin linux windows help
+# Strip debugging symbols and inject version info
+LDFLAGS ?= -s -w -X 'main.version=$(VERSION)'
 
-# Default target
+COMMANDS = ansible ansible-playbook ansible-inventory ansible-vault ansible-doc ansible-config ansible-galaxy ansible-pull
+
+# Supported cross-compilation matrix
+DARWIN_ARCHS = amd64 arm64
+LINUX_ARCHS = amd64 arm64
+WINDOWS_ARCHS = amd64 arm64
+
+.PHONY: all build install darwin linux windows cross-build dist deps test lint fmt vet clean help
+
+# Default target: build host-platform binaries
 all: clean build
 
-# Build the application
+# Build all 8 CLI tools for the current host environment
 build:
-	@echo "Building $(APP) version $(VERSION)..."
+	@echo "==> Building 8 Ansible replacement binaries for host OS ($(VERSION))..."
 	@mkdir -p $(BUILD_DIR)
-	@go build -ldflags $(LDFLAGS) -o $(BUILD_DIR)/$(APP) $(MAIN_PATH)
-	@echo "Build complete: $(BUILD_DIR)/$(APP)"
+	@for cmd in $(COMMANDS); do \
+		echo "  -> Building $${cmd}..."; \
+		CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$${cmd} ./cmd/$${cmd} || exit 1; \
+	done
+	@echo "==> Build complete! Host binaries are in $(BUILD_DIR)/"
 
-# Install dependencies
-install:
-	@echo "Installing dependencies..."
+# Directly install binaries to system PATH (default: /usr/local/bin, override with PREFIX=/usr)
+install: build
+	@echo "==> Installing binaries to $(BINDIR)..."
+	@install -d $(BINDIR)
+	@for cmd in $(COMMANDS); do \
+		echo "  -> Installing $${cmd} to $(BINDIR)..."; \
+		install -m 755 $(BUILD_DIR)/$${cmd} $(BINDIR)/$${cmd}; \
+	done
+	@echo "==> Installation complete! Python ansible CLI tools in $(BINDIR) have been replaced."
+
+# Build for macOS (Darwin amd64 + arm64 Apple Silicon)
+darwin:
+	@echo "==> Building for macOS (Darwin)..."
+	@for arch in $(DARWIN_ARCHS); do \
+		target_dir="$(BUILD_DIR)/darwin-$${arch}"; \
+		mkdir -p "$${target_dir}"; \
+		echo "  -> Building darwin/$${arch} into $${target_dir}/..."; \
+		for cmd in $(COMMANDS); do \
+			CGO_ENABLED=0 GOOS=darwin GOARCH=$${arch} go build -ldflags "$(LDFLAGS)" -o "$${target_dir}/$${cmd}" ./cmd/$${cmd} || exit 1; \
+		done; \
+	done
+	@echo "==> macOS builds complete in $(BUILD_DIR)/darwin-*/"
+
+# Build for Linux (Linux amd64 + arm64)
+linux:
+	@echo "==> Building for Linux..."
+	@for arch in $(LINUX_ARCHS); do \
+		target_dir="$(BUILD_DIR)/linux-$${arch}"; \
+		mkdir -p "$${target_dir}"; \
+		echo "  -> Building linux/$${arch} into $${target_dir}/..."; \
+		for cmd in $(COMMANDS); do \
+			CGO_ENABLED=0 GOOS=linux GOARCH=$${arch} go build -ldflags "$(LDFLAGS)" -o "$${target_dir}/$${cmd}" ./cmd/$${cmd} || exit 1; \
+		done; \
+	done
+	@echo "==> Linux builds complete in $(BUILD_DIR)/linux-*/"
+
+# Build for Windows (Windows amd64 + arm64, .exe extension)
+windows:
+	@echo "==> Building for Windows..."
+	@for arch in $(WINDOWS_ARCHS); do \
+		target_dir="$(BUILD_DIR)/windows-$${arch}"; \
+		mkdir -p "$${target_dir}"; \
+		echo "  -> Building windows/$${arch} into $${target_dir}/..."; \
+		for cmd in $(COMMANDS); do \
+			CGO_ENABLED=0 GOOS=windows GOARCH=$${arch} go build -ldflags "$(LDFLAGS)" -o "$${target_dir}/$${cmd}.exe" ./cmd/$${cmd} || exit 1; \
+		done; \
+	done
+	@echo "==> Windows builds complete in $(BUILD_DIR)/windows-*/"
+
+# Build for all platforms (macOS, Linux, Windows)
+cross-build: darwin linux windows
+	@echo "==> All cross-platform builds completed successfully!"
+
+# Package cross-platform distribution archives (.tar.gz and .zip)
+dist: clean cross-build
+	@echo "==> Packaging distribution archives into $(DIST_DIR)..."
+	@mkdir -p $(DIST_DIR)
+	@for arch in $(DARWIN_ARCHS); do \
+		echo "  -> Packaging darwin-$${arch}..."; \
+		tar -czf "$(DIST_DIR)/ansible-darwin-$${arch}.tar.gz" -C "$(BUILD_DIR)/darwin-$${arch}" . ; \
+	done
+	@for arch in $(LINUX_ARCHS); do \
+		echo "  -> Packaging linux-$${arch}..."; \
+		tar -czf "$(DIST_DIR)/ansible-linux-$${arch}.tar.gz" -C "$(BUILD_DIR)/linux-$${arch}" . ; \
+	done
+	@for arch in $(WINDOWS_ARCHS); do \
+		echo "  -> Packaging windows-$${arch}..."; \
+		(cd "$(BUILD_DIR)/windows-$${arch}" && zip -q -r "../../$(DIST_DIR)/ansible-windows-$${arch}.zip" .) ; \
+	done
+	@echo "==> Distribution archives packaged successfully in $(DIST_DIR)/:"
+	@ls -lh $(DIST_DIR)
+
+# Download and tidy Go dependencies
+deps:
+	@echo "==> Downloading dependencies..."
 	@go mod download
 	@go mod tidy
 
-# Build for macOS
-darwin:
-	@echo "Building for macOS (amd64)..."
-	@mkdir -p $(BUILD_DIR)
-	@CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags $(LDFLAGS) -o $(BUILD_DIR)/$(APP)-darwin-amd64 $(MAIN_PATH)
-	@echo "Build complete: $(BUILD_DIR)/$(APP)-darwin-amd64"
-
-# Build for Linux
-linux:
-	@echo "Building for Linux (amd64)..."
-	@mkdir -p $(BUILD_DIR)
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags $(LDFLAGS) -o $(BUILD_DIR)/$(APP)-linux-amd64 $(MAIN_PATH)
-	@echo "Build complete: $(BUILD_DIR)/$(APP)-linux-amd64"
-
-# Build for Windows
-windows:
-	@echo "Building for Windows (amd64)..."
-	@mkdir -p $(BUILD_DIR)
-	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags $(LDFLAGS) -o $(BUILD_DIR)/$(APP)-windows-amd64.exe $(MAIN_PATH)
-	@echo "Build complete: $(BUILD_DIR)/$(APP)-windows-amd64.exe"
-
-all:
-	@make darwin linux windows
-	@echo "All builds completed"
-
-# Build for all platforms
-cross-build: darwin linux windows
-	@echo "Cross-platform builds completed"
-
-# Run the application
-run:
-	@echo "Running $(APP)..."
-	@go run $(MAIN_PATH)
-
-# Run tests
+# Run all unit tests
 test:
-	@echo "Running tests..."
-	@go test -v ./...
+	@echo "==> Running tests..."
+	@go test -v -count=1 ./...
 
-# Run linter
+# Run golangci-lint
 lint:
-	@echo "Running linter..."
+	@echo "==> Running linter..."
 	@if command -v golangci-lint >/dev/null 2>&1; then \
 		golangci-lint run ./...; \
 	else \
@@ -75,35 +126,35 @@ lint:
 
 # Format code
 fmt:
-	@echo "Formatting code..."
+	@echo "==> Formatting code..."
 	@go fmt ./...
 
 # Run go vet
 vet:
-	@echo "Vetting code..."
+	@echo "==> Vetting code..."
 	@go vet ./...
 
-# Clean build artifacts
+# Clean build and package artifacts
 clean:
-	@echo "Cleaning up build files..."
+	@echo "==> Cleaning up build files..."
 	@rm -rf $(BUILD_DIR)
 	@rm -rf ./logs ./uploads
 	@echo "Clean complete"
 
 # Show help
 help:
-	@echo "Available targets:"
-	@echo "  all          - Clean and build the application (default)"
-	@echo "  build        - Build the application"
-	@echo "  install      - Install dependencies"
-	@echo "  darwin       - Build for macOS"
-	@echo "  linux        - Build for Linux"
-	@echo "  windows      - Build for Windows"
-	@echo "  cross-build  - Build for all platforms"
-	@echo "  run          - Run the application"
-	@echo "  test         - Run tests"
-	@echo "  lint         - Run linter"
-	@echo "  fmt          - Format code"
+	@echo "Available make targets:"
+	@echo "  build        - Build 8 CLI binaries for host system into bin/ (default)"
+	@echo "  install      - Install host binaries to PREFIX/bin (default: /usr/local/bin)"
+	@echo "  darwin       - Build for macOS (darwin-amd64 and darwin-arm64)"
+	@echo "  linux        - Build for Linux (linux-amd64 and linux-arm64)"
+	@echo "  windows      - Build for Windows (windows-amd64.exe and windows-arm64.exe)"
+	@echo "  cross-build  - Build all platforms (macOS, Linux, Windows)"
+	@echo "  dist         - Build and package tar.gz/zip archives into bin/dist/"
+	@echo "  test         - Run all unit tests"
+	@echo "  deps         - Download and tidy Go module dependencies"
+	@echo "  lint         - Run golangci-lint"
+	@echo "  fmt          - Format Go code using go fmt"
 	@echo "  vet          - Run go vet"
-	@echo "  clean        - Clean build artifacts"
+	@echo "  clean        - Remove build and dist artifacts"
 	@echo "  help         - Show this help message"

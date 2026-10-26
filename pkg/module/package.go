@@ -2,6 +2,7 @@ package module
 
 import (
 	"fmt"
+	"strings"
 
 	"go-ansible/pkg/ssh"
 )
@@ -12,20 +13,18 @@ type YumModule struct{}
 func (m *YumModule) Name() string { return "yum" }
 
 func (m *YumModule) Validate(params map[string]interface{}) error {
-	if _, ok := params["name"]; !ok {
-		if _, ok := params["pkg"]; !ok {
-			return fmt.Errorf("yum module requires name or pkg")
-		}
+	if packageNames(params) == "" {
+		return fmt.Errorf("yum module requires name or pkg")
 	}
 	return nil
 }
 
-func (m *YumModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
-	name := GetParamString(params, "name", "")
-	if name == "" {
-		name = GetParamString(params, "pkg", "")
+func (m *YumModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
+	name := packageNames(params)
+	state, err := normalizePackageState("yum", GetParamString(params, "state", "present"))
+	if err != nil {
+		return nil, err
 	}
-	state := GetParamString(params, "state", "present")
 	updateCache := GetParamBool(params, "update_cache", false)
 
 	var cmd string
@@ -38,10 +37,8 @@ func (m *YumModule) Execute(client *ssh.Client, params map[string]interface{}) (
 		cmd = fmt.Sprintf("yum install -y %s", name)
 	case "latest":
 		cmd = fmt.Sprintf("yum update -y %s", name)
-	case "absent", "removed":
+	case "absent", "removed", "purged":
 		cmd = fmt.Sprintf("yum remove -y %s", name)
-	default:
-		return nil, fmt.Errorf("unsupported state: %s", state)
 	}
 
 	result, err := client.Execute(cmd)
@@ -50,7 +47,7 @@ func (m *YumModule) Execute(client *ssh.Client, params map[string]interface{}) (
 	}
 
 	// 检查是否有变更
-	result.Changed = result.ExitCode == 0 && !contains(result.Stdout, "Nothing to do")
+	result.Changed = yumChanged(state, result.Stdout, result.Stderr)
 	return result, nil
 }
 
@@ -60,20 +57,18 @@ type AptModule struct{}
 func (m *AptModule) Name() string { return "apt" }
 
 func (m *AptModule) Validate(params map[string]interface{}) error {
-	if _, ok := params["name"]; !ok {
-		if _, ok := params["pkg"]; !ok {
-			return fmt.Errorf("apt module requires name or pkg")
-		}
+	if packageNames(params) == "" {
+		return fmt.Errorf("apt module requires name or pkg")
 	}
 	return nil
 }
 
-func (m *AptModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
-	name := GetParamString(params, "name", "")
-	if name == "" {
-		name = GetParamString(params, "pkg", "")
+func (m *AptModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
+	name := packageNames(params)
+	state, err := normalizePackageState("apt", GetParamString(params, "state", "present"))
+	if err != nil {
+		return nil, err
 	}
-	state := GetParamString(params, "state", "present")
 	updateCache := GetParamBool(params, "update_cache", false)
 
 	if updateCache {
@@ -90,8 +85,6 @@ func (m *AptModule) Execute(client *ssh.Client, params map[string]interface{}) (
 		cmd = fmt.Sprintf("apt-get remove -y %s", name)
 	case "purged":
 		cmd = fmt.Sprintf("apt-get purge -y %s", name)
-	default:
-		return nil, fmt.Errorf("unsupported state: %s", state)
 	}
 
 	result, err := client.Execute(cmd)
@@ -99,19 +92,82 @@ func (m *AptModule) Execute(client *ssh.Client, params map[string]interface{}) (
 		return result, err
 	}
 
-	result.Changed = result.ExitCode == 0 && !contains(result.Stdout, "is already the newest version")
+	result.Changed = aptChanged(state, result.Stdout, result.Stderr)
 	return result, nil
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+func yumChanged(state, stdout, stderr string) bool {
+	combined := strings.TrimSpace(stdout + "\n" + stderr)
+	if combined == "" {
+		return true
+	}
+	return !hasAnySubstring(combined,
+		"nothing to do",
+		"no packages marked for update",
+		"no packages marked for removal",
+		"no packages marked for erase",
+	)
 }
 
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+func aptChanged(state, stdout, stderr string) bool {
+	combined := strings.TrimSpace(stdout + "\n" + stderr)
+	if combined == "" {
+		return true
 	}
-	return false
+	return !hasAnySubstring(combined,
+		"is already the newest version",
+		"is already the latest version",
+		"0 upgraded, 0 newly installed, 0 to remove",
+		"0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded",
+		"package is not installed, so not removed",
+		"package is not installed, so not removed",
+	)
+}
+
+func normalizePackageState(manager, state string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "", "present", "installed", "install":
+		return "present", nil
+	case "latest", "upgraded", "upgrade":
+		return "latest", nil
+	case "absent", "removed", "remove", "deleted", "uninstalled":
+		return "absent", nil
+	case "purged", "purge":
+		if manager == "apt" {
+			return "purged", nil
+		}
+		return "absent", nil
+	default:
+		return "", fmt.Errorf("unsupported state: %s", state)
+	}
+}
+
+// PackageModule 通用包管理模块，自动探测目标系统的包管理器（apt/yum/dnf）并自适应分发
+type PackageModule struct{}
+
+func (m *PackageModule) Name() string { return "package" }
+
+func (m *PackageModule) Validate(params map[string]interface{}) error {
+	if packageNames(params) == "" {
+		return fmt.Errorf("package module requires name or pkg")
+	}
+	return nil
+}
+
+func (m *PackageModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
+	probeCmd := "if command -v apt-get >/dev/null 2>&1; then echo 'apt'; elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then echo 'yum'; else echo 'unknown'; fi"
+	res, err := client.Execute(probeCmd)
+	if err != nil {
+		return res, fmt.Errorf("failed to detect package manager on target host: %w", err)
+	}
+
+	pm := strings.TrimSpace(res.Stdout)
+	switch pm {
+	case "apt":
+		return (&AptModule{}).Execute(client, params)
+	case "yum":
+		return (&YumModule{}).Execute(client, params)
+	default:
+		return nil, fmt.Errorf("could not detect a supported package manager (apt/yum/dnf) on target host")
+	}
 }

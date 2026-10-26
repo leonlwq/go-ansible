@@ -30,34 +30,165 @@ func (m *CopyModule) Validate(params map[string]interface{}) error {
 	return nil
 }
 
-func (m *CopyModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
+func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
 	dest := GetParamString(params, "dest", "")
-	mode := GetParamString(params, "mode", "")
+	mode := GetParamMode(params, "mode", "")
 	owner := GetParamString(params, "owner", "")
 	group := GetParamString(params, "group", "")
 	backup := GetParamBool(params, "backup", false)
 	become := GetParamBool(params, "become", false)
+	force := GetParamBool(params, "force", true)
+	remoteSrc := GetParamBool(params, "remote_src", false)
+	validate := GetParamString(params, "validate", "")
+	checkMode := GetParamBool(params, "__check_mode", false)
+	diffMode := GetParamBool(params, "__diff", false)
 
-	fmt.Printf("[COPY] become=%v, params=%+v\n", become, params)
+	fmt.Printf("[COPY] become=%v, remote_src=%v, params=%+v\n", become, remoteSrc, params)
 
-	// 文件模式
 	src := GetParamString(params, "src", "")
+
+	// 1. 远端复制模式 (remote_src: true)
+	if remoteSrc {
+		if src == "" {
+			return nil, fmt.Errorf("copy module requires src when remote_src is true")
+		}
+		destPath := resolveDestPath(dest, src)
+
+		// 检查远程源文件是否存在
+		checkSrcRes, _ := client.Execute(fmt.Sprintf("test -e %s", src))
+		if checkSrcRes != nil && checkSrcRes.ExitCode != 0 {
+			return nil, fmt.Errorf("remote source file not found: %s", src)
+		}
+
+		srcChecksum := readRemoteChecksum(client, src)
+		destChecksum := readRemoteChecksum(client, destPath)
+
+		if srcChecksum != "" && srcChecksum == destChecksum {
+			return &Result{
+				Changed: false,
+				Message: "file already exists with matching content",
+			}, nil
+		}
+		if destChecksum != "" && !force {
+			return &Result{
+				Changed: false,
+				Message: "file exists with different content and force=false",
+			}, nil
+		}
+
+		diff := ""
+		if diffMode {
+			diff = buildTextDiff(destPath, readRemoteFileContent(client, destPath), readRemoteFileContent(client, src))
+		}
+
+		if checkMode {
+			return &Result{
+				Changed: true,
+				Message: "check mode: file would be copied remotely",
+				Diff:    diff,
+			}, nil
+		}
+
+		if backup && destChecksum != "" {
+			client.Execute(buildBackupCommand(destPath))
+		}
+
+		destDir := filepath.Dir(destPath)
+		client.Execute(fmt.Sprintf("mkdir -p %s", destDir))
+
+		if validate != "" {
+			tmpPath := fmt.Sprintf("/tmp/go-ansible-cptmp-%d-%s", os.Getpid(), filepath.Base(destPath))
+			if _, err := client.Execute(fmt.Sprintf("cp -p %s %s", src, tmpPath)); err != nil {
+				return nil, fmt.Errorf("copy to tmp for validation: %w", err)
+			}
+			if err := executeValidate(client, validate, tmpPath); err != nil {
+				client.Execute(fmt.Sprintf("rm -f %s", tmpPath))
+				return nil, err
+			}
+			if _, err := client.Execute(fmt.Sprintf("mv -f %s %s", tmpPath, destPath)); err != nil {
+				return nil, fmt.Errorf("move validated file: %w", err)
+			}
+		} else {
+			cpRes, err := client.Execute(fmt.Sprintf("cp -p %s %s", src, destPath))
+			if err != nil {
+				return nil, fmt.Errorf("remote copy: %w", err)
+			}
+			if cpRes != nil && cpRes.ExitCode != 0 {
+				return nil, fmt.Errorf("remote copy failed: %s", strings.TrimSpace(cpRes.Stderr))
+			}
+		}
+
+		m.setPermissions(client, destPath, mode, owner, group)
+		return &Result{
+			Changed: true,
+			Message: "file copied remotely successfully",
+			Diff:    diff,
+		}, nil
+	}
+
+	// 2. 内容直接写入模式 (content)
 	if src == "" {
-		// 检查内容模式
 		if content, ok := params["content"]; ok {
 			contentStr := fmt.Sprintf("%v", content)
-			cmd := fmt.Sprintf("cat > %s << 'GOANSIBLE_EOF'\n%s\nGOANSIBLE_EOF", dest, contentStr)
-			result, err := client.Execute(cmd)
-			if err != nil {
-				return result, err
+			remoteChecksum := readRemoteChecksum(client, dest)
+			localChecksum := stringChecksum(contentStr)
+			if localChecksum == remoteChecksum && remoteChecksum != "" {
+				return &Result{
+					Changed: false,
+					Message: "file already exists with matching content",
+				}, nil
 			}
-			result.Changed = true
+			if remoteChecksum != "" && !force {
+				return &Result{
+					Changed: false,
+					Message: "file exists with different content and force=false",
+				}, nil
+			}
+			diff := ""
+			if diffMode {
+				diff = buildTextDiff(dest, readRemoteFileContent(client, dest), contentStr)
+			}
+			if checkMode {
+				return &Result{
+					Changed: true,
+					Message: "check mode: file content would be updated",
+					Diff:    diff,
+				}, nil
+			}
+			if backup && remoteChecksum != "" {
+				client.Execute(buildBackupCommand(dest))
+			}
+
+			destDir := filepath.Dir(dest)
+			client.Execute(fmt.Sprintf("mkdir -p %s", destDir))
+
+			if validate != "" {
+				tmpPath := fmt.Sprintf("/tmp/go-ansible-cnt-%d-%s", os.Getpid(), filepath.Base(dest))
+				client.Execute(buildContentWriteCommand(tmpPath, contentStr))
+				if err := executeValidate(client, validate, tmpPath); err != nil {
+					client.Execute(fmt.Sprintf("rm -f %s", tmpPath))
+					return nil, err
+				}
+				client.Execute(fmt.Sprintf("mv -f %s %s", tmpPath, dest))
+			} else {
+				cmd := buildContentWriteCommand(dest, contentStr)
+				result, err := client.Execute(cmd)
+				if err != nil {
+					return result, err
+				}
+			}
+			result := &Result{
+				Changed: true,
+				Message: "file content written successfully",
+				Diff:    diff,
+			}
 			m.setPermissions(client, dest, mode, owner, group)
 			return result, nil
 		}
 		return nil, fmt.Errorf("copy module requires src or content")
 	}
 
+	// 3. 本地文件上传模式 (src -> remote dest)
 	fmt.Printf("[COPY] src=%s, dest=%s\n", src, dest)
 
 	// 检查本地文件是否存在
@@ -70,11 +201,6 @@ func (m *CopyModule) Execute(client *ssh.Client, params map[string]interface{}) 
 	}
 	fmt.Printf("[COPY] Source file size: %d bytes\n", fileInfo.Size())
 
-	// 备份
-	if backup {
-		client.Execute(fmt.Sprintf("cp -p %s %s.bak 2>/dev/null || true", dest, dest))
-	}
-
 	// 计算本地文件 checksum
 	localChecksum, err := fileChecksum(src)
 	if err != nil {
@@ -83,22 +209,11 @@ func (m *CopyModule) Execute(client *ssh.Client, params map[string]interface{}) 
 	fmt.Printf("[COPY] Local checksum: %s\n", localChecksum)
 
 	// 构建目标路径
-	var destPath string
-	// 检查 dest 是否是目录（以 / 结尾或是已存在的目录）
-	if dest[len(dest)-1] == '/' {
-		// 如果 dest 是目录，使用源文件名
-		destPath = dest + filepath.Base(src)
-	} else {
-		destPath = dest
-	}
+	destPath := resolveDestPath(dest, src)
 	fmt.Printf("[COPY] Destination path: %s\n", destPath)
 
 	// 获取远程文件 checksum
-	checkResult, _ := client.Execute(fmt.Sprintf("sha256sum %s 2>/dev/null | cut -d' ' -f1 || shasum -a 256 %s 2>/dev/null | cut -d' ' -f1", destPath, destPath))
-	remoteChecksum := ""
-	if checkResult != nil {
-		remoteChecksum = strings.TrimSpace(checkResult.Stdout)
-	}
+	remoteChecksum := readRemoteChecksum(client, destPath)
 	fmt.Printf("[COPY] Remote checksum: %s\n", remoteChecksum)
 
 	// 如果 checksum 相同，跳过
@@ -110,39 +225,69 @@ func (m *CopyModule) Execute(client *ssh.Client, params map[string]interface{}) 
 		}
 		return result, nil
 	}
+	if remoteChecksum != "" && !force {
+		return &Result{
+			Changed: false,
+			Message: "file exists with different content and force=false",
+		}, nil
+	}
+	diff := ""
+	if diffMode {
+		data, err := os.ReadFile(src)
+		if err == nil {
+			diff = buildTextDiff(destPath, readRemoteFileContent(client, destPath), string(data))
+		}
+	}
+	if checkMode {
+		return &Result{
+			Changed: true,
+			Message: "check mode: file would be copied",
+			Diff:    diff,
+		}, nil
+	}
+	if backup && remoteChecksum != "" {
+		client.Execute(buildBackupCommand(destPath))
+	}
 
 	// 确保目标目录存在
 	destDir := filepath.Dir(destPath)
 	fmt.Printf("[COPY] Creating directory: %s\n", destDir)
 	client.Execute(fmt.Sprintf("mkdir -p %s", destDir))
 
-	if become {
-		fmt.Println("[COPY] Using become mode")
-		// become 模式：先上传到临时目录，再 sudo mv
+	if become || validate != "" {
+		fmt.Println("[COPY] Using staging temp path for become/validate")
 		tmpPath := fmt.Sprintf("/tmp/go-ansible-%d-%s", os.Getpid(), filepath.Base(src))
 		fmt.Printf("[COPY] Uploading to temp path: %s\n", tmpPath)
 
-		// 上传到临时目录
 		if err := client.Upload(src, tmpPath); err != nil {
 			fmt.Printf("[COPY] Upload error: %v\n", err)
 			return nil, fmt.Errorf("upload file to tmp: %w", err)
 		}
-		fmt.Println("[COPY] Upload successful")
+
+		if validate != "" {
+			if err := executeValidate(client, validate, tmpPath); err != nil {
+				client.Execute(fmt.Sprintf("rm -f %s", tmpPath))
+				return nil, err
+			}
+		}
 
 		// 移动到目标位置
-		mvCmd := fmt.Sprintf("mv %s %s", tmpPath, destPath)
+		mvCmd := fmt.Sprintf("mv -f %s %s", tmpPath, destPath)
 		fmt.Printf("[COPY] Moving file: %s\n", mvCmd)
 		result, err := client.Execute(mvCmd)
 		if err != nil {
-			// 清理临时文件
 			client.Execute(fmt.Sprintf("rm -f %s", tmpPath))
 			fmt.Printf("[COPY] Move error: %v\n", err)
 			return nil, fmt.Errorf("move file: %w", err)
 		}
-		fmt.Println("[COPY] Move successful")
+		if result != nil && result.ExitCode != 0 {
+			client.Execute(fmt.Sprintf("rm -f %s", tmpPath))
+			return nil, fmt.Errorf("move file failed: %s", strings.TrimSpace(result.Stderr))
+		}
 
 		result.Changed = true
 		result.Message = "file copied successfully"
+		result.Diff = diff
 		m.setPermissions(client, destPath, mode, owner, group)
 		return result, nil
 	}
@@ -158,13 +303,22 @@ func (m *CopyModule) Execute(client *ssh.Client, params map[string]interface{}) 
 	result := &Result{
 		Changed: true,
 		Message: "file copied successfully",
+		Diff:    diff,
 	}
 
 	m.setPermissions(client, destPath, mode, owner, group)
 	return result, nil
 }
 
-func (m *CopyModule) setPermissions(client *ssh.Client, path, mode, owner, group string) {
+func readRemoteChecksum(client ssh.Connection, path string) string {
+	checkResult, _ := client.Execute(checksumCommand(path))
+	if checkResult == nil {
+		return ""
+	}
+	return strings.TrimSpace(checkResult.Stdout)
+}
+
+func (m *CopyModule) setPermissions(client ssh.Connection, path, mode, owner, group string) {
 	if mode != "" {
 		client.Execute(fmt.Sprintf("chmod %s %s", mode, path))
 	}
@@ -206,7 +360,7 @@ func (m *FetchModule) Validate(params map[string]interface{}) error {
 	return nil
 }
 
-func (m *FetchModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
+func (m *FetchModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
 	src := GetParamString(params, "src", "")
 	dest := GetParamString(params, "dest", "")
 

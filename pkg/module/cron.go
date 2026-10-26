@@ -20,7 +20,7 @@ func (m *CronModule) Validate(params map[string]interface{}) error {
 	return nil
 }
 
-func (m *CronModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
+func (m *CronModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
 	name := GetParamString(params, "name", "")
 	state := GetParamString(params, "state", "present")
 	minute := GetParamString(params, "minute", "*")

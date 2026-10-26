@@ -1,32 +1,82 @@
 package playbook
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 var reservedTaskFields = map[string]struct{}{
-	"name":          {},
-	"when":          {},
-	"loop":          {},
-	"with_items":    {},
-	"register":      {},
-	"until":         {},
-	"retries":       {},
-	"delay":         {},
-	"ignore_errors": {},
-	"no_log":        {},
-	"delegate_to":   {},
-	"local_action":  {},
-	"run_once":      {},
-	"tags":          {},
-	"notify":        {},
-	"become":        {},
-	"become_user":   {},
+	"name":            {},
+	"block":           {},
+	"rescue":          {},
+	"always":          {},
+	"vars":            {},
+	"when":            {},
+	"changed_when":    {},
+	"failed_when":     {},
+	"loop":            {},
+	"with_items":      {},
+	"with_dict":       {},
+	"with_fileglob":   {},
+	"with_sequence":   {},
+	"with_together":   {},
+	"with_nested":     {},
+	"loop_control":    {},
+	"register":        {},
+	"until":           {},
+	"retries":         {},
+	"delay":           {},
+	"async":           {},
+	"poll":            {},
+	"ignore_errors":   {},
+	"no_log":          {},
+	"delegate_to":     {},
+	"local_action":    {},
+	"run_once":        {},
+	"tags":            {},
+	"notify":          {},
+	"become":          {},
+	"become_user":     {},
+	"become_method":   {},
+	"become_pass":     {},
+	"become_password": {},
+	"throttle":        {},
+	"timeout":         {},
+	"debugger":        {},
+	"args":            {},
+	"environment":     {},
 }
 
 var reservedHandlerFields = map[string]struct{}{
-	"name":       {},
-	"listen":     {},
-	"loop":       {},
-	"with_items": {},
+	"name":            {},
+	"listen":          {},
+	"loop":            {},
+	"with_items":      {},
+	"with_dict":       {},
+	"with_fileglob":   {},
+	"with_sequence":   {},
+	"with_together":   {},
+	"with_nested":     {},
+	"tags":            {},
+	"become":          {},
+	"become_user":     {},
+	"become_method":   {},
+	"become_pass":     {},
+	"become_password": {},
+	"debugger":        {},
+	"args":            {},
+	"changed_when":    {},
+	"failed_when":     {},
+}
+
+func normalizeModuleName(name string) string {
+	name = strings.TrimSpace(name)
+	// 针对 FQCN 全限定集合命名如 ansible.builtin.copy, ansible.posix.firewalld, community.general.sysctl 进行平滑去前缀
+	if strings.Contains(name, ".") {
+		parts := strings.Split(name, ".")
+		return parts[len(parts)-1]
+	}
+	return name
 }
 
 func extractModule(raw map[string]interface{}, reserved map[string]struct{}) (string, map[string]interface{}, error) {
@@ -45,16 +95,32 @@ func extractModule(raw map[string]interface{}, reserved map[string]struct{}) (st
 		return "", nil, fmt.Errorf("task has multiple module candidates: %v", candidates)
 	}
 
-	name := candidates[0]
+	rawName := candidates[0]
+	name := normalizeModuleName(rawName)
 	params := make(map[string]interface{})
 
-	switch v := raw[name].(type) {
+	switch v := raw[rawName].(type) {
 	case map[string]interface{}:
-		params = v
+		for k, val := range v {
+			params[k] = val
+		}
+	case rawTask:
+		for k, val := range v {
+			params[k] = val
+		}
 	case string:
 		params["_raw_params"] = v
 	default:
 		params["_raw_params"] = fmt.Sprintf("%v", v)
+	}
+
+	// 支持 task / handler 级别的 args: 语法糖，将 args 字典中的参数合并到 params 中
+	if rawArgs, ok := raw["args"]; ok {
+		if argsMap := extractInterfaceMap(rawArgs); argsMap != nil {
+			for k, val := range argsMap {
+				params[k] = val
+			}
+		}
 	}
 
 	return name, params, nil
@@ -117,13 +183,42 @@ func extractStringMap(v map[string]interface{}) map[string]string {
 	return result
 }
 
+func extractInterfaceMap(v interface{}) map[string]interface{} {
+	switch typed := v.(type) {
+	case nil:
+		return nil
+	case map[string]interface{}:
+		result := make(map[string]interface{}, len(typed))
+		for key, value := range typed {
+			result[key] = value
+		}
+		return result
+	case rawTask:
+		result := make(map[string]interface{}, len(typed))
+		for key, value := range typed {
+			result[key] = value
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
 func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 	if name, ok := raw["name"].(string); ok {
 		task.Name = name
 	}
 
+	task.Vars = extractInterfaceMap(raw["vars"])
+
 	if when, ok := raw["when"]; ok {
 		task.When = when
+	}
+	if changedWhen, ok := raw["changed_when"]; ok {
+		task.ChangedWhen = changedWhen
+	}
+	if failedWhen, ok := raw["failed_when"]; ok {
+		task.FailedWhen = failedWhen
 	}
 
 	if loop, ok := raw["loop"]; ok {
@@ -131,6 +226,35 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 	}
 	if withItems, ok := raw["with_items"]; ok {
 		task.Loop = withItems
+	}
+	if withDict, ok := raw["with_dict"]; ok {
+		task.Loop = withDict
+	}
+	if withFileglob, ok := raw["with_fileglob"]; ok {
+		task.Loop = map[string]interface{}{"__with_fileglob__": withFileglob}
+	}
+	if withSequence, ok := raw["with_sequence"]; ok {
+		task.Loop = map[string]interface{}{"__with_sequence__": withSequence}
+	}
+	if withTogether, ok := raw["with_together"]; ok {
+		task.Loop = map[string]interface{}{"__with_together__": withTogether}
+	}
+	if withNested, ok := raw["with_nested"]; ok {
+		task.Loop = map[string]interface{}{"__with_nested__": withNested}
+	}
+	if loopControl := extractInterfaceMap(raw["loop_control"]); loopControl != nil {
+		if loopVar, ok := loopControl["loop_var"]; ok {
+			task.LoopControl.LoopVar = fmt.Sprintf("%v", loopVar)
+		}
+		if indexVar, ok := loopControl["index_var"]; ok {
+			task.LoopControl.IndexVar = fmt.Sprintf("%v", indexVar)
+		}
+		if label, ok := loopControl["label"]; ok {
+			task.LoopControl.Label = fmt.Sprintf("%v", label)
+		}
+		if extended, ok := loopControl["extended"]; ok {
+			task.LoopControl.Extended = extractBool(extended)
+		}
 	}
 
 	if register, ok := raw["register"].(string); ok {
@@ -148,9 +272,20 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 	if delay, ok := raw["delay"]; ok {
 		task.Delay = extractInt(delay)
 	}
+	if async, ok := raw["async"]; ok {
+		task.Async = extractInt(async)
+	}
+	if poll, ok := raw["poll"]; ok {
+		value := extractInt(poll)
+		task.Poll = &value
+	}
 
 	if ignore, ok := raw["ignore_errors"]; ok {
 		task.IgnoreError = extractBool(ignore)
+	}
+
+	if ignoreUnreachable, ok := raw["ignore_unreachable"]; ok {
+		task.IgnoreUnreachable = extractBool(ignoreUnreachable)
 	}
 
 	if noLog, ok := raw["no_log"]; ok {
@@ -182,6 +317,33 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 	if becomeUser, ok := raw["become_user"].(string); ok {
 		task.BecomeUser = becomeUser
 	}
+	if becomeMethod, ok := raw["become_method"].(string); ok {
+		task.BecomeMethod = becomeMethod
+	}
+	if becomePass, ok := raw["become_pass"]; ok {
+		task.BecomePass = fmt.Sprintf("%v", becomePass)
+	}
+	if becomePasswd, ok := raw["become_password"]; ok && task.BecomePass == "" {
+		task.BecomePass = fmt.Sprintf("%v", becomePasswd)
+	}
+
+	if throttle, ok := raw["throttle"]; ok {
+		task.Throttle = extractInt(throttle)
+	}
+
+	if timeout, ok := raw["timeout"]; ok {
+		task.Timeout = extractInt(timeout)
+	}
+
+	if debugger, ok := raw["debugger"]; ok {
+		task.Debugger = strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", debugger)))
+	}
+
+	if env, ok := raw["environment"]; ok {
+		if envMap := extractInterfaceMap(env); envMap != nil {
+			task.Environment = extractStringMap(envMap)
+		}
+	}
 }
 
 func extractHandlerCommonFields(raw map[string]interface{}, handler *Handler) {
@@ -199,5 +361,38 @@ func extractHandlerCommonFields(raw map[string]interface{}, handler *Handler) {
 	if withItems, ok := raw["with_items"]; ok {
 		handler.WithItems = withItems
 		handler.Loop = withItems
+	}
+	if withDict, ok := raw["with_dict"]; ok {
+		handler.Loop = withDict
+	}
+	if withFileglob, ok := raw["with_fileglob"]; ok {
+		handler.Loop = map[string]interface{}{"__with_fileglob__": withFileglob}
+	}
+	if withSequence, ok := raw["with_sequence"]; ok {
+		handler.Loop = map[string]interface{}{"__with_sequence__": withSequence}
+	}
+	if withTogether, ok := raw["with_together"]; ok {
+		handler.Loop = map[string]interface{}{"__with_together__": withTogether}
+	}
+	if withNested, ok := raw["with_nested"]; ok {
+		handler.Loop = map[string]interface{}{"__with_nested__": withNested}
+	}
+
+	handler.Tags = extractStringList(raw["tags"])
+
+	if become, ok := raw["become"]; ok {
+		handler.Become = extractBool(become)
+	}
+	if becomeUser, ok := raw["become_user"].(string); ok {
+		handler.BecomeUser = becomeUser
+	}
+	if becomeMethod, ok := raw["become_method"].(string); ok {
+		handler.BecomeMethod = becomeMethod
+	}
+	if becomePass, ok := raw["become_pass"]; ok {
+		handler.BecomePass = fmt.Sprintf("%v", becomePass)
+	}
+	if becomePasswd, ok := raw["become_password"]; ok && handler.BecomePass == "" {
+		handler.BecomePass = fmt.Sprintf("%v", becomePasswd)
 	}
 }

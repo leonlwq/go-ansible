@@ -8,13 +8,23 @@ A high-performance Ansible alternative written in Go.
 ## Features
 
 - **High Performance**: Built with Go for faster execution and lower resource usage
-- **Inventory Support**: Parses INI and YAML format inventory files
+- **Inventory Support**: Parses INI, YAML, JSON, and executable dynamic inventory files
+- **Configuration Support**: Reads `ansible.cfg` defaults including inventory, remote user, private key, host key checking, forks, timeout, roles path, gathering mode, and `stdout_callback`
+- **Callback Output**: Supports `default` and `json` stdout callbacks for playbook execution
+- **Vault Support**: Decrypts AES256 Ansible Vault vars files and inline `!vault` values using `ANSIBLE_VAULT_PASSWORD` or `vault_password_file`
 - **SSH Connection Pool**: Concurrent SSH connection management with connection pooling
 - **SSH Authentication**: Support for private key, password, SSH agent, and encrypted keys
-- **Built-in Modules**: 16 commonly used modules (shell, copy, file, apt, yum, service, etc.)
+- **Built-in Modules**: 24 commonly used modules (shell, copy, file, archive, get_url, unarchive, git, docker_container, k8s, apt, yum, service, systemd, etc.)
 - **Playbook Execution**: Full support for playbook parsing and execution
 - **Ad-hoc Commands**: Execute quick commands on remote hosts
 - **Variable Management**: Support for global, group, and host variables
+- **Async Tasks**: Supports `async`/`poll` for `shell` and `command` tasks, with default polling controlled by `ansible.cfg` `poll_interval`
+- **Failure Controls**: Supports play-level `any_errors_fatal`, `force_handlers`, and `max_fail_percentage`
+- **Meta Tasks**: Supports `meta: flush_handlers`, `clear_facts`, `clear_host_errors`, `reset_connection`, `refresh_inventory`, `end_host`, `end_play`, and `noop`
+- **Privilege Escalation**: Supports play, task, and handler level `become`, `become_user`, `become_method`, and `become_password` / `become_pass`
+- **Loop Support**: Supports `loop`, `with_items`, `with_dict`, `with_fileglob`, `with_sequence`, `with_together`, `with_nested`, and `loop_control`
+- **Lookup and Filters**: Supports `lookup('env')`, `lookup('file')`, `lookup('pipe')`, `lookup('template')`, and common filters including `default`, `quote`, `upper`, `lower`, `trim`, `replace`, `join`, `split`, `length`, `first`, `last`, `to_json`, `from_json`, `basename`, `dirname`, `b64encode`, and `b64decode`
+- **Jinja2 Subset**: Template files support common Jinja2 syntax including `{{ var }}`, filter pipelines, `{% if %}` / `{% else %}` / `{% endif %}`, `{% for x in list %}` / `{% endfor %}`, and `{# comments #}`
 
 ## Installation
 
@@ -23,14 +33,27 @@ A high-performance Ansible alternative written in Go.
 ```bash
 git clone https://github.com/go-ansible/go-ansible.git
 cd go-ansible
-go build -o go-ansible ./cmd/go-ansible
-sudo mv go-ansible /usr/local/bin/
+make build
+
+# Directly install / overwrite Python Ansible CLIs in /usr/local/bin:
+sudo make install
+
+# Or specify custom installation directory (e.g. /usr/bin):
+sudo make install PREFIX=/usr
 ```
 
 ### Using Go Install
 
 ```bash
-go install github.com/go-ansible/go-ansible/cmd/go-ansible@latest
+# Install standard Ansible drop-in commands:
+go install github.com/go-ansible/go-ansible/cmd/ansible@latest
+go install github.com/go-ansible/go-ansible/cmd/ansible-playbook@latest
+go install github.com/go-ansible/go-ansible/cmd/ansible-inventory@latest
+go install github.com/go-ansible/go-ansible/cmd/ansible-vault@latest
+go install github.com/go-ansible/go-ansible/cmd/ansible-doc@latest
+go install github.com/go-ansible/go-ansible/cmd/ansible-config@latest
+go install github.com/go-ansible/go-ansible/cmd/ansible-galaxy@latest
+go install github.com/go-ansible/go-ansible/cmd/ansible-pull@latest
 ```
 
 ## Quick Start
@@ -93,27 +116,40 @@ all:
           ansible_host: 192.168.1.21
 ```
 
-### 2. Run Ad-hoc Commands
+### 2. Run Ad-hoc Commands (Drop-in Replacement)
 
 ```bash
-# Ping all hosts
-go-ansible adhoc all -i inventory.ini -m ping
+# Ping all hosts using standard ansible command
+ansible all -i inventory.ini -m ping
 
 # Run shell command
-go-ansible adhoc webservers -i inventory.ini -m shell -a "uptime"
+ansible webservers -i inventory.ini -m shell -a "uptime"
 
 # Check disk usage
-go-ansible adhoc all -i inventory.ini -m shell -a "df -h"
+ansible all -i inventory.ini -m shell -a "df -h"
 
 # Gather system facts
-go-ansible adhoc all -i inventory.ini -m setup
+ansible all -i inventory.ini -m setup
 ```
 
-### 3. Run Playbook
+### 3. Run Playbook (Drop-in Replacement)
 
 ```bash
-go-ansible playbook -i inventory.ini site.yml
+# Execute playbook with native ansible-playbook command (zero syntax changes)
+ansible-playbook -i inventory.ini site.yml
 ```
+
+### 4. Configure Callback Output
+
+```ini
+[defaults]
+stdout_callback = json
+poll_interval = 5
+```
+
+Supported `stdout_callback` values:
+- `default`
+- `json`
 
 ## SSH Authentication
 
@@ -186,62 +222,88 @@ web3 ansible_ssh_private_key_file=/home/user/.ssh/id_rsa
 
 ## CLI Reference
 
-### Global Usage
+`go-ansible` provides both **100% native drop-in replacement commands** (`ansible-playbook`, `ansible`, `ansible-inventory`) and a unified multi-call executable (`go-ansible`).
 
-```
-go-ansible <command> [options]
-
-Commands:
-  playbook    Run a playbook
-  adhoc       Run ad-hoc commands
-  inventory   Manage inventory
-  version     Show version
-  help        Show this help
-```
-
-### Playbook Command
+### Playbook Command (`ansible-playbook` / `go-ansible playbook`)
 
 ```bash
-go-ansible playbook [options] <playbook.yml>
+ansible-playbook [options] <playbook.yml>
+# or: go-ansible playbook [options] <playbook.yml>
 
 Options:
-  -i, --inventory   Inventory file path (required)
-  -t, --tags        Only run tasks with these tags
-  --check           Dry run mode
-  -v, --verbose     Verbose output
+  -i, --inventory         Inventory file path (required)
+  -t, --tags              Only run tasks with these tags
+  --skip-tags             Skip tasks with these tags
+  --start-at-task         Start playbook execution at the task matching this name
+  -l, --limit             Further limit selected hosts
+  -e, --extra-vars        Extra vars (`key=value`, JSON, or `@file`, including Vault-encrypted YAML)
+  -f, --forks             Number of parallel processes (default: 5)
+  -C, --check             Dry run mode
+  -D, --diff              Show diff for supported text/file modules
+  -k, --ask-pass          Prompt for connection password
+  -K, --ask-become-pass   Prompt for privilege escalation password
+  --vault-password-file   Path to vault password file
+  --ask-vault-pass        Prompt for vault password
+  -u, --user              Connect as this remote user
+  --list-tasks            List all tasks that would be executed
+  --list-tags             List all available tags
+  --list-hosts            List all matching hosts
+  --syntax-check          Perform a syntax check on the playbook
+  -v, --verbose           Verbose output
 ```
 
-### Ad-hoc Command
+### Ad-hoc Command (`ansible` / `go-ansible adhoc`)
 
 ```bash
-go-ansible adhoc [options] <target>
+ansible <target> [options]
+# or: go-ansible adhoc <target> [options]
 
 Options:
-  -i, --inventory   Inventory file path (required)
-  -m, --module      Module to execute (default: command)
-  -a, --args        Module arguments
-  --forks           Number of parallel processes (default: 5)
-  -v, --verbose     Verbose output
+  -i, --inventory         Inventory file path (required)
+  -m, --module            Module to execute (default: command)
+  -a, --args              Module arguments
+  -e, --extra-vars        Extra vars (`key=value`, JSON, or `@file`, including Vault-encrypted YAML)
+  -l, --limit             Further limit selected hosts
+  -f, --forks             Number of parallel processes (default: 5)
+  -b, --become            Run operations with become (sudo)
+  -U, --become-user       Run operations as this user (default: root)
+  --become-method         Privilege escalation method to use (default: sudo)
+  -k, --ask-pass          Prompt for connection password
+  -K, --ask-become-pass   Prompt for privilege escalation password
+  --vault-password-file   Path to vault password file
+  --ask-vault-pass        Prompt for vault password
+  -u, --user              Connect as this remote user
+  -C, --check             Dry run mode for supported modules
+  -D, --diff              Show diff for supported text/file modules
+  --list-hosts            List matched hosts without executing
+  -v, --verbose           Verbose output
 
 Examples:
-  go-ansible adhoc all -i inventory.ini -m ping
-  go-ansible adhoc webservers -i inventory.ini -m shell -a "ls -la"
-  go-ansible adhoc all -i inventory.ini -m copy -a "src=/local/file dest=/remote/path"
+  ansible all -i inventory.ini -m ping
+  ansible webservers -i inventory.ini -m shell -a "ls -la" -b
+  ansible all -i inventory.ini -m copy -a "src=/local/file dest=/remote/path" -f 10
+  ansible webservers -i inventory.ini --list-hosts -l "!web2"
+  ansible all -i inventory.ini -m lineinfile -a "path=/etc/app.conf line=mode=prod" -C -D
 ```
 
-### Inventory Command
+### Inventory Command (`ansible-inventory` / `go-ansible inventory`)
 
 ```bash
-go-ansible inventory [options] [list|host]
+ansible-inventory [options]
+# or: go-ansible inventory [options]
 
 Options:
   -i, --inventory   Inventory file path (required)
-  --list            List all hosts and groups
-  --host <name>     Show details for specific host
+  --list            Print Ansible-compatible inventory JSON (default)
+  --host <name>     Print Ansible-compatible host vars JSON
+  -y, --yaml        Output inventory information as YAML
+  --graph           Create an inventory graph tree view
 
 Examples:
-  go-ansible inventory -i inventory.ini list
-  go-ansible inventory -i inventory.ini --host web1
+  ansible-inventory -i inventory.ini --list
+  ansible-inventory -i inventory.ini --host web1
+  ansible-inventory -i inventory.ini --graph
+  ansible-inventory -i inventory.ini -y
 ```
 
 ## Built-in Modules
@@ -262,9 +324,28 @@ Examples:
 | `copy` | Copy files to remote | `-a "src=local dest=/remote"` |
 | `file` | Manage file attributes | `-a "path=/tmp/dir state=directory"` |
 | `template` | Template file rendering | `-a "src=template.j2 dest=/remote"` |
+| `archive` | Create tar or zip archives with checksum-aware idempotence | `-a "path=/srv/app dest=/tmp/app.tar.gz format=tar.gz"` |
+| `get_url` | Download a file with checksum-aware idempotence | `-a "url=https://example.com/app.tar.gz dest=/tmp/app.tar.gz"` |
+| `unarchive` | Extract tar or zip archives on the remote host | `-a "src=/tmp/app.tar.gz dest=/srv/app remote_src=true"` |
 | `lineinfile` | Manage lines in files | `-a "path=/etc/hosts line='127.0.0.1 localhost'"` |
+| `replace` | Replace text in files with regexp or plain-string matching | `-a "path=/etc/app.conf regexp='^port=' replace='port=8080'"` |
+| `find` | Find files with pattern, depth, and limit filters | `-a "paths=/srv/app patterns=*.yml file_type=file depth=3 max_results=20"` |
 | `stat` | Get file information | `-a "path=/etc/passwd"` |
 | `fetch` | Fetch files from remote | `-a "src=/remote dest=/local"` |
+| `wait_for` | Wait for a port, file, or regex condition | `-a "port=8080 timeout=30"` |
+
+### Source Control Modules
+
+| Module | Description | Example |
+|--------|-------------|---------|
+| `git` | Clone or update a Git repository | `-a "repo=https://github.com/org/app.git dest=/srv/app version=main"` |
+
+### Container Modules
+
+| Module | Description | Example |
+|--------|-------------|---------|
+| `docker_container` | Manage Docker containers with basic idempotent lifecycle control | `-a "name=app image=nginx:latest state=started published_ports=8080:80"` |
+| `k8s` | Apply or delete Kubernetes manifests through `kubectl` | `-a "src=deployment.yml state=present namespace=demo"` |
 
 ### Package Modules
 
@@ -278,6 +359,7 @@ Examples:
 | Module | Description | Example |
 |--------|-------------|---------|
 | `service` | Manage services | `-a "name=nginx state=started"` |
+| `systemd` | Manage systemd units with daemon reload/mask support | `-a "name=nginx state=restarted daemon_reload=yes"` |
 | `user` | Manage users | `-a "name=deploy state=present"` |
 | `group` | Manage groups | `-a "name=developers state=present"` |
 | `cron` | Manage cron jobs | `-a "name='backup' job='/backup.sh'"` |
@@ -412,6 +494,73 @@ All modules support these common parameters:
     port: 80
 ```
 
+### lineinfile Module
+
+```yaml
+- name: Create config file and add header at BOF
+  lineinfile:
+    path: /etc/myapp/app.conf
+    line: "# managed by go-ansible"
+    create: yes
+    insertbefore: BOF
+    backup: yes
+    encoding: utf-8
+    newline: lf
+  register: app_conf_edit
+
+- name: Append footer at EOF using CRLF newlines
+  lineinfile:
+    path: /etc/myapp/app.conf
+    line: "# end"
+    insertafter: EOF
+    encoding: latin-1
+    newline: crlf
+
+- name: Inspect lineinfile structured result
+  debug:
+    msg: "action={{ app_conf_edit.action }} count={{ app_conf_edit.count }} created={{ app_conf_edit.created }} backup={{ app_conf_edit.backup_file }}"
+```
+
+### replace Module
+
+```yaml
+- name: Replace simple string
+  replace:
+    path: /etc/myapp/app.conf
+    search_string: "port=80"
+    replace: "port=8080"
+    encoding: latin-1
+    newline: lf
+  register: replace_result
+
+- name: Inspect replace structured result
+  debug:
+    msg: "matched={{ replace_result.matched }} count={{ replace_result.count }} encoding={{ replace_result.encoding }} newline={{ replace_result.newline }}"
+```
+
+### find Module
+
+```yaml
+- name: Find YAML files with depth and limit
+  find:
+    paths:
+      - /srv/app
+    patterns:
+      - "*.yml"
+      - "*.yaml"
+    file_type: file
+    min_depth: 1
+    depth: 3
+    max_results: 20
+    contains: "BEGIN[[:space:][:print:]\n]*END"
+    read_whole_file: yes
+  register: yaml_files
+
+- name: Inspect find structured result
+  debug:
+    msg: "matched={{ yaml_files.matched }} returned={{ yaml_files.returned }} examined={{ yaml_files.examined }} skipped={{ yaml_files.skipped_by_limit }}"
+```
+
 ## Project Structure
 
 ```
@@ -470,23 +619,21 @@ Compared to Python Ansible:
 | Language | Go | Python |
 | Startup | Fast | Slow |
 | Memory | Low | Higher |
-| Modules | 16 built-in | 3000+ |
+| Modules | 24 built-in | 3000+ |
 | Jinja2 | Basic support | Full support |
-| Roles | Not yet | Full support |
+| Roles | Basic support | Full support |
 | Collections | Not yet | Full support |
 | Plugins | Not yet | Full support |
 
 ## Roadmap
 
-- [ ] Full Jinja2 template support
-- [ ] Role support
-- [ ] Vault support (encrypted variables)
-- [ ] Dynamic inventory
-- [ ] More modules (git, docker, kubernetes, etc.)
+- [ ] More complete Jinja2/filter support
+- [ ] More complete Vault support
+- [ ] More modules
 - [ ] Callback plugins
 - [ ] Filter plugins
 - [ ] Connection plugins (winrm, paramiko)
-- [ ] Configuration file support
+- [ ] More complete configuration file support
 - [ ] Parallel execution optimization
 
 ## Contributing

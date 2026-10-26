@@ -2,18 +2,233 @@ package inventory
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
+	"go-ansible/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
-// ParseFile 解析 inventory 文件，自动检测格式
-func ParseFile(filepath string) (*Inventory, error) {
+// ParseSources 解析多个 inventory 源（可为多个文件路径、目录、逗号分隔路径、内联主机列表）
+func ParseSources(sources ...string) (*Inventory, error) {
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no inventory sources specified")
+	}
+
+	result := NewInventory()
+	parsedAny := false
+
+	for _, src := range sources {
+		src = strings.TrimSpace(src)
+		if src == "" {
+			continue
+		}
+
+		// 处理逗号结尾的内联主机（Ansible 经典语法: -i "192.168.1.10,"）
+		if strings.HasSuffix(src, ",") {
+			inlineInv, err := ParseInlineHosts(src)
+			if err != nil {
+				return nil, err
+			}
+			result.Merge(inlineInv)
+			parsedAny = true
+			continue
+		}
+
+		// 检查路径是否存在
+		info, err := os.Stat(src)
+		if err == nil {
+			if info.IsDir() {
+				dirInv, err := ParseDirectory(src)
+				if err != nil {
+					return nil, err
+				}
+				result.Merge(dirInv)
+				parsedAny = true
+				continue
+			}
+
+			// 单文件
+			fileInv, err := parseSingleFile(src)
+			if err != nil {
+				return nil, err
+			}
+			result.Merge(fileInv)
+			parsedAny = true
+			continue
+		}
+
+		// 文件不存在但包含逗号，尝试按多个文件或内联主机解析
+		if strings.Contains(src, ",") {
+			parts := strings.Split(src, ",")
+			allExist := true
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p == "" {
+					continue
+				}
+				if _, err := os.Stat(p); err != nil {
+					allExist = false
+					break
+				}
+			}
+			if allExist {
+				for _, p := range parts {
+					p = strings.TrimSpace(p)
+					if p == "" {
+						continue
+					}
+					inv, err := ParseSources(p)
+					if err != nil {
+						return nil, err
+					}
+					result.Merge(inv)
+					parsedAny = true
+				}
+				continue
+			}
+
+			// 作为内联主机解析
+			inlineInv, err := ParseInlineHosts(src)
+			if err != nil {
+				return nil, err
+			}
+			result.Merge(inlineInv)
+			parsedAny = true
+			continue
+		}
+
+		return nil, fmt.Errorf("inventory source not found: %s", src)
+	}
+
+	if !parsedAny {
+		return nil, fmt.Errorf("no valid inventory parsed from sources: %v", sources)
+	}
+
+	result.ApplyGroupVars()
+	return result, nil
+}
+
+// ParseDirectory 解析目录下所有 inventory 文件并合并
+func ParseDirectory(dirPath string) (*Inventory, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("read inventory directory: %w", err)
+	}
+
+	result := NewInventory()
+	validExts := map[string]bool{
+		".ini":  true,
+		".yml":  true,
+		".yaml": true,
+		".json": true,
+		".toml": true,
+		"":      true, // 可能是动态脚本或无后缀主机文件
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		// 忽略隐藏文件、临时备份文件
+		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, "~") || strings.HasSuffix(name, ".bak") || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(name)
+		if validExts[ext] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	if len(names) == 0 {
+		return nil, fmt.Errorf("no inventory files found in directory: %s", dirPath)
+	}
+
+	for _, name := range names {
+		filePath := filepath.Join(dirPath, name)
+		inv, err := ParseFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("parse file %s: %w", filePath, err)
+		}
+		result.Merge(inv)
+	}
+
+	result.ApplyGroupVars()
+	return result, nil
+}
+
+// ParseInlineHosts 解析内联主机字符串（如 "web1,web2" 或 "192.168.1.10,"）
+func ParseInlineHosts(raw string) (*Inventory, error) {
+	inv := NewInventory()
+	allGroup := &Group{
+		Name:      "all",
+		Hosts:     make([]*Host, 0),
+		Children:  make([]*Group, 0),
+		Variables: make(map[string]string),
+	}
+	ungrouped := &Group{
+		Name:      "ungrouped",
+		Hosts:     make([]*Host, 0),
+		Children:  make([]*Group, 0),
+		Variables: make(map[string]string),
+	}
+	inv.Groups["all"] = allGroup
+	inv.Groups["ungrouped"] = ungrouped
+
+	tokens := strings.Split(raw, ",")
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		host := &Host{
+			Name:      token,
+			Address:   token,
+			Port:      22,
+			Variables: make(map[string]string),
+		}
+		inv.AllHosts[token] = host
+		allGroup.Hosts = append(allGroup.Hosts, host)
+		ungrouped.Hosts = append(ungrouped.Hosts, host)
+	}
+
+	if len(inv.AllHosts) == 0 {
+		return nil, fmt.Errorf("no valid hosts found in inline expression: %q", raw)
+	}
+
+	return inv, nil
+}
+
+// ParseFile 解析 inventory 文件或目录，自动检测格式
+func ParseFile(path string) (*Inventory, error) {
+	if strings.Contains(path, ",") {
+		return ParseSources(path)
+	}
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return ParseDirectory(path)
+	}
+	return parseSingleFile(path)
+}
+
+func parseSingleFile(filepath string) (*Inventory, error) {
+	if info, err := os.Stat(filepath); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+		inv, err := ParseDynamicFile(filepath)
+		if err == nil {
+			inv.ApplyGroupVars()
+			return inv, nil
+		}
+	}
+
 	data, err := os.ReadFile(filepath)
 	if err != nil {
 		return nil, fmt.Errorf("read inventory file: %w", err)
@@ -23,7 +238,9 @@ func ParseFile(filepath string) (*Inventory, error) {
 
 	// 检测格式：YAML 格式通常以 "---" 开头或包含冒号
 	content := strings.TrimSpace(string(data))
-	if strings.HasPrefix(content, "---") || isYAMLFormat(content) {
+	if strings.HasPrefix(content, "{") {
+		inv, err = ParseJSON(data)
+	} else if strings.HasPrefix(content, "---") || isYAMLFormat(content) {
 		inv, err = ParseYAML(data)
 	} else {
 		inv, err = ParseINI(data)
@@ -37,6 +254,27 @@ func ParseFile(filepath string) (*Inventory, error) {
 	inv.ApplyGroupVars()
 
 	return inv, nil
+}
+
+// ParseDynamicFile 解析可执行 inventory 脚本
+func ParseDynamicFile(path string) (*Inventory, error) {
+	listData, err := exec.Command(path, "--list").Output()
+	if err != nil {
+		return nil, fmt.Errorf("run dynamic inventory --list: %w", err)
+	}
+
+	return parseJSONInventory(listData, func(hostName string) (map[string]interface{}, error) {
+		hostData, hostErr := exec.Command(path, "--host", hostName).Output()
+		if hostErr != nil {
+			return nil, hostErr
+		}
+
+		var vars map[string]interface{}
+		if err := json.Unmarshal(hostData, &vars); err != nil {
+			return nil, fmt.Errorf("parse dynamic inventory host %s: %w", hostName, err)
+		}
+		return vars, nil
+	})
 }
 
 // isYAMLFormat 检测是否为 YAML 格式
@@ -172,7 +410,10 @@ func ParseINI(data []byte) (*Inventory, error) {
 // hostname:port
 // hostname ansible_host=192.168.1.1 ansible_user=root ansible_port=22
 func parseHostLine(line string) (*Host, error) {
-	parts := strings.Fields(line)
+	parts, err := util.SplitArgs(line)
+	if err != nil {
+		return nil, fmt.Errorf("split host line: %w", err)
+	}
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("empty host line")
 	}
@@ -215,6 +456,10 @@ func parseHostLine(line string) (*Host, error) {
 				host.Password = value
 			case "ansible_private_key_file", "ansible_ssh_private_key_file":
 				host.PrivateKey = expandHome(value)
+			case "ansible_ssh_common_args":
+				host.SSHCommonArgs = value
+			case "ansible_connection":
+				host.Connection = value
 			case "ansible_become":
 				host.Become = value == "yes" || value == "true" || value == "1"
 			case "ansible_become_user":
@@ -265,6 +510,148 @@ func ParseYAML(data []byte) (*Inventory, error) {
 	return inv, nil
 }
 
+// ParseJSON 解析 JSON 格式的 inventory
+func ParseJSON(data []byte) (*Inventory, error) {
+	return parseJSONInventory(data, nil)
+}
+
+func parseJSONInventory(data []byte, hostVarProvider func(string) (map[string]interface{}, error)) (*Inventory, error) {
+	raw := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse json inventory: %w", err)
+	}
+
+	inv := NewInventory()
+	hostVars := make(map[string]map[string]interface{})
+	if metaRaw, ok := raw["_meta"]; ok {
+		var meta struct {
+			HostVars map[string]map[string]interface{} `json:"hostvars"`
+		}
+		if err := json.Unmarshal(metaRaw, &meta); err != nil {
+			return nil, fmt.Errorf("parse json inventory _meta: %w", err)
+		}
+		hostVars = meta.HostVars
+	}
+
+	groupChildren := make(map[string][]string)
+	for groupName, groupRaw := range raw {
+		if groupName == "_meta" {
+			continue
+		}
+
+		group := ensureInventoryGroup(inv, groupName)
+		var parsed struct {
+			Hosts    []string               `json:"hosts"`
+			Children []string               `json:"children"`
+			Vars     map[string]interface{} `json:"vars"`
+		}
+		if err := json.Unmarshal(groupRaw, &parsed); err != nil {
+			return nil, fmt.Errorf("parse json inventory group %s: %w", groupName, err)
+		}
+
+		for key, value := range parsed.Vars {
+			group.Variables[key] = fmt.Sprintf("%v", value)
+		}
+		for _, hostName := range parsed.Hosts {
+			host := ensureInventoryHost(inv, hostName)
+			group.Hosts = appendUniqueHost(group.Hosts, host)
+		}
+		groupChildren[groupName] = parsed.Children
+	}
+
+	for groupName, children := range groupChildren {
+		group := ensureInventoryGroup(inv, groupName)
+		for _, childName := range children {
+			child := ensureInventoryGroup(inv, childName)
+			child.Parent = group
+			group.Children = appendUniqueGroup(group.Children, child)
+		}
+	}
+
+	for hostName, vars := range hostVars {
+		host := ensureInventoryHost(inv, hostName)
+		applyJSONHostVars(inv, host, vars)
+	}
+
+	if hostVarProvider != nil {
+		for hostName, host := range inv.AllHosts {
+			if len(host.Variables) > 0 || host.Address != host.Name || host.User != "" || host.Port != 22 || host.PrivateKey != "" || host.Password != "" {
+				continue
+			}
+			vars, err := hostVarProvider(hostName)
+			if err != nil || len(vars) == 0 {
+				continue
+			}
+			applyJSONHostVars(inv, host, vars)
+		}
+	}
+
+	return inv, nil
+}
+
+func ensureInventoryGroup(inv *Inventory, name string) *Group {
+	if inv.Groups[name] == nil {
+		inv.Groups[name] = &Group{
+			Name:      name,
+			Hosts:     make([]*Host, 0),
+			Children:  make([]*Group, 0),
+			Variables: make(map[string]string),
+		}
+	}
+	return inv.Groups[name]
+}
+
+func ensureInventoryHost(inv *Inventory, name string) *Host {
+	if inv.AllHosts[name] == nil {
+		inv.AllHosts[name] = &Host{
+			Name:      name,
+			Address:   name,
+			Port:      22,
+			Variables: make(map[string]string),
+		}
+	}
+	return inv.AllHosts[name]
+}
+
+func appendUniqueHost(hosts []*Host, host *Host) []*Host {
+	for _, existing := range hosts {
+		if existing.Name == host.Name {
+			return hosts
+		}
+	}
+	return append(hosts, host)
+}
+
+func appendUniqueGroup(groups []*Group, group *Group) []*Group {
+	for _, existing := range groups {
+		if existing.Name == group.Name {
+			return groups
+		}
+	}
+	return append(groups, group)
+}
+
+func applyJSONHostVars(inv *Inventory, host *Host, vars map[string]interface{}) {
+	for key, value := range vars {
+		stringValue := fmt.Sprintf("%v", value)
+		switch key {
+		case "ansible_host", "ansible_ssh_host",
+			"ansible_user", "ansible_ssh_user",
+			"ansible_port", "ansible_ssh_port",
+			"ansible_ssh_pass",
+			"ansible_private_key_file", "ansible_ssh_private_key_file",
+			"ansible_ssh_common_args",
+			"ansible_connection",
+			"ansible_become", "ansible_become_user", "ansible_become_method",
+			"ansible_become_pass", "ansible_become_password",
+			"ansible_become_exe", "ansible_become_flags":
+			inv.applyConnectionVarToHost(host, key, stringValue, true)
+		default:
+			host.Variables[key] = stringValue
+		}
+	}
+}
+
 // parseYAMLGroup 递归解析 YAML 组
 func parseYAMLGroup(inv *Inventory, name string, data map[string]interface{}, parent *Group) {
 	if inv.Groups[name] == nil {
@@ -312,6 +699,10 @@ func parseYAMLGroup(inv *Inventory, name string, data map[string]interface{}, pa
 						host.Password = val
 					case "ansible_private_key_file", "ansible_ssh_private_key_file":
 						host.PrivateKey = expandHome(val)
+					case "ansible_ssh_common_args":
+						host.SSHCommonArgs = val
+					case "ansible_connection":
+						host.Connection = val
 					case "ansible_become":
 						host.Become = val == "yes" || val == "true" || val == "1"
 					case "ansible_become_user":

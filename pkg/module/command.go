@@ -2,6 +2,7 @@ package module
 
 import (
 	"fmt"
+	"strings"
 
 	"go-ansible/pkg/ssh"
 )
@@ -14,14 +15,47 @@ func (m *CommandModule) Name() string { return "command" }
 func (m *CommandModule) Validate(params map[string]interface{}) error {
 	if _, ok := params["_raw_params"]; !ok {
 		if _, ok := params["cmd"]; !ok {
-			return fmt.Errorf("command module requires _raw_params or cmd")
+			if _, ok := params["argv"]; !ok {
+				return fmt.Errorf("command module requires _raw_params, cmd, or argv")
+			}
 		}
 	}
 	return nil
 }
 
-func (m *CommandModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
-	cmd := GetParamString(params, "_raw_params", "")
+func buildArgvCommand(v interface{}) string {
+	switch args := v.(type) {
+	case []interface{}:
+		if len(args) == 0 {
+			return ""
+		}
+		parts := make([]string, 0, len(args))
+		for _, arg := range args {
+			parts = append(parts, shellQuote(fmt.Sprintf("%v", arg)))
+		}
+		return strings.Join(parts, " ")
+	case []string:
+		if len(args) == 0 {
+			return ""
+		}
+		parts := make([]string, 0, len(args))
+		for _, arg := range args {
+			parts = append(parts, shellQuote(arg))
+		}
+		return strings.Join(parts, " ")
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+}
+
+func (m *CommandModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
+	var cmd string
+	if argvRaw, ok := params["argv"]; ok && argvRaw != nil {
+		cmd = buildArgvCommand(argvRaw)
+	}
+	if cmd == "" {
+		cmd = GetParamString(params, "_raw_params", "")
+	}
 	if cmd == "" {
 		cmd = GetParamString(params, "cmd", "")
 	}
@@ -66,7 +100,7 @@ func (m *ShellModule) Validate(params map[string]interface{}) error {
 	return nil
 }
 
-func (m *ShellModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
+func (m *ShellModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
 	cmd := GetParamString(params, "_raw_params", "")
 	if cmd == "" {
 		cmd = GetParamString(params, "cmd", "")
@@ -108,7 +142,7 @@ func (m *PingModule) Validate(params map[string]interface{}) error {
 	return nil
 }
 
-func (m *PingModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
+func (m *PingModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
 	result, err := client.Execute("echo pong")
 	if err != nil {
 		return result, err
@@ -127,22 +161,29 @@ func (m *SetupModule) Validate(params map[string]interface{}) error {
 	return nil
 }
 
-func (m *SetupModule) Execute(client *ssh.Client, params map[string]interface{}) (*Result, error) {
+func (m *SetupModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
 	filter := GetParamString(params, "filter", "")
 
 	script := `
 		echo "gathered_facts:"
 		echo "  ansible_hostname: $(hostname)"
 		echo "  ansible_fqdn: $(hostname -f 2>/dev/null || hostname)"
-		echo "  ansible_os_family: $(uname -s)"
 		echo "  ansible_architecture: $(uname -m)"
 		echo "  ansible_kernel: $(uname -r)"
+		echo "  ansible_os_family: $(if [ -f /etc/os-release ]; then . /etc/os-release; case \"$ID_LIKE $ID\" in *rhel*|*centos*|*fedora*|*rocky*|*alma*) echo 'RedHat' ;; *debian*|*ubuntu*) echo 'Debian' ;; *alpine*) echo 'Alpine' ;; *arch*) echo 'Archlinux' ;; *suse*) echo 'Suse' ;; *) echo \"$ID\" ;; esac; elif [ \"$(uname -s)\" = 'Darwin' ]; then echo 'Darwin'; else uname -s; fi)"
 		echo "  ansible_distribution: $(cat /etc/os-release 2>/dev/null | grep ^NAME= | cut -d= -f2 | tr -d '\"') || $(sw_vers -productName 2>/dev/null)"
 		echo "  ansible_distribution_version: $(cat /etc/os-release 2>/dev/null | grep ^VERSION_ID= | cut -d= -f2 | tr -d '\"') || $(sw_vers -productVersion 2>/dev/null)"
 		echo "  ansible_python_version: $(python3 --version 2>/dev/null || python --version 2>/dev/null || echo 'Not installed')"
 		echo "  ansible_processor_count: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '1')"
 		echo "  ansible_memtotal_mb: $(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 'N/A')"
-		echo "  ansible_date_time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		echo "  ansible_date_time:"
+		echo "    epoch: \"$(date +%s)\""
+		echo "    iso8601: \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+		echo "    date: \"$(date +%Y-%m-%d)\""
+		echo "    time: \"$(date +%H:%M:%S)\""
+		echo "    year: \"$(date +%Y)\""
+		echo "    month: \"$(date +%m)\""
+		echo "    day: \"$(date +%d)\""
 	`
 
 	if filter != "" {

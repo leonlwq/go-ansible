@@ -7,10 +7,10 @@ import (
 	"go-ansible/pkg/inventory"
 )
 
-// ConnectionPool 连接池
+// ConnectionPool 连接池，统一管理 SSH、Local、Docker 等各类型连接
 type ConnectionPool struct {
 	config  *ClientConfig
-	clients map[string]*Client
+	clients map[string]Connection
 	mu      sync.RWMutex
 }
 
@@ -21,16 +21,16 @@ func NewConnectionPool(config *ClientConfig) *ConnectionPool {
 	}
 	return &ConnectionPool{
 		config:  config,
-		clients: make(map[string]*Client),
+		clients: make(map[string]Connection),
 	}
 }
 
-// Get 获取或创建客户端连接
-func (p *ConnectionPool) Get(host *inventory.Host) (*Client, error) {
+// Get 获取或创建指定主机的连接 (SSH/Local/Docker/WinRM)
+func (p *ConnectionPool) Get(host *inventory.Host) (Connection, error) {
 	p.mu.RLock()
-	if client, ok := p.clients[host.Name]; ok {
+	if conn, ok := p.clients[host.Name]; ok {
 		p.mu.RUnlock()
-		return client, nil
+		return conn, nil
 	}
 	p.mu.RUnlock()
 
@@ -38,21 +38,21 @@ func (p *ConnectionPool) Get(host *inventory.Host) (*Client, error) {
 	defer p.mu.Unlock()
 
 	// double check
-	if client, ok := p.clients[host.Name]; ok {
-		return client, nil
+	if conn, ok := p.clients[host.Name]; ok {
+		return conn, nil
 	}
 
-	client, err := NewClient(host, p.config)
+	conn, err := NewConnection(host, p.config)
 	if err != nil {
-		return nil, fmt.Errorf("create client for %s: %w", host.Name, err)
+		return nil, fmt.Errorf("create connection for %s: %w", host.Name, err)
 	}
 
-	if err := client.Connect(); err != nil {
+	if err := conn.Connect(); err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", host.Name, err)
 	}
 
-	p.clients[host.Name] = client
-	return client, nil
+	p.clients[host.Name] = conn
+	return conn, nil
 }
 
 // Remove 移除连接
@@ -60,12 +60,27 @@ func (p *ConnectionPool) Remove(hostName string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if client, ok := p.clients[hostName]; ok {
-		err := client.Close()
+	if conn, ok := p.clients[hostName]; ok {
+		err := conn.Close()
 		delete(p.clients, hostName)
 		return err
 	}
 	return nil
+}
+
+// Store 将已创建的连接放入缓存。
+func (p *ConnectionPool) Store(hostName string, conn Connection) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clients[hostName] = conn
+}
+
+// Has 判断指定主机是否已有缓存连接。
+func (p *ConnectionPool) Has(hostName string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.clients[hostName]
+	return ok
 }
 
 // Close 关闭所有连接
@@ -74,8 +89,8 @@ func (p *ConnectionPool) Close() error {
 	defer p.mu.Unlock()
 
 	var lastErr error
-	for name, client := range p.clients {
-		if err := client.Close(); err != nil {
+	for name, conn := range p.clients {
+		if err := conn.Close(); err != nil {
 			lastErr = err
 		}
 		delete(p.clients, name)
@@ -95,13 +110,13 @@ func (p *ConnectionPool) ExecuteAll(hosts []*inventory.Host, cmd string) (map[st
 		go func(h *inventory.Host) {
 			defer wg.Done()
 
-			client, err := p.Get(h)
+			conn, err := p.Get(h)
 			if err != nil {
 				errChan <- err
 				return
 			}
 
-			result, err := client.Execute(cmd)
+			result, err := conn.Execute(cmd)
 			if err != nil {
 				errChan <- err
 				return

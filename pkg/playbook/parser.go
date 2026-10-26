@@ -28,7 +28,12 @@ func (p *Parser) ParseFile(path string) (*Playbook, error) {
 	if p.baseDir == "" {
 		p.baseDir = filepath.Dir(path)
 	}
-	return p.Parse(data)
+	playbook, err := p.Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	playbook.Path = path
+	return playbook, nil
 }
 
 // Parse 解析 playbook 内容
@@ -111,12 +116,38 @@ func (p *Parser) ParseRole(rolePath string) (*Role, error) {
 		}
 	}
 
-	// 解析 defaults/main.yml
-	defaultsPath := filepath.Join(rolePath, "defaults", "main.yml")
-	if _, err := os.Stat(defaultsPath); err == nil {
-		data, err := os.ReadFile(defaultsPath)
-		if err == nil {
-			yaml.Unmarshal(data, &role.Defaults)
+	// 解析 defaults/main.yml 或 defaults/main.yaml
+	defaultsFiles := []string{
+		filepath.Join(rolePath, "defaults", "main.yml"),
+		filepath.Join(rolePath, "defaults", "main.yaml"),
+	}
+	for _, defaultsPath := range defaultsFiles {
+		if _, err := os.Stat(defaultsPath); err == nil {
+			data, err := os.ReadFile(defaultsPath)
+			if err == nil {
+				yaml.Unmarshal(data, &role.Defaults)
+			}
+			break
+		}
+	}
+
+	// 解析 meta/main.yml 或 meta/main.yaml (角色依赖)
+	metaFiles := []string{
+		filepath.Join(rolePath, "meta", "main.yml"),
+		filepath.Join(rolePath, "meta", "main.yaml"),
+	}
+	for _, metaPath := range metaFiles {
+		if _, err := os.Stat(metaPath); err == nil {
+			data, err := os.ReadFile(metaPath)
+			if err == nil {
+				var metaData struct {
+					Dependencies []interface{} `yaml:"dependencies"`
+				}
+				if err := yaml.Unmarshal(data, &metaData); err == nil {
+					role.Dependencies = metaData.Dependencies
+				}
+			}
+			break
 		}
 	}
 

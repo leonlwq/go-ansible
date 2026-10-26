@@ -1,0 +1,51 @@
+---
+- hosts: "{{ Hosts }}"
+  # remote_user: "{{ RemoteUser }}"
+  become: yes
+  gather_facts: no
+  vars:
+    VersionStoragePath: "/data/versionstorage"
+    AppPath: "/data/app"
+    SupervisordTemplatePath: "/data/cicd/ansible/repository"
+    SupervisordPath: "/etc/supervisord.d"
+
+  tasks:
+    - name: copy {{ ProjectName }} version file
+      tags: transmit
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: 0644
+      with_items:
+        - {src: "{{ VersionStoragePath }}/{{ ProjectEnv }}/{{ ProjectName }}/{{ ProjectName }}-{{ Version }}.tar.gz",  dest: "{{ AppPath }}/" }
+        - {src: "{{ SupervisordTemplatePath }}/{{ ProjectName }}/{{ ProjectName }}.ini",dest: "{{ SupervisordPath }}/"}
+      notify:
+        - uncompress file
+
+    - name: restart {{ ProjectName }}
+      tags: restart
+      shell:
+        cmd: "{{ item.cmd }}"
+      with_items:
+        - {cmd: "/bin/bash {{ AppPath }}/{{ ProjectName }}/{{ ProjectName }}.sh stop"}
+        - {cmd: "supervisorctl update"}
+        - {cmd: "supervisorctl stop {{ ProjectName }}"}
+        - {cmd: "supervisorctl start {{ ProjectName }}"}
+
+    - name: check {{ ProjectName }}
+      tags: check
+      wait_for:
+        port: "{{ ServicePort }}"
+        delay: 3
+        timeout: 120
+
+  handlers:
+    - name: uncompress file
+      tags: uncompress
+      shell:
+        cmd: "{{ item.cmd }}"
+      with_items:
+        - {cmd: "mkdir -p {{ AppPath }}/{{ ProjectName }}"}
+        - {cmd: "cd {{ AppPath }}/ && tar xf {{ ProjectName }}-{{ Version }}.tar.gz && rm -rf {{ ProjectName }}-{{ Version }}.tar.gz"}

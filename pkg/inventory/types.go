@@ -2,19 +2,21 @@ package inventory
 
 // Host 表示单个主机
 type Host struct {
-	Name         string            `yaml:"name" json:"name"`
-	Address      string            `yaml:"address" json:"address"`
-	Port         int               `yaml:"port" json:"port"`
-	User         string            `yaml:"user" json:"user"`
-	Password     string            `yaml:"password" json:"password"`
-	PrivateKey   string            `yaml:"private_key" json:"private_key"`
-	Become       bool              `yaml:"become" json:"become"`
-	BecomeUser   string            `yaml:"become_user" json:"become_user"`
-	BecomeMethod string            `yaml:"become_method" json:"become_method"`
-	BecomePass   string            `yaml:"become_pass" json:"become_pass"`
-	BecomeExe    string            `yaml:"become_exe" json:"become_exe"`
-	BecomeFlags  string            `yaml:"become_flags" json:"become_flags"`
-	Variables    map[string]string `yaml:"vars" json:"vars"`
+	Name          string            `yaml:"name" json:"name"`
+	Address       string            `yaml:"address" json:"address"`
+	Port          int               `yaml:"port" json:"port"`
+	User          string            `yaml:"user" json:"user"`
+	Password      string            `yaml:"password" json:"password"`
+	PrivateKey    string            `yaml:"private_key" json:"private_key"`
+	SSHCommonArgs string            `yaml:"ssh_common_args" json:"ssh_common_args"`
+	Connection    string            `yaml:"connection" json:"connection"`
+	Become        bool              `yaml:"become" json:"become"`
+	BecomeUser    string            `yaml:"become_user" json:"become_user"`
+	BecomeMethod  string            `yaml:"become_method" json:"become_method"`
+	BecomePass    string            `yaml:"become_pass" json:"become_pass"`
+	BecomeExe     string            `yaml:"become_exe" json:"become_exe"`
+	BecomeFlags   string            `yaml:"become_flags" json:"become_flags"`
+	Variables     map[string]string `yaml:"vars" json:"vars"`
 }
 
 // Group 表示主机组
