@@ -18,7 +18,7 @@ type ConfigOptions struct {
 }
 
 func RunConfig(args []string, version string) {
-	fmt.Println("Reimplementation and reconstruction of the main features in Python version")
+	fmt.Fprintln(os.Stderr, "Reimplementation and reconstruction of the main features in Python version")
 	cmd := NewConfigCmd(version)
 	cmd.SetArgs(normalizeAnsibleArgs(args))
 	if err := cmd.Execute(); err != nil {

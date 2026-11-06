@@ -2,6 +2,9 @@ package module
 
 import (
 	"fmt"
+	"path"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"go-ansible/pkg/ssh"
@@ -20,6 +23,40 @@ type getURLSpec struct {
 	Force         bool
 	Backup        bool
 	ValidateCerts bool
+	URLUsername   string
+	URLPassword   string
+	Headers       map[string]string
+	TmpDest       string
+}
+
+func parseHeadersParam(params map[string]interface{}) map[string]string {
+	val, ok := params["headers"]
+	if !ok || val == nil {
+		return nil
+	}
+	result := make(map[string]string)
+	switch v := val.(type) {
+	case map[string]interface{}:
+		for k, item := range v {
+			result[k] = fmt.Sprintf("%v", item)
+		}
+	case map[string]string:
+		for k, item := range v {
+			result[k] = item
+		}
+	case string:
+		lines := strings.Split(v, "\n")
+		for _, line := range lines {
+			if idx := strings.Index(line, ":"); idx != -1 {
+				k := strings.TrimSpace(line[:idx])
+				val := strings.TrimSpace(line[idx+1:])
+				if k != "" {
+					result[k] = val
+				}
+			}
+		}
+	}
+	return result
 }
 
 func (m *GetURLModule) Name() string { return "get_url" }
@@ -40,17 +77,72 @@ func (m *GetURLModule) Validate(params map[string]interface{}) error {
 }
 
 func (m *GetURLModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
+	dest := GetParamString(params, "dest", "")
+	rawURL := GetParamString(params, "url", "")
+	if strings.HasSuffix(dest, "/") {
+		urlBase := path.Base(rawURL)
+		if urlBase != "" && urlBase != "." && urlBase != "/" {
+			dest = filepath.Join(dest, urlBase)
+		}
+	} else if client != nil && dest != "" {
+		checkDirCmd := fmt.Sprintf("[ -d %s ]", shellQuote(dest))
+		if res, err := client.Execute(checkDirCmd); err == nil && res != nil && res.ExitCode == 0 {
+			urlBase := path.Base(rawURL)
+			if urlBase != "" && urlBase != "." && urlBase != "/" {
+				dest = filepath.Join(dest, urlBase)
+			}
+		}
+	}
+
 	spec := getURLSpec{
-		URL:           GetParamString(params, "url", ""),
-		Dest:          GetParamString(params, "dest", ""),
+		URL:           rawURL,
+		Dest:          dest,
 		Checksum:      GetParamString(params, "checksum", ""),
 		Mode:          GetParamMode(params, "mode", ""),
 		Owner:         GetParamString(params, "owner", ""),
 		Group:         GetParamString(params, "group", ""),
-		Timeout:       GetParam[int](params, "timeout", 30),
+		Timeout:       GetParamInt(params, "timeout", 30),
 		Force:         GetParamBool(params, "force", true),
 		Backup:        GetParamBool(params, "backup", false),
 		ValidateCerts: getOptionalBool(params, "validate_certs", true),
+		URLUsername:   GetParamString(params, "url_username", GetParamString(params, "username", "")),
+		URLPassword:   GetParamString(params, "url_password", GetParamString(params, "password", "")),
+		Headers:       parseHeadersParam(params),
+		TmpDest:       GetParamString(params, "tmp_dest", "/tmp"),
+	}
+
+	if IsCheckMode(params) {
+		checksumAlgo := ""
+		checksumValue := ""
+		if spec.Checksum != "" {
+			if algo, val, err := parseChecksumSpec(spec.Checksum); err == nil {
+				checksumAlgo = algo
+				checksumValue = val
+			}
+		}
+		quotedDest := shellQuote(spec.Dest)
+		checkCmd := fmt.Sprintf(`if [ ! -e %s ]; then echo "missing"; elif [ -d %s ]; then echo "isdir"; else echo "exists"; fi`, quotedDest, quotedDest)
+		res, err := client.Execute(checkCmd)
+		if err != nil {
+			return nil, err
+		}
+		status := strings.TrimSpace(res.Stdout)
+		if status == "missing" {
+			return &Result{Changed: true, Message: "check mode: target file missing, would download"}, nil
+		}
+		if checksumAlgo != "" {
+			verifyCmd := fmt.Sprintf(`if [ "$(%s 2>/dev/null)" = %s ]; then echo "match"; else echo "mismatch"; fi`,
+				checksumCommandForAlgo(quotedDest, checksumAlgo), shellQuote(checksumValue))
+			vRes, _ := client.Execute(verifyCmd)
+			if strings.TrimSpace(vRes.Stdout) == "match" {
+				return &Result{Changed: false, Message: "check mode: file exists and checksum matches"}, nil
+			}
+			return &Result{Changed: true, Message: "check mode: checksum mismatch, would download"}, nil
+		}
+		if !spec.Force {
+			return &Result{Changed: false, Message: "check mode: file exists and force=false"}, nil
+		}
+		return &Result{Changed: true, Message: "check mode: file exists but would be re-downloaded (force=true)"}, nil
 	}
 
 	cmd, err := buildGetURLCommand(spec)
@@ -62,13 +154,7 @@ func (m *GetURLModule) Execute(client ssh.Connection, params map[string]interfac
 	if err != nil {
 		return result, err
 	}
-	if cleaned, changed, found := parseChangedMarker(result.Stdout); found {
-		result.Stdout = cleaned
-		result.Changed = changed
-	}
-	if cleaned, _, found := parseChangedMarker(result.Stderr); found {
-		result.Stderr = cleaned
-	}
+	HandleChangedMarker(result)
 	return result, nil
 }
 
@@ -94,12 +180,18 @@ func buildGetURLCommand(spec getURLSpec) (string, error) {
 		checksumValue = value
 	}
 
+	tmpDir := spec.TmpDest
+	if tmpDir == "" {
+		tmpDir = "/tmp"
+	}
+	tmpDir = strings.TrimRight(tmpDir, "/")
+
 	quotedDest := shellQuote(spec.Dest)
 	quotedURL := shellQuote(spec.URL)
 	lines := []string{
 		"set -e",
 		fmt.Sprintf("timeout=%d", spec.Timeout),
-		`tmp_file="$(mktemp /tmp/go-ansible-geturl.XXXXXX)"`,
+		fmt.Sprintf(`tmp_file="$(mktemp "%s/go-ansible-geturl.XXXXXX")"`, tmpDir),
 		`cleanup() { rm -f "$tmp_file"; }`,
 		`trap cleanup EXIT`,
 	}
@@ -123,7 +215,7 @@ func buildGetURLCommand(spec getURLSpec) (string, error) {
 
 	lines = append(lines,
 		fmt.Sprintf(`mkdir -p "$(dirname %s)"`, quotedDest),
-		buildDownloaderScript(spec.ValidateCerts),
+		buildDownloaderScript(spec.ValidateCerts, spec.URLUsername, spec.URLPassword, spec.Headers),
 		fmt.Sprintf(`download_file %s "$tmp_file" "$timeout"`, quotedURL),
 	)
 
@@ -149,7 +241,7 @@ func buildGetURLCommand(spec getURLSpec) (string, error) {
 	if spec.Backup {
 		lines = append(lines,
 			fmt.Sprintf(`if [ -e %s ]; then`, quotedDest),
-			fmt.Sprintf(`  cp -p %s %s.bak 2>/dev/null || true`, quotedDest, quotedDest),
+			fmt.Sprintf(`  %s`, buildBackupCommand(spec.Dest)),
 			`fi`,
 		)
 	}
@@ -177,8 +269,38 @@ func buildGetURLCommand(spec getURLSpec) (string, error) {
 }
 
 func parseChecksumSpec(spec string) (string, string, error) {
-	algo, value, ok := strings.Cut(strings.TrimSpace(spec), ":")
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return "", "", fmt.Errorf("empty checksum specification")
+	}
+
+	algo, value, ok := strings.Cut(spec, ":")
 	if !ok {
+		// Ansible 官方规范：支持无算法前缀的裸 Hash，根据十六进制长度自动探测算法
+		bare := strings.ToLower(spec)
+		isHex := true
+		for _, c := range bare {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				isHex = false
+				break
+			}
+		}
+		if isHex {
+			switch len(bare) {
+			case 32:
+				return "md5", bare, nil
+			case 40:
+				return "sha1", bare, nil
+			case 56:
+				return "sha224", bare, nil
+			case 64:
+				return "sha256", bare, nil
+			case 96:
+				return "sha384", bare, nil
+			case 128:
+				return "sha512", bare, nil
+			}
+		}
 		return "", "", fmt.Errorf("invalid checksum format: %s", spec)
 	}
 
@@ -215,12 +337,28 @@ func checksumCommandForAlgo(pathExpr, algo string) string {
 	}
 }
 
-func buildDownloaderScript(validateCerts bool) string {
+func buildDownloaderScript(validateCerts bool, username, password string, headers map[string]string) string {
 	curlExtra := ""
 	wgetExtra := ""
 	if !validateCerts {
-		curlExtra = " -k"
-		wgetExtra = " --no-check-certificate"
+		curlExtra += " -k"
+		wgetExtra += " --no-check-certificate"
+	}
+	if username != "" || password != "" {
+		curlExtra += fmt.Sprintf(" -u %s:%s", shellQuote(username), shellQuote(password))
+		wgetExtra += fmt.Sprintf(" --http-user=%s --http-password=%s", shellQuote(username), shellQuote(password))
+	}
+	if len(headers) > 0 {
+		keys := make([]string, 0, len(headers))
+		for k := range headers {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			hVal := fmt.Sprintf("%s: %s", k, headers[k])
+			curlExtra += fmt.Sprintf(" -H %s", shellQuote(hVal))
+			wgetExtra += fmt.Sprintf(" --header=%s", shellQuote(hVal))
+		}
 	}
 
 	return fmt.Sprintf(`download_file() {

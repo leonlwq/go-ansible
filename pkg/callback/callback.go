@@ -4,11 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"golang.org/x/term"
+
 	"go-ansible/pkg/playbook"
+	"go-ansible/pkg/util"
 )
 
 type Renderer interface {
@@ -53,13 +57,18 @@ func (r *DefaultRenderer) Render(w io.Writer, result *playbook.PlaybookResult, t
 		return nil
 	}
 
+	cp := getColorPalette(w)
+
 	for _, play := range result.Plays {
 		playName := play.Name
 		fmt.Fprintf(w, "\nPLAY [%s] *************************************************************************\n", playName)
 
 		for _, hostName := range sortedHostNames(play.Hosts) {
 			hostResult := play.Hosts[hostName]
-			for _, taskResult := range hostResult.Tasks {
+			if hostResult == nil {
+				continue
+			}
+			for _, taskResult := range hostResult.GetTasks() {
 				taskName := taskResult.Name
 				if taskName == "" {
 					taskName = "task"
@@ -68,7 +77,7 @@ func (r *DefaultRenderer) Render(w io.Writer, result *playbook.PlaybookResult, t
 				fmt.Fprintf(w, "\nTASK [%s] *************************************************************************\n", taskName)
 
 				if taskResult.Skipped {
-					fmt.Fprintf(w, "skipping: [%s]\n", hostName)
+					fmt.Fprintf(w, "%sskipping: [%s]%s\n", cp.Cyan, hostName, cp.Reset)
 					continue
 				}
 
@@ -87,19 +96,32 @@ func (r *DefaultRenderer) Render(w io.Writer, result *playbook.PlaybookResult, t
 
 				switch status {
 				case "unreachable":
-					fmt.Fprintf(w, "fatal: [%s]: UNREACHABLE!", hostName)
+					fmt.Fprintf(w, "%sfatal: [%s]: UNREACHABLE!%s", cp.Red, hostName, cp.Reset)
 				case "ignored":
-					fmt.Fprintf(w, "ignoring unreachable: [%s]", hostName)
+					fmt.Fprintf(w, "%signoring unreachable: [%s]%s", cp.Cyan, hostName, cp.Reset)
 				case "fatal":
-					fmt.Fprintf(w, "fatal: [%s]: FAILED!", hostName)
+					fmt.Fprintf(w, "%sfatal: [%s]: FAILED!%s", cp.Red, hostName, cp.Reset)
+				case "changed":
+					fmt.Fprintf(w, "%schanged: [%s]%s", cp.Yellow, hostName, cp.Reset)
 				default:
-					fmt.Fprintf(w, "%s: [%s]", status, hostName)
+					fmt.Fprintf(w, "%sok: [%s]%s", cp.Green, hostName, cp.Reset)
 				}
 
 				if taskResult.Item != nil {
-					fmt.Fprintf(w, " => (item=%v)", formatItem(taskResult.Item))
+					if taskResult.NoLog {
+						fmt.Fprintf(w, " => (item=[VALUE_SPECIFIED_IN_NO_LOG_TASK])")
+					} else {
+						fmt.Fprintf(w, " => (item=%v)", formatItem(taskResult.Item))
+					}
 				}
 				fmt.Fprintln(w)
+
+				if taskResult.NoLog {
+					if taskResult.Failed {
+						fmt.Fprintf(w, "  fatal: [%s]: FAILED! => {\"censored\": \"the output has been hidden due to the fact that 'no_log: true' was specified for this result\"}\n", hostName)
+					}
+					continue
+				}
 
 				if taskResult.Message != "" {
 					fmt.Fprintf(w, "  msg: %s\n", taskResult.Message)
@@ -111,38 +133,79 @@ func (r *DefaultRenderer) Render(w io.Writer, result *playbook.PlaybookResult, t
 					fmt.Fprintf(w, "  stderr: %s\n", taskResult.Stderr)
 				}
 				if taskResult.Diff != "" {
-					fmt.Fprintf(w, "  diff:\n%s\n", indentBlock(taskResult.Diff, "    "))
+					coloredDiff := formatColoredDiff(taskResult.Diff, cp)
+					fmt.Fprintf(w, "  diff:\n%s\n", util.IndentBlock(coloredDiff, "    "))
 				}
 			}
 		}
 	}
 
-	fmt.Fprintf(w, "\nPLAY RECAP *****************************************************************************\n")
+	type recapStats struct {
+		ok          int
+		changed     int
+		unreachable int
+		failed      int
+		skipped     int
+		rescued     int
+		ignored     int
+	}
+
+	hostAgg := make(map[string]*recapStats)
 	for _, play := range result.Plays {
-		for _, hostName := range sortedHostNames(play.Hosts) {
-			hostResult := play.Hosts[hostName]
-			okCount, changedCount, failedCount, skippedCount, unreachableCount, ignoredCount := summarizeHost(hostResult)
-			color := "\033[32m"
-			if failedCount > 0 || (unreachableCount > 0 && ignoredCount == 0) {
-				color = "\033[31m"
-			} else if changedCount > 0 {
-				color = "\033[33m"
-			} else if unreachableCount > 0 {
-				color = "\033[36m"
-			}
-			fmt.Fprintf(
-				w,
-				"%s%-30s\033[0m: ok=%-3d changed=%-3d failed=%-3d skipped=%-3d unreachable=%-3d rescued=0 ignored=%-3d\n",
-				color,
-				hostName,
-				okCount,
-				changedCount,
-				failedCount,
-				skippedCount,
-				unreachableCount,
-				ignoredCount,
-			)
+		if play == nil {
+			continue
 		}
+		for hostName, hostResult := range play.Hosts {
+			if hostResult == nil {
+				continue
+			}
+			st, ok := hostAgg[hostName]
+			if !ok {
+				st = &recapStats{}
+				hostAgg[hostName] = st
+			}
+			okCount, changedCount, failedCount, skippedCount, unreachableCount, rescuedCount, ignoredCount := summarizeHost(hostResult)
+			st.ok += okCount
+			st.changed += changedCount
+			st.unreachable += unreachableCount
+			st.failed += failedCount
+			st.skipped += skippedCount
+			st.rescued += rescuedCount
+			st.ignored += ignoredCount
+		}
+	}
+
+	names := make([]string, 0, len(hostAgg))
+	for h := range hostAgg {
+		names = append(names, h)
+	}
+	sort.Strings(names)
+
+	fmt.Fprintf(w, "\nPLAY RECAP *****************************************************************************\n")
+	for _, hostName := range names {
+		st := hostAgg[hostName]
+		color := cp.Green
+		if st.failed > 0 || (st.unreachable > 0 && st.ignored == 0) {
+			color = cp.Red
+		} else if st.changed > 0 {
+			color = cp.Yellow
+		} else if st.unreachable > 0 {
+			color = cp.Cyan
+		}
+		fmt.Fprintf(
+			w,
+			"%s%-30s%s: ok=%-3d changed=%-3d unreachable=%-3d failed=%-3d skipped=%-3d rescued=%-3d ignored=%-3d\n",
+			color,
+			hostName,
+			cp.Reset,
+			st.ok,
+			st.changed,
+			st.unreachable,
+			st.failed,
+			st.skipped,
+			st.rescued,
+			st.ignored,
+		)
 	}
 
 	if tags != "" {
@@ -170,22 +233,29 @@ func (r *DefaultRenderer) renderProfileTasks(w io.Writer, result *playbook.Playb
 
 	for _, play := range result.Plays {
 		for _, hostResult := range play.Hosts {
-			for _, tr := range hostResult.Tasks {
+			if hostResult == nil {
+				continue
+			}
+			for _, tr := range hostResult.GetTasks() {
 				taskName := tr.Name
 				if taskName == "" {
 					taskName = "task"
+				}
+				displayKey := taskName
+				if play.Name != "" {
+					displayKey = play.Name + " : " + taskName
 				}
 				var dur time.Duration
 				if !tr.Start.IsZero() && !tr.End.IsZero() && tr.End.After(tr.Start) {
 					dur = tr.End.Sub(tr.Start)
 				}
-				if existing, ok := taskMap[taskName]; ok {
+				if existing, ok := taskMap[displayKey]; ok {
 					if dur > existing {
-						taskMap[taskName] = dur
+						taskMap[displayKey] = dur
 					}
 				} else {
-					taskMap[taskName] = dur
-					taskOrder = append(taskOrder, taskName)
+					taskMap[displayKey] = dur
+					taskOrder = append(taskOrder, displayKey)
 				}
 			}
 		}
@@ -223,7 +293,11 @@ func (r *DefaultRenderer) renderProfileTasks(w io.Writer, result *playbook.Playb
 		if dashes < 2 {
 			dashes = 2
 		}
-		fmt.Fprintf(w, "%s %s %6.2fs\n", name, strings.Repeat("-", dashes), p.duration.Seconds())
+		durStr := fmt.Sprintf("%6.2fs", p.duration.Seconds())
+		if p.duration > 0 && p.duration < 10*time.Millisecond {
+			durStr = fmt.Sprintf("%6.3fs", p.duration.Seconds())
+		}
+		fmt.Fprintf(w, "%s %s %s\n", name, strings.Repeat("-", dashes), durStr)
 	}
 }
 
@@ -235,7 +309,10 @@ func (r *DefaultRenderer) renderTimer(w io.Writer, result *playbook.PlaybookResu
 		var earliest, latest time.Time
 		for _, play := range result.Plays {
 			for _, hostResult := range play.Hosts {
-				for _, tr := range hostResult.Tasks {
+				if hostResult == nil {
+					continue
+				}
+				for _, tr := range hostResult.GetTasks() {
 					if !tr.Start.IsZero() && (earliest.IsZero() || tr.Start.Before(earliest)) {
 						earliest = tr.Start
 					}
@@ -254,7 +331,32 @@ func (r *DefaultRenderer) renderTimer(w io.Writer, result *playbook.PlaybookResu
 	hours := int(totalDuration.Hours()) % 24
 	minutes := int(totalDuration.Minutes()) % 60
 	seconds := int(totalDuration.Seconds()) % 60
-	fmt.Fprintf(w, "\nPlaybook run took %d days, %d hours, %d minutes, %d seconds\n", days, hours, minutes, seconds)
+	millis := totalDuration.Milliseconds() % 1000
+	if totalDuration > 0 && totalDuration < time.Second {
+		fmt.Fprintf(w, "\nPlaybook run took %d days, %d hours, %d minutes, %d seconds (%d ms)\n", days, hours, minutes, seconds, millis)
+	} else {
+		fmt.Fprintf(w, "\nPlaybook run took %d days, %d hours, %d minutes, %d seconds\n", days, hours, minutes, seconds)
+	}
+}
+
+func formatColoredDiff(diff string, cp ColorPalette) string {
+	if diff == "" {
+		return ""
+	}
+	lines := strings.Split(diff, "\n")
+	var coloredLines []string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "+") && !strings.HasPrefix(l, "+++") {
+			coloredLines = append(coloredLines, cp.Green+l+cp.Reset)
+		} else if strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "---") {
+			coloredLines = append(coloredLines, cp.Red+l+cp.Reset)
+		} else if strings.HasPrefix(l, "@@") {
+			coloredLines = append(coloredLines, cp.Cyan+l+cp.Reset)
+		} else {
+			coloredLines = append(coloredLines, l)
+		}
+	}
+	return strings.Join(coloredLines, "\n")
 }
 
 type JSONRenderer struct{}
@@ -285,12 +387,23 @@ func (r *JSONRenderer) Render(w io.Writer, result *playbook.PlaybookResult, tags
 		Name  string                     `json:"name"`
 		Hosts map[string]*jsonHostResult `json:"hosts"`
 	}
+	type jsonHostStats struct {
+		OK          int `json:"ok"`
+		Changed     int `json:"changed"`
+		Unreachable int `json:"unreachable"`
+		Failures    int `json:"failures"`
+		Skipped     int `json:"skipped"`
+		Rescued     int `json:"rescued"`
+		Ignored     int `json:"ignored"`
+	}
 
 	payload := struct {
-		Plays []*jsonPlayResult `json:"plays"`
-		Tags  []string          `json:"tags,omitempty"`
+		Plays []*jsonPlayResult         `json:"plays"`
+		Stats map[string]*jsonHostStats `json:"stats,omitempty"`
+		Tags  []string                  `json:"tags,omitempty"`
 	}{
 		Plays: nil,
+		Stats: make(map[string]*jsonHostStats),
 	}
 	if result != nil {
 		payload.Plays = make([]*jsonPlayResult, 0, len(result.Plays))
@@ -300,10 +413,14 @@ func (r *JSONRenderer) Render(w io.Writer, result *playbook.PlaybookResult, tags
 				Hosts: make(map[string]*jsonHostResult, len(play.Hosts)),
 			}
 			for hostName, hostResult := range play.Hosts {
-				jsonHost := &jsonHostResult{
-					Tasks: make([]*jsonTaskResult, 0, len(hostResult.Tasks)),
+				var tasksSnapshot []*playbook.TaskResult
+				if hostResult != nil {
+					tasksSnapshot = hostResult.GetTasks()
 				}
-				for _, taskResult := range hostResult.Tasks {
+				jsonHost := &jsonHostResult{
+					Tasks: make([]*jsonTaskResult, 0, len(tasksSnapshot)),
+				}
+				for _, taskResult := range tasksSnapshot {
 					jsonTask := &jsonTaskResult{
 						Name:        taskResult.Name,
 						Host:        taskResult.Host,
@@ -320,6 +437,16 @@ func (r *JSONRenderer) Render(w io.Writer, result *playbook.PlaybookResult, tags
 						Data:        taskResult.Data,
 						Item:        taskResult.Item,
 					}
+					if taskResult.NoLog {
+						jsonTask.Stdout = "[VALUE_SPECIFIED_IN_NO_LOG_TASK]"
+						jsonTask.Stderr = ""
+						jsonTask.Message = "[VALUE_SPECIFIED_IN_NO_LOG_TASK]"
+						jsonTask.Diff = ""
+						jsonTask.Data = map[string]interface{}{"censored": "the output has been hidden due to the fact that 'no_log: true' was specified for this result"}
+						if jsonTask.Item != nil {
+							jsonTask.Item = "[VALUE_SPECIFIED_IN_NO_LOG_TASK]"
+						}
+					}
 					if !taskResult.Start.IsZero() {
 						jsonTask.Start = taskResult.Start.Format("2006-01-02T15:04:05Z07:00")
 					}
@@ -329,6 +456,20 @@ func (r *JSONRenderer) Render(w io.Writer, result *playbook.PlaybookResult, tags
 					jsonHost.Tasks = append(jsonHost.Tasks, jsonTask)
 				}
 				jsonPlay.Hosts[hostName] = jsonHost
+
+				st, ok := payload.Stats[hostName]
+				if !ok {
+					st = &jsonHostStats{}
+					payload.Stats[hostName] = st
+				}
+				okCount, changedCount, failedCount, skippedCount, unreachableCount, rescuedCount, ignoredCount := summarizeHost(hostResult)
+				st.OK += okCount
+				st.Changed += changedCount
+				st.Unreachable += unreachableCount
+				st.Failures += failedCount
+				st.Skipped += skippedCount
+				st.Rescued += rescuedCount
+				st.Ignored += ignoredCount
 			}
 			payload.Plays = append(payload.Plays, jsonPlay)
 		}
@@ -342,22 +483,17 @@ func (r *JSONRenderer) Render(w io.Writer, result *playbook.PlaybookResult, tags
 	return encoder.Encode(payload)
 }
 
-func indentBlock(text, prefix string) string {
-	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	for i, line := range lines {
-		lines[i] = prefix + line
-	}
-	return strings.Join(lines, "\n")
-}
-
 func HasFailures(result *playbook.PlaybookResult) bool {
 	if result == nil {
 		return false
 	}
 	for _, play := range result.Plays {
 		for _, hostResult := range play.Hosts {
-			for _, taskResult := range hostResult.Tasks {
-				if taskResult.Failed {
+			if hostResult == nil {
+				continue
+			}
+			for _, taskResult := range hostResult.GetTasks() {
+				if (taskResult.Failed && !taskResult.Rescued) || (taskResult.Unreachable && !taskResult.Ignored) {
 					return true
 				}
 			}
@@ -366,11 +502,11 @@ func HasFailures(result *playbook.PlaybookResult) bool {
 	return false
 }
 
-func summarizeHost(hostResult *playbook.HostResult) (okCount, changedCount, failedCount, skippedCount, unreachableCount, ignoredCount int) {
+func summarizeHost(hostResult *playbook.HostResult) (okCount, changedCount, failedCount, skippedCount, unreachableCount, rescuedCount, ignoredCount int) {
 	if hostResult == nil {
-		return 0, 0, 0, 0, 0, 0
+		return 0, 0, 0, 0, 0, 0, 0
 	}
-	for _, taskResult := range hostResult.Tasks {
+	for _, taskResult := range hostResult.GetTasks() {
 		if taskResult.Unreachable {
 			unreachableCount++
 		}
@@ -379,7 +515,11 @@ func summarizeHost(hostResult *playbook.HostResult) (okCount, changedCount, fail
 		}
 		switch {
 		case taskResult.Failed:
-			failedCount++
+			if taskResult.Rescued {
+				rescuedCount++
+			} else {
+				failedCount++
+			}
 		case taskResult.Changed:
 			changedCount++
 		case taskResult.Skipped:
@@ -388,7 +528,7 @@ func summarizeHost(hostResult *playbook.HostResult) (okCount, changedCount, fail
 			okCount++
 		}
 	}
-	return okCount, changedCount, failedCount, skippedCount, unreachableCount, ignoredCount
+	return okCount, changedCount, failedCount, skippedCount, unreachableCount, rescuedCount, ignoredCount
 }
 
 func sortedHostNames(hosts map[string]*playbook.HostResult) []string {
@@ -448,4 +588,56 @@ func formatItem(item interface{}) string {
 	default:
 		return fmt.Sprintf("%v", item)
 	}
+}
+
+// ColorPalette 定义终端色彩 ANSI 转义序列
+type ColorPalette struct {
+	Reset   string
+	Red     string
+	Green   string
+	Yellow  string
+	Blue    string
+	Magenta string
+	Cyan    string
+	White   string
+}
+
+// getColorPalette 根据输出流特性与环境变量获取色彩配置
+func getColorPalette(w io.Writer) ColorPalette {
+	if !shouldUseColor(w) {
+		return ColorPalette{}
+	}
+	return ColorPalette{
+		Reset:   "\033[0m",
+		Red:     "\033[31m",
+		Green:   "\033[32m",
+		Yellow:  "\033[33m",
+		Blue:    "\033[34m",
+		Magenta: "\033[35m",
+		Cyan:    "\033[36m",
+		White:   "\033[37m",
+	}
+}
+
+// shouldUseColor 判定是否启用 ANSI 色彩输出
+func shouldUseColor(w io.Writer) bool {
+	// 1. NO_COLOR 规范 (https://no-color.org) 或 ANSIBLE_NOCOLOR
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	if v := strings.ToLower(os.Getenv("ANSIBLE_NOCOLOR")); v == "1" || v == "true" || v == "yes" {
+		return false
+	}
+
+	// 2. ANSIBLE_FORCE_COLOR
+	if v := strings.ToLower(os.Getenv("ANSIBLE_FORCE_COLOR")); v == "1" || v == "true" || v == "yes" {
+		return true
+	}
+
+	// 3. TTY 终端探测
+	if f, ok := w.(*os.File); ok {
+		return term.IsTerminal(int(f.Fd()))
+	}
+
+	return false
 }

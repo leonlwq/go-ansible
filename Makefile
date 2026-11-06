@@ -9,17 +9,28 @@ BINDIR ?= $(PREFIX)/bin
 # Strip debugging symbols and inject version info
 LDFLAGS ?= -s -w -X 'main.version=$(VERSION)'
 
-COMMANDS = ansible ansible-playbook ansible-inventory ansible-vault ansible-doc ansible-config ansible-galaxy ansible-pull
+COMMANDS = ansible ansible-playbook ansible-inventory ansible-vault ansible-doc ansible-config ansible-galaxy ansible-pull go-ansible
 
 # Supported cross-compilation matrix
 DARWIN_ARCHS = amd64 arm64
 LINUX_ARCHS = amd64 arm64
 WINDOWS_ARCHS = amd64 arm64
 
-.PHONY: all build install darwin linux windows cross-build dist deps test lint fmt vet clean help
+.PHONY: all build multicall install darwin linux windows cross-build dist deps test lint fmt vet clean help
 
 # Default target: build host-platform binaries
 all: clean build
+
+# Build single unified multicall binary with BusyBox-style symlinks
+multicall:
+	@echo "==> Building unified go-ansible multicall binary ($(VERSION))..."
+	@mkdir -p $(BUILD_DIR)
+	@CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/go-ansible ./cmd/go-ansible
+	@echo "  -> Creating symlinks for all 8 Ansible tools in $(BUILD_DIR)/..."
+	@for cmd in ansible ansible-playbook ansible-inventory ansible-vault ansible-doc ansible-config ansible-galaxy ansible-pull; do \
+		ln -sf go-ansible $(BUILD_DIR)/$${cmd}; \
+	done
+	@echo "==> Multicall binary and symlinks ready in $(BUILD_DIR)/"
 
 # Build all 8 CLI tools for the current host environment
 build:

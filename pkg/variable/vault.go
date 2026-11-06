@@ -305,7 +305,8 @@ func decryptPayloadWithPassword(ciphertext, salt, cryptedHMAC []byte, password s
 }
 
 func parseVaultEnvelope(data []byte) ([]byte, string, string, string, error) {
-	lines := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
+	cleanData := bytes.ReplaceAll(data, []byte("\r"), nil)
+	lines := bytes.Split(bytes.TrimSpace(cleanData), []byte("\n"))
 	if len(lines) < 2 {
 		return nil, "", "", "", fmt.Errorf("invalid vault envelope")
 	}
@@ -325,14 +326,19 @@ func parseVaultEnvelope(data []byte) ([]byte, string, string, string, error) {
 }
 
 func parseVaultPayload(payload []byte) ([]byte, []byte, []byte, error) {
-	decoded := make([]byte, hex.DecodedLen(len(payload)))
-	n, err := hex.Decode(decoded, bytes.TrimSpace(payload))
+	cleanPayload := bytes.ReplaceAll(payload, []byte("\r"), nil)
+	cleanPayload = bytes.ReplaceAll(cleanPayload, []byte("\n"), nil)
+	decoded := make([]byte, hex.DecodedLen(len(cleanPayload)))
+	n, err := hex.Decode(decoded, bytes.TrimSpace(cleanPayload))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("decode vault payload: %w", err)
 	}
 	parts := bytes.Split(decoded[:n], []byte("\n"))
 	if len(parts) != 3 {
 		return nil, nil, nil, fmt.Errorf("invalid vault payload format")
+	}
+	for i := range parts {
+		parts[i] = bytes.TrimSpace(parts[i])
 	}
 
 	salt := make([]byte, hex.DecodedLen(len(parts[0])))

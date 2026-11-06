@@ -1,5 +1,7 @@
 package inventory
 
+import "sync"
+
 // Host 表示单个主机
 type Host struct {
 	Name          string            `yaml:"name" json:"name"`
@@ -30,9 +32,15 @@ type Group struct {
 
 // Inventory 表示主机清单
 type Inventory struct {
-	Groups    map[string]*Group `yaml:"groups" json:"groups"`
-	AllHosts  map[string]*Host  `yaml:"-" json:"-"`
-	Variables map[string]string `yaml:"vars" json:"vars"`
+	Groups            map[string]*Group                 `yaml:"groups" json:"groups"`
+	AllHosts          map[string]*Host                  `yaml:"-" json:"-"`
+	Variables         map[string]string                 `yaml:"vars" json:"vars"`
+	GroupVars         map[string]map[string]interface{} `yaml:"-" json:"-"`
+	HostVars          map[string]map[string]interface{} `yaml:"-" json:"-"`
+	Vars              map[string]interface{}            `yaml:"-" json:"-"`
+	FilePath          string                            `yaml:"-" json:"-"`
+	resolvedVarsCache map[string]map[string]string      `yaml:"-" json:"-"`
+	cacheMu           sync.RWMutex                      `yaml:"-" json:"-"`
 }
 
 // NewInventory 创建新的主机清单
@@ -41,5 +49,8 @@ func NewInventory() *Inventory {
 		Groups:    make(map[string]*Group),
 		AllHosts:  make(map[string]*Host),
 		Variables: make(map[string]string),
+		GroupVars: make(map[string]map[string]interface{}),
+		HostVars:  make(map[string]map[string]interface{}),
+		Vars:      make(map[string]interface{}),
 	}
 }

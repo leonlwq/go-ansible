@@ -2,10 +2,12 @@ package module
 
 import (
 	"fmt"
-	"regexp"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"go-ansible/pkg/ssh"
+	"go-ansible/pkg/util"
 )
 
 // ReplaceModule replace 模块
@@ -26,7 +28,7 @@ func (m *ReplaceModule) Validate(params map[string]interface{}) error {
 		return fmt.Errorf("replace regexp and search_string are mutually exclusive")
 	}
 	if regexpText != "" {
-		if _, err := regexp.Compile(regexpText); err != nil {
+		if _, err := util.GetRegex(regexpText); err != nil {
 			return fmt.Errorf("compile regexp: %w", err)
 		}
 	}
@@ -34,12 +36,12 @@ func (m *ReplaceModule) Validate(params map[string]interface{}) error {
 		return err
 	}
 	if before := GetParamString(params, "before", ""); before != "" {
-		if _, err := regexp.Compile(before); err != nil {
+		if _, err := util.GetRegex(before); err != nil {
 			return fmt.Errorf("compile before regexp: %w", err)
 		}
 	}
 	if after := GetParamString(params, "after", ""); after != "" {
-		if _, err := regexp.Compile(after); err != nil {
+		if _, err := util.GetRegex(after); err != nil {
 			return fmt.Errorf("compile after regexp: %w", err)
 		}
 	}
@@ -56,8 +58,9 @@ func (m *ReplaceModule) Execute(client ssh.Connection, params map[string]interfa
 	encoding := GetParamString(params, "encoding", "")
 	newline := GetParamString(params, "newline", "")
 	backup := GetParamBool(params, "backup", false)
-	checkMode := GetParamBool(params, "__check_mode", false)
-	diffMode := GetParamBool(params, "__diff", false)
+	validate := GetParamString(params, "validate", "")
+	checkMode := IsCheckMode(params)
+	diffMode := IsDiffMode(params)
 
 	normalizedEncoding, err := normalizeTextEncoding(encoding)
 	if err != nil {
@@ -121,17 +124,33 @@ func (m *ReplaceModule) Execute(client ssh.Connection, params map[string]interfa
 		}, nil
 	}
 
+	// 验证逻辑 (validate)
+	if validate != "" {
+		tmpPath := fmt.Sprintf("/tmp/go-ansible-repval-%d-%s", time.Now().UnixNano(), filepath.Base(path))
+		if _, err := writeRemoteEncodedContent(client, tmpPath, after, normalizedEncoding); err != nil {
+			return nil, fmt.Errorf("write validate temp file: %w", err)
+		}
+		defer func() {
+			_, _ = client.Execute(fmt.Sprintf("rm -f %s", shellQuote(tmpPath)))
+		}()
+
+		if err := executeValidate(client, validate, tmpPath); err != nil {
+			return &Result{
+				Changed:  false,
+				Failed:   true,
+				Message:  err.Error(),
+				ExitCode: 1,
+			}, nil
+		}
+	}
+
 	backupFile := ""
 	if backup {
 		_, _ = client.Execute(buildBackupCommand(path))
 		backupFile = path + ".bak"
 	}
 
-	writeCmd, err := buildEncodedContentWriteCommand(path, after, normalizedEncoding)
-	if err != nil {
-		return nil, err
-	}
-	result, err := client.Execute(writeCmd)
+	result, err := writeRemoteEncodedContent(client, path, after, normalizedEncoding)
 	if err != nil {
 		return result, err
 	}
@@ -168,7 +187,7 @@ func applyScopedReplace(content, regexpPattern, searchString, replacement, befor
 		replaced := strings.ReplaceAll(target, searchString, replacement)
 		return prefix + replaced + suffix, count, nil
 	}
-	pattern, err := regexp.Compile(regexpPattern)
+	pattern, err := util.GetRegex(regexpPattern)
 	if err != nil {
 		return "", 0, fmt.Errorf("compile regexp: %w", err)
 	}
@@ -182,7 +201,7 @@ func replaceScopeBounds(content, beforePattern, afterPattern string) (int, int, 
 	end := len(content)
 
 	if strings.TrimSpace(beforePattern) != "" {
-		re, err := regexp.Compile(beforePattern)
+		re, err := util.GetRegex(beforePattern)
 		if err != nil {
 			return 0, 0, fmt.Errorf("compile before regexp: %w", err)
 		}
@@ -194,7 +213,7 @@ func replaceScopeBounds(content, beforePattern, afterPattern string) (int, int, 
 	}
 
 	if strings.TrimSpace(afterPattern) != "" {
-		re, err := regexp.Compile(afterPattern)
+		re, err := util.GetRegex(afterPattern)
 		if err != nil {
 			return 0, 0, fmt.Errorf("compile after regexp: %w", err)
 		}

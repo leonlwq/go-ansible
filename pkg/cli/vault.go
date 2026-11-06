@@ -111,7 +111,7 @@ command line with -e @some_file.yml.`,
 	cmd.PersistentFlags().StringArrayVar(&opts.vaultIDs, "vault-id", nil, "the vault identity to use (can be specified multiple times)")
 	cmd.PersistentFlags().StringVar(&opts.encryptVaultID, "encrypt-vault-id", "", "the vault id used to encrypt, must match one of the vault-ids")
 	cmd.PersistentFlags().BoolVarP(&opts.askVaultPass, "ask-vault-pass", "p", false, "ask for vault password")
-	cmd.PersistentFlags().StringVar(&opts.outputFile, "output", "", "output file name for encrypt or decrypt")
+	cmd.PersistentFlags().StringVarP(&opts.outputFile, "output", "o", "", "output file name for encrypt, decrypt, view or encrypt_string")
 	cmd.PersistentFlags().StringVar(&opts.newPassFile, "new-vault-password-file", "", "new vault password file for rekey")
 	cmd.PersistentFlags().StringVar(&opts.newVaultID, "new-vault-id", "", "the new vault identity to use for rekey")
 	encryptStringCmd.Flags().StringVarP(&opts.varName, "name", "n", "", "variable name to enclose in !vault")
@@ -122,7 +122,7 @@ command line with -e @some_file.yml.`,
 
 // RunVault 独立执行 ansible-vault
 func RunVault(args []string, version string) {
-	fmt.Println("Reimplementation and reconstruction of the main features in Python version")
+	fmt.Fprintln(os.Stderr, "Reimplementation and reconstruction of the main features in Python version")
 	cmd := NewVaultCmd(version)
 	cmd.SetArgs(args)
 	if err := cmd.Execute(); err != nil {
@@ -310,9 +310,19 @@ func runVaultView(files []string, opts vaultOptions) error {
 			return fmt.Errorf("decrypt %s: %w", file, err)
 		}
 
-		os.Stdout.Write(decrypted)
+		var out io.Writer = os.Stdout
+		if opts.outputFile != "" {
+			f, err := os.OpenFile(opts.outputFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				return fmt.Errorf("create output file %s: %w", opts.outputFile, err)
+			}
+			defer f.Close()
+			out = f
+		}
+
+		out.Write(decrypted)
 		if !bytes.HasSuffix(decrypted, []byte("\n")) {
-			fmt.Println()
+			fmt.Fprintln(out)
 		}
 	}
 	return nil
@@ -462,6 +472,12 @@ func runVaultEncryptString(args []string, opts vaultOptions) error {
 	}
 
 	formatted := variable.FormatVaultInline(encrypted, opts.varName)
+	if opts.outputFile != "" {
+		if err := os.WriteFile(opts.outputFile, []byte(formatted), 0644); err != nil {
+			return fmt.Errorf("write output file %s: %w", opts.outputFile, err)
+		}
+		return nil
+	}
 	fmt.Print(formatted)
 	return nil
 }

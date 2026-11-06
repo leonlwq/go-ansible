@@ -1,6 +1,7 @@
 package module
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -58,14 +59,18 @@ func (m *URIModule) Execute(client ssh.Connection, params map[string]interface{}
 	}
 
 	result.Stdout = ""
-	if spec.ReturnContent {
-		result.Stdout = body
-	}
 	result.Changed = false
 	result.Data = map[string]interface{}{
-		"status":  status,
-		"url":     spec.URL,
-		"content": body,
+		"status": status,
+		"url":    spec.URL,
+	}
+	if spec.ReturnContent {
+		result.Stdout = body
+		result.Data["content"] = body
+		var jsonData interface{}
+		if err := json.Unmarshal([]byte(body), &jsonData); err == nil && jsonData != nil {
+			result.Data["json"] = jsonData
+		}
 	}
 	if statusAllowed(status, spec.StatusCodes) {
 		result.Failed = false
@@ -91,7 +96,7 @@ func newURISpec(params map[string]interface{}) (uriSpec, error) {
 		statusCodes = []int{200}
 	}
 
-	timeout := GetParam[int](params, "timeout", 30)
+	timeout := GetParamInt(params, "timeout", 30)
 	if timeout <= 0 {
 		timeout = 30
 	}
@@ -101,7 +106,23 @@ func newURISpec(params map[string]interface{}) (uriSpec, error) {
 		method = "GET"
 	}
 
-	body := GetParamString(params, "body", "")
+	var body string
+	if bVal, ok := params["body"]; ok && bVal != nil {
+		switch bv := bVal.(type) {
+		case string:
+			body = bv
+		case []byte:
+			body = string(bv)
+		case map[string]interface{}, []interface{}:
+			if jsonBytes, err := json.Marshal(bv); err == nil {
+				body = string(jsonBytes)
+			} else {
+				body = fmt.Sprintf("%v", bv)
+			}
+		default:
+			body = fmt.Sprintf("%v", bv)
+		}
+	}
 	if method == "GET" && body != "" {
 		method = "POST"
 	}

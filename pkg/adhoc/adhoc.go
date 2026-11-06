@@ -12,6 +12,7 @@ import (
 	"go-ansible/pkg/inventory"
 	"go-ansible/pkg/module"
 	"go-ansible/pkg/ssh"
+	"go-ansible/pkg/util"
 )
 
 // Adhoc Ad-hoc 命令执行器
@@ -163,7 +164,8 @@ func (a *Adhoc) Execute(target, moduleName string, params map[string]interface{}
 						r, e := mod.Execute(client, resolvedParams)
 						done <- asyncRes{res: r, err: e}
 					}()
-					timeout := time.After(time.Duration(a.async) * time.Second)
+					timer := time.NewTimer(time.Duration(a.async) * time.Second)
+					defer timer.Stop()
 					interval := time.Duration(a.poll) * time.Second
 					if interval <= 0 {
 						interval = time.Second
@@ -178,7 +180,7 @@ func (a *Adhoc) Execute(target, moduleName string, params map[string]interface{}
 							modResult = ar.res
 							err = ar.err
 							break pollLoop
-						case <-timeout:
+						case <-timer.C:
 							err = fmt.Errorf("async task timed out after %d seconds", a.async)
 							modResult = &module.Result{
 								Failed:  true,
@@ -256,9 +258,12 @@ func (a *Adhoc) resolveParamsForHost(host *inventory.Host, moduleName string, pa
 	resolved := resolveAdhocValueMap(params, vars)
 	if a.checkMode && supportsAdhocCheckMode(moduleName) {
 		resolved["__check_mode"] = true
+		resolved["_ansible_check_mode"] = true
+		resolved["check_mode"] = true
 	}
 	if a.diffMode && supportsAdhocDiffMode(moduleName) {
 		resolved["__diff"] = true
+		resolved["_ansible_diff"] = true
 	}
 	return resolved
 }
@@ -289,6 +294,10 @@ func resolveAdhocValue(value interface{}, vars map[string]interface{}) interface
 }
 
 func resolveAdhocString(s string, vars map[string]interface{}) interface{} {
+	if !strings.Contains(s, "{{") {
+		return s
+	}
+
 	trimmed := strings.TrimSpace(s)
 	if name, ok := extractSimpleTemplate(trimmed); ok {
 		if value, exists := vars[name]; exists {
@@ -296,16 +305,20 @@ func resolveAdhocString(s string, vars map[string]interface{}) interface{} {
 		}
 	}
 
+	keys := sortedAdhocVarKeys(vars)
 	result := s
 	for i := 0; i < 10; i++ {
 		previous := result
-		for _, key := range sortedAdhocVarKeys(vars) {
+		for _, key := range keys {
 			placeholder := "{{ " + key + " }}"
 			result = strings.ReplaceAll(result, placeholder, fmt.Sprintf("%v", vars[key]))
 			placeholder = "{{" + key + "}}"
 			result = strings.ReplaceAll(result, placeholder, fmt.Sprintf("%v", vars[key]))
+			if !strings.Contains(result, "{{") {
+				return result
+			}
 		}
-		if result == previous {
+		if result == previous || !strings.Contains(result, "{{") {
 			break
 		}
 	}
@@ -338,21 +351,11 @@ func sortedAdhocVarKeys(vars map[string]interface{}) []string {
 }
 
 func supportsAdhocCheckMode(moduleName string) bool {
-	switch moduleName {
-	case "copy", "template", "file", "lineinfile", "replace":
-		return true
-	default:
-		return false
-	}
+	return module.SupportsCheckMode(moduleName)
 }
 
 func supportsAdhocDiffMode(moduleName string) bool {
-	switch moduleName {
-	case "copy", "template", "lineinfile", "replace":
-		return true
-	default:
-		return false
-	}
+	return module.SupportsDiffMode(moduleName)
 }
 
 // ExecuteShell 执行 shell 命令（快捷方式）
@@ -440,19 +443,19 @@ func (r *Result) FormatResult() string {
 			builder.WriteString(fmt.Sprintf("  msg: %s\n", hostResult.Message))
 		}
 		if hostResult.Stdout != "" {
-			builder.WriteString(fmt.Sprintf("  stdout: %s\n", indentAdhocBlock(hostResult.Stdout, "    ")))
+			builder.WriteString(fmt.Sprintf("  stdout: %s\n", util.IndentBlock(hostResult.Stdout, "    ")))
 		}
 		if hostResult.Stderr != "" {
-			builder.WriteString(fmt.Sprintf("  stderr: %s\n", indentAdhocBlock(hostResult.Stderr, "    ")))
+			builder.WriteString(fmt.Sprintf("  stderr: %s\n", util.IndentBlock(hostResult.Stderr, "    ")))
 		}
 		if hostResult.Diff != "" {
 			builder.WriteString("  diff:\n")
-			builder.WriteString(indentAdhocBlock(hostResult.Diff, "    "))
+			builder.WriteString(util.IndentBlock(hostResult.Diff, "    "))
 			builder.WriteString("\n")
 		}
 		if len(hostResult.Data) > 0 {
 			builder.WriteString("  data:\n")
-			builder.WriteString(indentAdhocBlock(formatAdhocData(hostResult.Data), "    "))
+			builder.WriteString(util.IndentBlock(formatAdhocData(hostResult.Data), "    "))
 			builder.WriteString("\n")
 		}
 	}
@@ -498,14 +501,6 @@ func sortedAdhocHostNames(hosts map[string]*HostResult) []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-func indentAdhocBlock(text, prefix string) string {
-	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	for i, line := range lines {
-		lines[i] = prefix + line
-	}
-	return strings.Join(lines, "\n")
 }
 
 func formatAdhocData(data map[string]interface{}) string {

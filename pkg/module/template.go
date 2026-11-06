@@ -7,10 +7,20 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
-	"unicode"
 
 	"go-ansible/pkg/ssh"
+)
+
+var (
+	jinjaCommentPattern   = regexp.MustCompile(`(?s)\{#.*?#\}`)
+	jinjaForTagPattern    = regexp.MustCompile(`\{%-?\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+?)\s*-?%\}`)
+	jinjaTagPattern       = regexp.MustCompile(`\{%-?\s*(.+?)\s*-?%\}`)
+	jinjaExprPattern      = regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
+	numericLiteralPattern = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
+
+	parsedTemplateCache sync.Map
 )
 
 // TemplateModule template 模块
@@ -38,8 +48,8 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 	force := GetParamBool(params, "force", true)
 	become := GetParamBool(params, "become", false)
 	validate := GetParamString(params, "validate", "")
-	checkMode := GetParamBool(params, "__check_mode", false)
-	diffMode := GetParamBool(params, "__diff", false)
+	checkMode := IsCheckMode(params)
+	diffMode := IsDiffMode(params)
 	varsData, _ := params["vars"].(map[string]interface{})
 
 	if varsData == nil {
@@ -60,10 +70,18 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 	localChecksum := stringChecksum(renderedContent)
 	remoteChecksum := readRemoteChecksum(client, dest)
 	if localChecksum == remoteChecksum && remoteChecksum != "" {
-		return &Result{
-			Changed: false,
+		permChanged, err := SetFilePermissions(client, dest, mode, owner, group, false)
+		if err != nil {
+			return nil, fmt.Errorf("set file permissions: %w", err)
+		}
+		result := &Result{
+			Changed: permChanged,
 			Message: "template already rendered with matching content",
-		}, nil
+		}
+		if permChanged {
+			result.Message = "file permissions updated"
+		}
+		return result, nil
 	}
 	if remoteChecksum != "" && !force {
 		return &Result{
@@ -133,16 +151,7 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 	}
 
 	// 设置权限
-	if mode != "" {
-		client.Execute(fmt.Sprintf("chmod %s %s", mode, dest))
-	}
-	if owner != "" {
-		chown := owner
-		if group != "" {
-			chown = fmt.Sprintf("%s:%s", owner, group)
-		}
-		client.Execute(fmt.Sprintf("chown %s %s", chown, dest))
-	}
+	_, _ = SetFilePermissions(client, dest, mode, owner, group, false)
 
 	return &Result{
 		Changed: true,
@@ -151,11 +160,18 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 	}, nil
 }
 
-// RenderTemplateString 将包含 Jinja2 语法的模板字符串预处理并基于 Go template 渲染
+// RenderTemplateString 将包含 Jinja2 语法的模板字符串预处理并基于 Go template 渲染（具备 AST 内存编译缓存加速）
 func RenderTemplateString(tmplContent string, varsData map[string]interface{}) (string, error) {
-	tmpl, err := template.New("template").Funcs(templateFuncMap()).Parse(preprocessJinjaTemplate(tmplContent))
-	if err != nil {
-		return "", fmt.Errorf("parse template: %w", err)
+	var tmpl *template.Template
+	if val, ok := parsedTemplateCache.Load(tmplContent); ok {
+		tmpl = val.(*template.Template)
+	} else {
+		parsed, err := template.New("template").Funcs(templateFuncMap()).Parse(preprocessJinjaTemplate(tmplContent))
+		if err != nil {
+			return "", fmt.Errorf("parse template: %w", err)
+		}
+		parsedTemplateCache.Store(tmplContent, parsed)
+		tmpl = parsed
 	}
 	return renderTemplateContent(tmpl, varsData)
 }
@@ -169,7 +185,7 @@ func renderTemplateContent(tmpl *template.Template, vars map[string]interface{})
 }
 
 func preprocessJinjaTemplate(content string) string {
-	content = regexp.MustCompile(`(?s)\{#.*?#\}`).ReplaceAllString(content, "")
+	content = jinjaCommentPattern.ReplaceAllString(content, "")
 
 	loopVars := collectJinjaLoopVars(content)
 	content = replaceJinjaExpressions(content, loopVars)
@@ -179,16 +195,14 @@ func preprocessJinjaTemplate(content string) string {
 
 func collectJinjaLoopVars(content string) map[string]struct{} {
 	loopVars := make(map[string]struct{})
-	re := regexp.MustCompile(`\{%-?\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+?)\s*-?%\}`)
-	for _, match := range re.FindAllStringSubmatch(content, -1) {
+	for _, match := range jinjaForTagPattern.FindAllStringSubmatch(content, -1) {
 		loopVars[match[1]] = struct{}{}
 	}
 	return loopVars
 }
 
 func replaceJinjaTags(content string, loopVars map[string]struct{}) string {
-	re := regexp.MustCompile(`\{%-?\s*(.+?)\s*-?%\}`)
-	return re.ReplaceAllStringFunc(content, func(raw string) string {
+	return jinjaTagPattern.ReplaceAllStringFunc(content, func(raw string) string {
 		inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(raw, "{%"), "%}"))
 		inner = strings.Trim(inner, "- ")
 
@@ -218,8 +232,7 @@ func replaceJinjaTags(content string, loopVars map[string]struct{}) string {
 }
 
 func replaceJinjaExpressions(content string, loopVars map[string]struct{}) string {
-	re := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
-	return re.ReplaceAllStringFunc(content, func(raw string) string {
+	return jinjaExprPattern.ReplaceAllStringFunc(content, func(raw string) string {
 		inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(raw, "{{"), "}}"))
 		return "{{ " + jinjaExprToGo(inner, loopVars) + " }}"
 	})
@@ -227,17 +240,17 @@ func replaceJinjaExpressions(content string, loopVars map[string]struct{}) strin
 
 func jinjaExprToGo(expr string, loopVars map[string]struct{}) string {
 	expr = strings.TrimSpace(expr)
-	for isMatchedParentheses(expr) {
+	for HasSurroundingParentheses(expr) {
 		expr = strings.TrimSpace(expr[1 : len(expr)-1])
 	}
-	if truePart, condPart, falsePart, ok := splitTernary(expr); ok {
+	if truePart, condPart, falsePart, ok := SplitTernary(expr); ok {
 		trueGo := jinjaExprToGo(truePart, loopVars)
 		falseGo := jinjaExprToGo(falsePart, loopVars)
 		condGo := jinjaConditionToGo(condPart, loopVars)
 		return fmt.Sprintf("(ternary %s %s %s)", trueGo, falseGo, condGo)
 	}
 
-	parts := splitJinjaFilterSegments(expr)
+	parts := SplitFilterSegments(expr)
 	if len(parts) == 0 {
 		return expr
 	}
@@ -257,7 +270,7 @@ func jinjaExprToGo(expr string, loopVars map[string]struct{}) string {
 
 func jinjaConditionToGo(cond string, loopVars map[string]struct{}) string {
 	cond = strings.TrimSpace(cond)
-	for isMatchedParentheses(cond) {
+	for HasSurroundingParentheses(cond) {
 		cond = strings.TrimSpace(cond[1 : len(cond)-1])
 	}
 	if strings.HasPrefix(cond, "not ") {
@@ -291,204 +304,27 @@ func jinjaConditionToGo(cond string, loopVars map[string]struct{}) string {
 	return jinjaExprToGo(cond, loopVars)
 }
 
-func isMatchedParentheses(s string) bool {
-	s = strings.TrimSpace(s)
-	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
-		return false
-	}
-	depth := 0
-	var quote rune
-	runes := []rune(s)
-	for i, ch := range runes {
-		if quote != 0 {
-			if ch == quote {
-				quote = 0
-			}
-			continue
-		}
-		if ch == '\'' || ch == '"' {
-			quote = ch
-			continue
-		}
-		if ch == '(' {
-			depth++
-		} else if ch == ')' {
-			depth--
-			if depth == 0 && i < len(runes)-1 {
-				return false
-			}
-		}
-	}
-	return depth == 0
-}
-
-func splitTernary(expr string) (string, string, string, bool) {
-	runes := []rune(expr)
-	n := len(runes)
-	if n < 7 {
-		return "", "", "", false
-	}
-
-	var quote rune
-	parenDepth := 0
-	bracketDepth := 0
-	braceDepth := 0
-
-	ifIdx := -1
-
-	for i := 0; i < n; i++ {
-		ch := runes[i]
-		if quote != 0 {
-			if ch == quote {
-				quote = 0
-			}
-			continue
-		}
-		if ch == '\'' || ch == '"' {
-			quote = ch
-			continue
-		}
-		if ch == '(' {
-			parenDepth++
-			continue
-		} else if ch == ')' {
-			if parenDepth > 0 {
-				parenDepth--
-			}
-			continue
-		} else if ch == '[' {
-			bracketDepth++
-			continue
-		} else if ch == ']' {
-			if bracketDepth > 0 {
-				bracketDepth--
-			}
-			continue
-		} else if ch == '{' {
-			braceDepth++
-			continue
-		} else if ch == '}' {
-			if braceDepth > 0 {
-				braceDepth--
-			}
-			continue
-		}
-
-		if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
-			// Check for keyword "if"
-			if ifIdx == -1 && i > 0 && i+2 <= n && string(runes[i:i+2]) == "if" {
-				prevIsSep := unicode.IsSpace(runes[i-1]) || runes[i-1] == ')' || runes[i-1] == ']'
-				nextIsSep := i+2 == n || unicode.IsSpace(runes[i+2]) || runes[i+2] == '('
-				if prevIsSep && nextIsSep {
-					ifIdx = i
-					i++ // loop will increment again
-					continue
-				}
-			}
-
-			// If "if" found, check for keyword "else"
-			if ifIdx != -1 && i > ifIdx+2 && i+4 <= n && string(runes[i:i+4]) == "else" {
-				prevIsSep := unicode.IsSpace(runes[i-1]) || runes[i-1] == ')' || runes[i-1] == ']'
-				nextIsSep := i+4 == n || unicode.IsSpace(runes[i+4]) || runes[i+4] == '('
-				if prevIsSep && nextIsSep {
-					truePart := strings.TrimSpace(string(runes[:ifIdx]))
-					condPart := strings.TrimSpace(string(runes[ifIdx+2 : i]))
-					falsePart := strings.TrimSpace(string(runes[i+4:]))
-					if truePart != "" && condPart != "" && falsePart != "" {
-						return truePart, condPart, falsePart, true
-					}
-				}
-			}
-		}
-	}
-
-	return "", "", "", false
-}
-
-func splitJinjaFilterSegments(expr string) []string {
-	segments := make([]string, 0)
-	var current strings.Builder
-	var quote rune
-	depth := 0
-	for _, ch := range expr {
-		switch {
-		case quote != 0:
-			current.WriteRune(ch)
-			if ch == quote {
-				quote = 0
-			}
-		case ch == '\'' || ch == '"':
-			quote = ch
-			current.WriteRune(ch)
-		case ch == '(':
-			depth++
-			current.WriteRune(ch)
-		case ch == ')':
-			if depth > 0 {
-				depth--
-			}
-			current.WriteRune(ch)
-		case ch == '|' && depth == 0:
-			segments = append(segments, strings.TrimSpace(current.String()))
-			current.Reset()
-		default:
-			current.WriteRune(ch)
-		}
-	}
-	if strings.TrimSpace(current.String()) != "" {
-		segments = append(segments, strings.TrimSpace(current.String()))
-	}
-	return segments
-}
-
 func parseJinjaFilter(filter string) (string, []string) {
 	filter = strings.TrimSpace(filter)
 	if open := strings.Index(filter, "("); open != -1 && strings.HasSuffix(filter, ")") {
-		return strings.TrimSpace(filter[:open]), splitJinjaArgs(filter[open+1 : len(filter)-1])
+		return strings.TrimSpace(filter[:open]), SplitFilterArgs(filter[open+1 : len(filter)-1])
 	}
 	return filter, nil
-}
-
-func splitJinjaArgs(args string) []string {
-	result := make([]string, 0)
-	var current strings.Builder
-	var quote rune
-	depth := 0
-	for _, ch := range args {
-		switch {
-		case quote != 0:
-			current.WriteRune(ch)
-			if ch == quote {
-				quote = 0
-			}
-		case ch == '\'' || ch == '"':
-			quote = ch
-			current.WriteRune(ch)
-		case ch == '(':
-			depth++
-			current.WriteRune(ch)
-		case ch == ')':
-			if depth > 0 {
-				depth--
-			}
-			current.WriteRune(ch)
-		case ch == ',' && depth == 0:
-			result = append(result, strings.TrimSpace(current.String()))
-			current.Reset()
-		default:
-			current.WriteRune(ch)
-		}
-	}
-	if strings.TrimSpace(current.String()) != "" {
-		result = append(result, strings.TrimSpace(current.String()))
-	}
-	return result
 }
 
 func jinjaValueToGo(value string, loopVars map[string]struct{}) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return value
+	}
+	if strings.HasPrefix(value, "lookup(") && strings.HasSuffix(value, ")") {
+		innerArgs := value[len("lookup(") : len(value)-1]
+		argList := SplitFilterArgs(innerArgs)
+		goArgs := make([]string, 0, len(argList))
+		for _, arg := range argList {
+			goArgs = append(goArgs, jinjaValueToGo(arg, loopVars))
+		}
+		return fmt.Sprintf("(lookup %s)", strings.Join(goArgs, " "))
 	}
 	if strings.Contains(value, "=") && !strings.Contains(value, "==") && !strings.Contains(value, "!=") && !strings.Contains(value, "<=") && !strings.Contains(value, ">=") {
 		eqIdx := strings.Index(value, "=")
@@ -508,7 +344,7 @@ func jinjaValueToGo(value string, loopVars map[string]struct{}) string {
 	case "none", "null":
 		return "nil"
 	}
-	if _, err := strconv.ParseFloat(value, 64); err == nil && regexp.MustCompile(`^-?\d+(\.\d+)?$`).MatchString(value) {
+	if _, err := strconv.ParseFloat(value, 64); err == nil && numericLiteralPattern.MatchString(value) {
 		return value
 	}
 

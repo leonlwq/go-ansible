@@ -37,6 +37,21 @@ func normalizePlay(raw rawPlay) (*Play, error) {
 		gatherFacts := extractBool(raw.GatherFacts)
 		play.GatherFacts = &gatherFacts
 	}
+	if raw.GatherSubset != nil {
+		play.GatherSubset = extractStringList(raw.GatherSubset)
+	}
+	if raw.GatherTimeout != nil {
+		play.GatherTimeout = extractInt(raw.GatherTimeout)
+	}
+
+	if raw.CheckMode != nil {
+		cm := extractBool(raw.CheckMode)
+		play.CheckMode = &cm
+	}
+	if raw.Diff != nil {
+		df := extractBool(raw.Diff)
+		play.Diff = &df
+	}
 
 	for key, value := range raw.Vars {
 		play.Vars[key] = value

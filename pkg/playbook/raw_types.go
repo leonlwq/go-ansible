@@ -10,6 +10,8 @@ type rawPlay struct {
 	BecomePass     string                 `yaml:"become_pass"`
 	BecomePasswd   string                 `yaml:"become_password"`
 	GatherFacts    interface{}            `yaml:"gather_facts"`
+	GatherSubset   interface{}            `yaml:"gather_subset"`
+	GatherTimeout  interface{}            `yaml:"gather_timeout"`
 	Vars           map[string]interface{} `yaml:"vars"`
 	VarsFiles      interface{}            `yaml:"vars_files"`
 	Tasks          []rawTask              `yaml:"tasks"`
@@ -27,6 +29,8 @@ type rawPlay struct {
 	Throttle       interface{}            `yaml:"throttle"`
 	VarsPrompt     interface{}            `yaml:"vars_prompt"`
 	Debugger       string                 `yaml:"debugger"`
+	CheckMode      interface{}            `yaml:"check_mode"`
+	Diff           interface{}            `yaml:"diff"`
 }
 
 type rawTask map[string]interface{}

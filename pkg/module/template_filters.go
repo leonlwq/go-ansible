@@ -2,6 +2,7 @@ package module
 
 import (
 	"crypto/md5"
+	crand "crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -9,23 +10,53 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"math/big"
 	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"go-ansible/pkg/util"
+)
+
+var (
+	defaultFuncMapOnce sync.Once
+	cachedDefaultFuncMap template.FuncMap
 )
 
 func templateFuncMap() template.FuncMap {
+	defaultFuncMapOnce.Do(func() {
+		cachedDefaultFuncMap = buildTemplateFuncMap()
+	})
+	return cachedDefaultFuncMap
+}
+
+func buildTemplateFuncMap() template.FuncMap {
 	return template.FuncMap{
-		"default":    TemplateDefaultValue,
-		"ternary":    TemplateTernary,
-		"dict2items": TemplateDict2Items,
-		"quote":      TemplateQuoteValue,
+		"lookup":       TemplateLookup,
+		"default":      TemplateDefaultValue,
+		"mandatory":    TemplateMandatory,
+		"ternary":      TemplateTernary,
+		"dict2items":   TemplateDict2Items,
+		"items2dict":   TemplateItems2DictSimple,
+		"to_yaml":      TemplateToYAML,
+		"to_nice_yaml": TemplateToNiceYAML,
+		"from_yaml":    TemplateFromYAML,
+		"quote":        TemplateQuoteValue,
 		"upper": func(value interface{}) string {
 			return strings.ToUpper(fmt.Sprintf("%v", value))
 		},
@@ -42,14 +73,35 @@ func templateFuncMap() template.FuncMap {
 			items := TemplateNormalizeList(value)
 			return strings.Join(items, fmt.Sprintf("%v", sep))
 		},
-		"split": func(sep interface{}, value interface{}) []string {
-			return strings.Split(fmt.Sprintf("%v", value), fmt.Sprintf("%v", sep))
+		"split": func(args ...interface{}) []string {
+			if len(args) == 0 {
+				return []string{}
+			}
+			if len(args) == 1 {
+				return strings.Fields(fmt.Sprintf("%v", args[0]))
+			}
+			sep := fmt.Sprintf("%v", args[0])
+			val := fmt.Sprintf("%v", args[1])
+			return strings.Split(val, sep)
 		},
 		"length": TemplateLength,
 		"first":  TemplateFirst,
 		"last":   TemplateLast,
 		"to_json": func(value interface{}) string {
 			data, err := json.Marshal(value)
+			if err != nil {
+				return ""
+			}
+			return string(data)
+		},
+		"to_nice_json": func(value interface{}, args ...interface{}) string {
+			indent := "  "
+			if len(args) > 0 {
+				if n, ok := args[0].(int); ok && n >= 0 {
+					indent = strings.Repeat(" ", n)
+				}
+			}
+			data, err := json.MarshalIndent(value, "", indent)
 			if err != nil {
 				return ""
 			}
@@ -69,16 +121,24 @@ func templateFuncMap() template.FuncMap {
 			return filepath.Dir(fmt.Sprintf("%v", value))
 		},
 		"b64encode": func(value interface{}) string {
+			if b, ok := value.([]byte); ok {
+				return base64.StdEncoding.EncodeToString(b)
+			}
 			return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%v", value)))
 		},
 		"b64decode": func(value interface{}) string {
-			data, err := base64.StdEncoding.DecodeString(fmt.Sprintf("%v", value))
+			s := strings.TrimSpace(fmt.Sprintf("%v", value))
+			data, err := base64.StdEncoding.DecodeString(s)
 			if err != nil {
-				return ""
+				return s
 			}
 			return string(data)
 		},
 		// High-frequency Ansible filters
+		"to_datetime":   TemplateToDatetime,
+		"strftime":      TemplateStrftime,
+		"urlencode":     TemplateUrlencode,
+		"type_debug":    TemplateTypeDebug,
 		"combine":       TemplateCombine,
 		"regex_replace": TemplateRegexReplace,
 		"regex_search":  TemplateRegexSearch,
@@ -100,6 +160,8 @@ func templateFuncMap() template.FuncMap {
 		"float":         TemplateFloat,
 		"abs":           TemplateAbs,
 		"hash":          TemplateHash,
+		"checksum":      TemplateChecksum,
+		"urlsplit":      TemplateUrlsplit,
 	}
 }
 
@@ -379,19 +441,62 @@ func deepMergeMaps(dest, src map[string]interface{}, recursive bool) {
 	}
 }
 
+var regexCache = util.RegexPool()
+
+func getCachedRegex(pattern string) (*regexp.Regexp, error) {
+	return util.GetRegex(pattern)
+}
+
+// TemplateMandatory raises an error if the value is empty, nil, or undefined.
+func TemplateMandatory(args ...interface{}) (interface{}, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("mandatory filter requires a value")
+	}
+	val := args[0]
+	msg := "Mandatory variable is not defined or is empty"
+	if len(args) > 1 {
+		msg = fmt.Sprintf("%v", args[1])
+	}
+	if val == nil {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return val, nil
+}
+
+func convertPythonBackreferences(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	// 将 Python 正则反向引用形如 \g<1> 转换为 Go 的 ${1}
+	reNamed, err := getCachedRegex(`\\g<([0-9a-zA-Z_]+)>`)
+	if err == nil {
+		s = reNamed.ReplaceAllString(s, `${$1}`)
+	}
+	// 将 Python 正则反向引用形如 \1, \2 转换为 Go 的 $1, $2
+	reNum, err := getCachedRegex(`\\([0-9]+)`)
+	if err == nil {
+		s = reNum.ReplaceAllString(s, `$$1`)
+	}
+	return s
+}
+
 // TemplateRegexReplace replaces matches with replacement.
 func TemplateRegexReplace(pattern, replacement, value interface{}) string {
 	valStr := fmt.Sprintf("%v", value)
-	re, err := regexp.Compile(fmt.Sprintf("%v", pattern))
+	re, err := getCachedRegex(fmt.Sprintf("%v", pattern))
 	if err != nil {
 		return valStr
 	}
-	return re.ReplaceAllString(valStr, fmt.Sprintf("%v", replacement))
+	replStr := convertPythonBackreferences(fmt.Sprintf("%v", replacement))
+	return re.ReplaceAllString(valStr, replStr)
 }
 
 // TemplateRegexSearch returns the first matching substring.
 func TemplateRegexSearch(pattern, value interface{}) string {
-	re, err := regexp.Compile(fmt.Sprintf("%v", pattern))
+	re, err := getCachedRegex(fmt.Sprintf("%v", pattern))
 	if err != nil {
 		return ""
 	}
@@ -400,7 +505,7 @@ func TemplateRegexSearch(pattern, value interface{}) string {
 
 // TemplateRegexFindAll returns all regex matches.
 func TemplateRegexFindAll(pattern, value interface{}) []string {
-	re, err := regexp.Compile(fmt.Sprintf("%v", pattern))
+	re, err := getCachedRegex(fmt.Sprintf("%v", pattern))
 	if err != nil {
 		return []string{}
 	}
@@ -449,7 +554,7 @@ func TemplateSelectAttr(attr interface{}, rest ...interface{}) []interface{} {
 			match = !exists || fmt.Sprintf("%v", val) != fmt.Sprintf("%v", target)
 		case "match":
 			if exists {
-				if re, err := regexp.Compile(fmt.Sprintf("%v", target)); err == nil {
+				if re, err := getCachedRegex(fmt.Sprintf("%v", target)); err == nil {
 					match = re.MatchString(fmt.Sprintf("%v", val))
 				}
 			}
@@ -801,9 +906,37 @@ func TemplateAbs(value interface{}) interface{} {
 }
 
 // TemplateHash calculates cryptographic hashes (md5, sha1, sha256, sha512).
-func TemplateHash(algo, value interface{}) string {
+// Supports TemplateHash(value) with default 'sha1' (Ansible standard), or TemplateHash(algo, value) / TemplateHash(value, algo).
+func TemplateHash(args ...interface{}) string {
+	if len(args) == 0 {
+		return ""
+	}
+	algo := "sha1"
+	var value interface{}
+
+	if len(args) == 1 {
+		value = args[0]
+	} else {
+		a0 := strings.ToLower(fmt.Sprintf("%v", args[0]))
+		switch a0 {
+		case "md5", "sha1", "sha256", "sha512":
+			algo = a0
+			value = args[1]
+		default:
+			a1 := strings.ToLower(fmt.Sprintf("%v", args[1]))
+			switch a1 {
+			case "md5", "sha1", "sha256", "sha512":
+				algo = a1
+				value = args[0]
+			default:
+				algo = a0
+				value = args[1]
+			}
+		}
+	}
+
 	data := []byte(fmt.Sprintf("%v", value))
-	switch strings.ToLower(fmt.Sprintf("%v", algo)) {
+	switch algo {
 	case "md5":
 		h := md5.Sum(data)
 		return hex.EncodeToString(h[:])
@@ -817,9 +950,80 @@ func TemplateHash(algo, value interface{}) string {
 		h := sha512.Sum512(data)
 		return hex.EncodeToString(h[:])
 	default:
-		h := sha256.Sum256(data)
+		h := sha1.Sum(data)
 		return hex.EncodeToString(h[:])
 	}
+}
+
+// TemplateChecksum returns sha1 hash of value (Ansible standard checksum filter).
+func TemplateChecksum(value interface{}) string {
+	return TemplateHash("sha1", value)
+}
+
+// TemplateUrlsplit parses a URL and returns a map of its components or a specific component.
+func TemplateUrlsplit(args ...interface{}) interface{} {
+	if len(args) == 0 {
+		return nil
+	}
+	var rawURL, queryKey string
+	if len(args) == 1 {
+		rawURL = fmt.Sprintf("%v", args[0])
+	} else {
+		arg0 := fmt.Sprintf("%v", args[0])
+		arg1 := fmt.Sprintf("%v", args[1])
+		if strings.Contains(arg0, "://") || strings.HasPrefix(arg0, "/") {
+			rawURL = arg0
+			queryKey = arg1
+		} else {
+			queryKey = arg0
+			rawURL = arg1
+		}
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		if queryKey != "" {
+			return ""
+		}
+		return map[string]interface{}{}
+	}
+
+	var user, pass string
+	netloc := u.Host
+	if u.User != nil {
+		user = u.User.Username()
+		pass, _ = u.User.Password()
+		netloc = u.User.String() + "@" + u.Host
+	}
+
+	var portVal interface{}
+	if pStr := u.Port(); pStr != "" {
+		if pInt, err := strconv.Atoi(pStr); err == nil {
+			portVal = pInt
+		} else {
+			portVal = pStr
+		}
+	}
+
+	m := map[string]interface{}{
+		"scheme":   u.Scheme,
+		"netloc":   netloc,
+		"path":     u.Path,
+		"query":    u.RawQuery,
+		"fragment": u.Fragment,
+		"username": user,
+		"password": pass,
+		"hostname": u.Hostname(),
+		"port":     portVal,
+	}
+
+	if queryKey != "" {
+		if v, ok := m[queryKey]; ok {
+			return v
+		}
+		return ""
+	}
+	return m
 }
 
 // Internal helpers
@@ -990,5 +1194,506 @@ func TemplateDict2Items(val interface{}) ([]map[string]interface{}, error) {
 			return result, nil
 		}
 		return nil, fmt.Errorf("dict2items requires a dictionary, got %T", val)
+	}
+}
+
+// TemplateItems2Dict converts a list of key/value pairs into a dictionary
+func TemplateItems2Dict(val interface{}, args ...string) (map[string]interface{}, error) {
+	if val == nil {
+		return map[string]interface{}{}, nil
+	}
+	keyName := "key"
+	valueName := "value"
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		arg = strings.Trim(arg, `"'`)
+		if strings.HasPrefix(strings.ToLower(arg), "key_name=") {
+			keyName = strings.Trim(arg[len("key_name="):], `"'`)
+		} else if strings.HasPrefix(strings.ToLower(arg), "value_name=") {
+			valueName = strings.Trim(arg[len("value_name="):], `"'`)
+		} else if keyName == "key" {
+			keyName = arg
+		} else if valueName == "value" {
+			valueName = arg
+		}
+	}
+
+	result := make(map[string]interface{})
+
+	extractKV := func(item interface{}) (string, interface{}, bool) {
+		if item == nil {
+			return "", nil, false
+		}
+		switch m := item.(type) {
+		case map[string]interface{}:
+			k, kOk := m[keyName]
+			v := m[valueName]
+			if kOk && k != nil {
+				return fmt.Sprintf("%v", k), v, true
+			}
+		case map[string]string:
+			k, kOk := m[keyName]
+			v := m[valueName]
+			if kOk {
+				return k, v, true
+			}
+		case map[interface{}]interface{}:
+			var kVal, vVal interface{}
+			var kFound bool
+			for mk, mv := range m {
+				if fmt.Sprintf("%v", mk) == keyName {
+					kVal = mv
+					kFound = true
+				}
+				if fmt.Sprintf("%v", mk) == valueName {
+					vVal = mv
+				}
+			}
+			if kFound && kVal != nil {
+				return fmt.Sprintf("%v", kVal), vVal, true
+			}
+		default:
+			rv := reflect.ValueOf(item)
+			if rv.Kind() == reflect.Map {
+				var kVal, vVal interface{}
+				var kFound bool
+				for _, mk := range rv.MapKeys() {
+					if fmt.Sprintf("%v", mk.Interface()) == keyName {
+						kVal = rv.MapIndex(mk).Interface()
+						kFound = true
+					}
+					if fmt.Sprintf("%v", mk.Interface()) == valueName {
+						vVal = rv.MapIndex(mk).Interface()
+					}
+				}
+				if kFound && kVal != nil {
+					return fmt.Sprintf("%v", kVal), vVal, true
+				}
+			}
+		}
+		return "", nil, false
+	}
+
+	switch items := val.(type) {
+	case []interface{}:
+		for _, item := range items {
+			if k, v, ok := extractKV(item); ok {
+				result[k] = v
+			}
+		}
+		return result, nil
+	case []map[string]interface{}:
+		for _, item := range items {
+			if k, v, ok := extractKV(item); ok {
+				result[k] = v
+			}
+		}
+		return result, nil
+	case []map[string]string:
+		for _, item := range items {
+			if k, v, ok := extractKV(item); ok {
+				result[k] = v
+			}
+		}
+		return result, nil
+	default:
+		rv := reflect.ValueOf(val)
+		if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+			for i := 0; i < rv.Len(); i++ {
+				item := rv.Index(i).Interface()
+				if k, v, ok := extractKV(item); ok {
+					result[k] = v
+				}
+			}
+			return result, nil
+		}
+		return nil, fmt.Errorf("items2dict requires a list/slice, got %T", val)
+	}
+}
+
+// TemplateItems2DictSimple 是 items2dict 在无参调用时的别名
+func TemplateItems2DictSimple(val interface{}) (map[string]interface{}, error) {
+	return TemplateItems2Dict(val)
+}
+
+// TemplateToYAML 将任意数据结构序列化为 YAML 字符串
+func TemplateToYAML(val interface{}) (string, error) {
+	if val == nil {
+		return "null\n", nil
+	}
+	data, err := yaml.Marshal(val)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// TemplateToNiceYAML 将数据结构格式化为带指定缩进的 YAML 文本 (默认 indent: 2)
+func TemplateToNiceYAML(val interface{}, args ...interface{}) (string, error) {
+	if val == nil {
+		return "null\n", nil
+	}
+	indent := 2
+	if len(args) > 0 {
+		switch v := args[0].(type) {
+		case int:
+			if v > 0 {
+				indent = v
+			}
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+				indent = n
+			}
+		}
+	}
+	var buf strings.Builder
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(indent)
+	if err := enc.Encode(val); err != nil {
+		return "", err
+	}
+	_ = enc.Close()
+	return buf.String(), nil
+}
+
+// TemplateFromYAML 将 YAML 字符串反序列化为数据结构
+func TemplateFromYAML(val interface{}) (interface{}, error) {
+	if val == nil {
+		return nil, nil
+	}
+	var raw []byte
+	switch v := val.(type) {
+	case string:
+		raw = []byte(v)
+	case []byte:
+		raw = v
+	default:
+		raw = []byte(fmt.Sprintf("%v", val))
+	}
+	var decoded interface{}
+	if err := yaml.Unmarshal(raw, &decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
+
+// ExecuteLookup 统一执行 Ansible lookup 插件（env, file, pipe, template, password, first_found, url），
+// 支持传入 baseDir 解析相对文件路径，实现 Playbook 表达式与 Jinja2 模板渲染的统一复用。
+func ExecuteLookup(baseDir string, pluginName string, args ...interface{}) (interface{}, error) {
+	return ExecuteLookupWithVars(baseDir, pluginName, nil, args...)
+}
+
+// ExecuteLookupWithVars 在 ExecuteLookup 基础上支持注入上下文变量字典（用于 template 等插件渲染）。
+func ExecuteLookupWithVars(baseDir string, pluginName string, vars map[string]interface{}, args ...interface{}) (interface{}, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	key := fmt.Sprintf("%v", args[0])
+
+	resolvePath := func(p string) string {
+		p = util.ExpandPath(p)
+		if !filepath.IsAbs(p) && baseDir != "" {
+			direct := filepath.Join(baseDir, p)
+			if _, err := os.Stat(direct); err == nil {
+				return direct
+			}
+			for _, sub := range []string{"files", "templates"} {
+				subPath := filepath.Join(baseDir, sub, p)
+				if _, err := os.Stat(subPath); err == nil {
+					return subPath
+				}
+			}
+			return direct
+		}
+		return p
+	}
+
+	switch strings.ToLower(strings.TrimSpace(pluginName)) {
+	case "env":
+		return os.Getenv(key), nil
+	case "file":
+		path := resolvePath(key)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("lookup 'file' failed to read %s: %w", path, err)
+		}
+		return strings.TrimRight(string(data), "\r\n"), nil
+	case "pipe":
+		output, err := exec.Command("/bin/sh", "-c", key).CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("lookup 'pipe' failed to execute %q: %v (%s)", key, err, strings.TrimSpace(string(output)))
+		}
+		return strings.TrimRight(string(output), "\r\n"), nil
+	case "template":
+		path := resolvePath(key)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("lookup 'template' failed to read %s: %w", path, err)
+		}
+		varsMap := make(map[string]interface{})
+		for k, v := range vars {
+			varsMap[k] = v
+		}
+		if len(args) > 1 {
+			if vm, ok := args[1].(map[string]interface{}); ok {
+				for k, v := range vm {
+					varsMap[k] = v
+				}
+			}
+		}
+		rendered, err := RenderTemplateString(string(data), varsMap)
+		if err != nil {
+			return "", fmt.Errorf("lookup 'template' failed to render %s: %w", path, err)
+		}
+		return strings.TrimRight(rendered, "\r\n"), nil
+	case "password":
+		parts := strings.Fields(key)
+		if len(parts) == 0 {
+			return "", nil
+		}
+		path := resolvePath(parts[0])
+		if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			return strings.TrimRight(string(data), "\r\n"), nil
+		}
+		length := 16
+		chars := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		for _, param := range parts[1:] {
+			if strings.HasPrefix(param, "length=") {
+				if l, err := strconv.Atoi(param[len("length="):]); err == nil && l > 0 {
+					length = l
+				}
+			} else if strings.HasPrefix(param, "chars=") {
+				charsVal := param[len("chars="):]
+				customChars := ""
+				for _, cName := range strings.Split(charsVal, ",") {
+					switch strings.TrimSpace(cName) {
+					case "ascii_letters":
+						customChars += "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+					case "ascii_lowercase":
+						customChars += "abcdefghijklmnopqrstuvwxyz"
+					case "ascii_uppercase":
+						customChars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+					case "digits":
+						customChars += "0123456789"
+					case "punctuation":
+						customChars += "!@#$%^&*()-_=+"
+					default:
+						customChars += cName
+					}
+				}
+				if len(customChars) > 0 {
+					chars = customChars
+				}
+			}
+		}
+		genPass := generateRandomLookupPassword(length, chars)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err == nil {
+			_ = os.WriteFile(path, []byte(genPass+"\n"), 0600)
+		}
+		return genPass, nil
+	case "first_found":
+		candidates := strings.Split(key, ",")
+		for _, c := range candidates {
+			candidate := strings.TrimSpace(c)
+			if candidate == "" {
+				continue
+			}
+			p := resolvePath(candidate)
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+		if len(args) > 1 {
+			for _, arg := range args[1:] {
+				candidate := fmt.Sprintf("%v", arg)
+				p := resolvePath(candidate)
+				if _, err := os.Stat(p); err == nil {
+					return p, nil
+				}
+			}
+		}
+		return "", nil
+	case "url":
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(key)
+		if err != nil {
+			return "", nil
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", nil
+		}
+		return strings.TrimRight(string(body), "\r\n"), nil
+	default:
+		return key, nil
+	}
+}
+
+// TemplateLookup 实现了与 Playbook 表达式一致的 lookup 插件函数，可在 Jinja2 模板与表达式中无缝调用
+func TemplateLookup(pluginName string, args ...interface{}) (interface{}, error) {
+	return ExecuteLookup("", pluginName, args...)
+}
+
+func generateRandomLookupPassword(length int, chars string) string {
+	if length <= 0 {
+		length = 16
+	}
+	if len(chars) == 0 {
+		chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	}
+	runes := []rune(chars)
+	result := make([]rune, length)
+	for i := 0; i < length; i++ {
+		n, err := crand.Int(crand.Reader, big.NewInt(int64(len(runes))))
+		if err != nil {
+			result[i] = runes[i%len(runes)]
+		} else {
+			result[i] = runes[n.Int64()]
+		}
+	}
+	return string(result)
+}
+
+// strftimeToGoLayout converts common Python strftime formats into Go reference time format.
+func strftimeToGoLayout(format string) string {
+	r := strings.NewReplacer(
+		"%Y", "2006",
+		"%y", "06",
+		"%m", "01",
+		"%d", "02",
+		"%H", "15",
+		"%I", "03",
+		"%p", "PM",
+		"%M", "04",
+		"%S", "05",
+		"%f", "000000",
+		"%z", "-0700",
+		"%Z", "MST",
+		"%b", "Jan",
+		"%B", "January",
+		"%a", "Mon",
+		"%A", "Monday",
+	)
+	return r.Replace(format)
+}
+
+// TemplateToDatetime converts a date string into a time.Time or RFC3339 formatted string.
+func TemplateToDatetime(args ...interface{}) interface{} {
+	if len(args) == 0 || args[0] == nil {
+		return time.Now().Format(time.RFC3339)
+	}
+	valStr := strings.TrimSpace(fmt.Sprintf("%v", args[0]))
+	if valStr == "" {
+		return time.Now().Format(time.RFC3339)
+	}
+	format := "%Y-%m-%d %H:%M:%S"
+	if len(args) > 1 && args[1] != nil {
+		f := strings.TrimSpace(fmt.Sprintf("%v", args[1]))
+		if f != "" {
+			format = f
+		}
+	}
+	goLayout := strftimeToGoLayout(format)
+	if t, err := time.Parse(goLayout, valStr); err == nil {
+		return t.Format(time.RFC3339)
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02"} {
+		if t, err := time.Parse(layout, valStr); err == nil {
+			return t.Format(time.RFC3339)
+		}
+	}
+	return valStr
+}
+
+// TemplateStrftime formats a time or current time according to format string.
+func TemplateStrftime(args ...interface{}) string {
+	format := "%Y-%m-%d %H:%M:%S"
+	var t time.Time = time.Now()
+
+	if len(args) == 1 {
+		s := fmt.Sprintf("%v", args[0])
+		if strings.Contains(s, "%") {
+			format = s
+		} else if parsed, err := time.Parse(time.RFC3339, s); err == nil {
+			t = parsed
+		} else if parsed, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+			t = parsed
+		} else if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+			t = time.Unix(sec, 0)
+		}
+	} else if len(args) >= 2 {
+		s := fmt.Sprintf("%v", args[0])
+		format = fmt.Sprintf("%v", args[1])
+		if parsed, err := time.Parse(time.RFC3339, s); err == nil {
+			t = parsed
+		} else if parsed, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+			t = parsed
+		} else if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+			t = time.Unix(sec, 0)
+		}
+	}
+	goLayout := strftimeToGoLayout(format)
+	return t.Format(goLayout)
+}
+
+// TemplateUrlencode escapes URL query parameters.
+func TemplateUrlencode(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return url.QueryEscape(v)
+	case map[string]interface{}:
+		vals := url.Values{}
+		var keys []string
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			vals.Set(k, fmt.Sprintf("%v", v[k]))
+		}
+		return vals.Encode()
+	case map[string]string:
+		vals := url.Values{}
+		var keys []string
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			vals.Set(k, v[k])
+		}
+		return vals.Encode()
+	default:
+		return url.QueryEscape(fmt.Sprintf("%v", value))
+	}
+}
+
+// TemplateTypeDebug returns the pythonic name of the underlying type.
+func TemplateTypeDebug(value interface{}) string {
+	if value == nil {
+		return "NoneType"
+	}
+	rt := reflect.TypeOf(value)
+	switch rt.Kind() {
+	case reflect.String:
+		return "str"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return "int"
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "int"
+	case reflect.Float32, reflect.Float64:
+		return "float"
+	case reflect.Bool:
+		return "bool"
+	case reflect.Slice, reflect.Array:
+		return "list"
+	case reflect.Map, reflect.Struct:
+		return "dict"
+	default:
+		return rt.Kind().String()
 	}
 }

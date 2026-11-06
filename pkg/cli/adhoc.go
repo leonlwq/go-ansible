@@ -13,52 +13,24 @@ import (
 	"github.com/spf13/cobra"
 
 	"go-ansible/pkg/adhoc"
-	"go-ansible/pkg/inventory"
 	"go-ansible/pkg/ssh"
 )
 
 type AnsibleOptions struct {
-	InventoryPath     string
-	InventoryPaths    []string
-	Module            string
-	ModuleArgs        string
-	ExtraVars         []string
-	Forks             int
-	ForksSet          bool
-	Limit             string
-	RemoteUser        string
-	Become            bool
-	BecomeUser        string
-	BecomeMethod      string
-	Check             bool
-	Diff              bool
-	Verbose           int
-	AskPass           bool
-	AskBecomePass     bool
-	AskVaultPass      bool
-	VaultPasswordFile string
-	VaultIDs          []string
-	ListHosts         bool
+	CommonCLIOptions
 
-	Connection    string
-	Timeout       int
-	PrivateKey    string
-	SSHCommonArgs string
-	SSHExtraArgs  string
-	Background    int
-	Poll          int
-	OneLine       bool
-	Tree          string
+	Module     string
+	ModuleArgs string
+	Background int
+	Poll       int
+	OneLine    bool
+	Tree       string
 
 	Target string
 }
 
-func runAdhoc(args []string) {
-	RunAdhoc(args, "0.1.0")
-}
-
 func RunAdhoc(args []string, version string) {
-	fmt.Println("Reimplementation and reconstruction of the main features in Python version")
+	fmt.Fprintln(os.Stderr, "Reimplementation and reconstruction of the main features in Python version")
 	cmd := NewAnsibleCmd(version)
 	cmd.SetArgs(normalizeAnsibleArgs(args))
 	if err := cmd.Execute(); err != nil {
@@ -74,11 +46,13 @@ func NewAnsibleCmd(version string) *cobra.Command {
 		version = "0.1.0"
 	}
 	opts := &AnsibleOptions{
-		Module:       "command",
-		BecomeUser:   "root",
-		BecomeMethod: "sudo",
-		Forks:        5,
-		Poll:         15,
+		CommonCLIOptions: CommonCLIOptions{
+			BecomeUser:   "root",
+			BecomeMethod: "sudo",
+			Forks:        5,
+		},
+		Module: "command",
+		Poll:   15,
 	}
 	cmd := &cobra.Command{
 		Use:           "ansible <target> [options]",
@@ -100,33 +74,11 @@ func NewAnsibleCmd(version string) *cobra.Command {
 	cmd.SetVersionTemplate("ansible {{.Version}}\n")
 
 	flags := cmd.Flags()
-	flags.VarP(newInventoryValue(&opts.InventoryPaths), "inventory", "i", "specify inventory host path(s) or comma separated host list")
+	opts.RegisterCommonFlags(flags)
 	flags.StringVarP(&opts.Module, "module-name", "m", "command", "module name to execute")
 	flags.StringVar(&opts.Module, "module", "command", "module name to execute")
 	_ = flags.MarkHidden("module")
 	flags.StringVarP(&opts.ModuleArgs, "args", "a", "", "module arguments")
-	flags.StringArrayP("extra-vars", "e", nil, "set additional variables as key=value or YAML/JSON, if filename prepend with @")
-	flags.IntVarP(&opts.Forks, "forks", "f", 5, "specify number of parallel processes to use")
-	flags.StringVarP(&opts.Limit, "limit", "l", "", "further limit selected hosts to an additional pattern")
-	flags.StringVarP(&opts.RemoteUser, "user", "u", "", "connect as this user")
-	flags.BoolVarP(&opts.Become, "become", "b", false, "run operations with become (does not imply password prompting)")
-	flags.StringVarP(&opts.BecomeUser, "become-user", "U", "root", "run operations as this user")
-	flags.StringVar(&opts.BecomeMethod, "become-method", "sudo", "privilege escalation method to use")
-	flags.BoolVarP(&opts.Check, "check", "C", false, "don't make any changes; instead, try to predict some of the changes that may occur")
-	flags.BoolVarP(&opts.Diff, "diff", "D", false, "when changing (small) files and templates, show the differences in those files")
-	flags.CountP("verbose", "v", "verbose mode (-v, -vv, -vvv)")
-	flags.BoolVarP(&opts.AskPass, "ask-pass", "k", false, "ask for connection password")
-	flags.BoolVarP(&opts.AskBecomePass, "ask-become-pass", "K", false, "ask for privilege escalation password")
-	flags.BoolVar(&opts.AskVaultPass, "ask-vault-pass", false, "ask for vault password")
-	flags.StringVar(&opts.VaultPasswordFile, "vault-password-file", "", "vault password file")
-	flags.StringArrayVar(&opts.VaultIDs, "vault-id", nil, "the vault identity to use (can be specified multiple times)")
-	flags.BoolVar(&opts.ListHosts, "list-hosts", false, "outputs a list of matching hosts; does not execute anything else")
-	flags.StringVarP(&opts.Connection, "connection", "c", "", "connection type to use (default=smart)")
-	flags.IntVarP(&opts.Timeout, "timeout", "T", 0, "override the SSH timeout in seconds")
-	flags.StringVar(&opts.PrivateKey, "private-key", "", "use this file to authenticate the connection")
-	flags.StringVar(&opts.PrivateKey, "key-file", "", "use this file to authenticate the connection")
-	flags.StringVar(&opts.SSHCommonArgs, "ssh-common-args", "", "specify common arguments to pass to sftp/scp/ssh")
-	flags.StringVar(&opts.SSHExtraArgs, "ssh-extra-args", "", "specify extra arguments to pass to ssh only")
 	flags.IntVarP(&opts.Background, "background", "B", 0, "run asynchronously, failing after X seconds (default=N/A)")
 	flags.IntVarP(&opts.Poll, "poll", "P", 15, "set the poll interval if using -B (default=15)")
 	flags.BoolVarP(&opts.OneLine, "one-line", "o", false, "condense output")
@@ -138,94 +90,13 @@ func NewAnsibleCmd(version string) *cobra.Command {
 func (opts *AnsibleOptions) Run() error {
 	cfg := loadCLIConfig()
 
-	invPaths := opts.InventoryPaths
-	if len(invPaths) == 0 && opts.InventoryPath != "" {
-		invPaths = []string{opts.InventoryPath}
-	}
-	if len(invPaths) == 0 && cfg.Defaults.Inventory != "" {
-		invPaths = []string{cfg.ResolvePath(cfg.Defaults.Inventory)}
-	}
-	var inv *inventory.Inventory
-	if len(invPaths) == 0 {
-		fmt.Fprintf(os.Stderr, "[WARNING]: No inventory was parsed, only implicit localhost is available\n")
-		inv = inventory.NewInventory()
-		inv.EnsureLocalhost()
-	} else {
-		opts.InventoryPath = invPaths[0]
-		var err error
-		inv, err = inventory.ParseSources(invPaths...)
-		if err != nil {
-			return fmt.Errorf("parsing inventory: %w", err)
-		}
-	}
-
-	forks := opts.Forks
-	if !opts.ForksSet && cfg.Defaults.Forks > 0 {
-		forks = cfg.Defaults.Forks
-	}
-
-	var defaultSSHPass string
-	if opts.AskPass {
-		pass, err := promptPassword("SSH password: ")
-		if err != nil {
-			return fmt.Errorf("reading SSH password: %w", err)
-		}
-		defaultSSHPass = pass
-	}
-
-	var defaultBecomePass string
-	if opts.AskBecomePass {
-		pass, err := promptPassword("BECOME password[defaults to SSH password]: ")
-		if err != nil {
-			return fmt.Errorf("reading become password: %w", err)
-		}
-		if pass == "" && defaultSSHPass != "" {
-			pass = defaultSSHPass
-		}
-		defaultBecomePass = pass
-	}
-	applyConfigDefaultsToInventory(inv, cfg)
-	applyConnectionOptionsToInventory(inv, ConnectionOptions{
-		Connection:    opts.Connection,
-		Timeout:       opts.Timeout,
-		PrivateKey:    opts.PrivateKey,
-		SSHCommonArgs: opts.SSHCommonArgs,
-		SSHExtraArgs:  opts.SSHExtraArgs,
-	})
-
-	resolvedLimit, err := resolveLimitPattern(opts.Limit)
+	env, err := opts.SetupExecutionEnv(cfg)
 	if err != nil {
-		return fmt.Errorf("resolving limit: %w", err)
+		return err
 	}
-	opts.Limit = resolvedLimit
-
-	if opts.RemoteUser != "" {
-		for _, host := range inv.AllHosts {
-			host.User = opts.RemoteUser
-		}
-	}
-	if defaultSSHPass != "" {
-		for _, host := range inv.AllHosts {
-			if host.Password == "" {
-				host.Password = defaultSSHPass
-			}
-		}
-	}
-
-	if opts.Become {
-		for _, host := range inv.AllHosts {
-			host.Become = true
-			if opts.BecomeUser != "" {
-				host.BecomeUser = opts.BecomeUser
-			}
-			if opts.BecomeMethod != "" {
-				host.BecomeMethod = opts.BecomeMethod
-			}
-			if defaultBecomePass != "" && host.BecomePass == "" {
-				host.BecomePass = defaultBecomePass
-			}
-		}
-	}
+	inv := env.Inventory
+	forks := env.Forks
+	vaultSecrets := env.VaultSecrets
 
 	sshCfg := sshClientConfigFromDefaults(cfg)
 	if opts.Timeout > 0 {
@@ -248,11 +119,6 @@ func (opts *AnsibleOptions) Run() error {
 		}
 		printAdhocHosts(opts.Target, opts.Limit, hosts)
 		return nil
-	}
-
-	vaultSecrets, err := resolveVaultSecrets(cfg, opts.VaultPasswordFile, opts.VaultIDs, opts.AskVaultPass)
-	if err != nil {
-		return fmt.Errorf("loading vault password: %w", err)
 	}
 
 	params := make(map[string]interface{})
@@ -329,6 +195,25 @@ func (opts *AnsibleOptions) Run() error {
 			}
 			raw, _ := json.Marshal(payload)
 			fmt.Printf("%s | %s => %s\n", hostName, status, string(raw))
+		}
+	} else if opts.OneLine {
+		for _, hostName := range sortedCLIAdhocHostNames(result.Hosts) {
+			hostResult := result.Hosts[hostName]
+			status := "SUCCESS"
+			if hostResult.Failed {
+				status = "FAILED"
+			} else if hostResult.Changed {
+				status = "CHANGED"
+			}
+			msg := strings.TrimSpace(hostResult.Stdout)
+			if msg == "" && hostResult.Message != "" {
+				msg = strings.TrimSpace(hostResult.Message)
+			}
+			if hostResult.Failed && hostResult.Stderr != "" {
+				msg = strings.TrimSpace(hostResult.Stderr)
+			}
+			singleLine := strings.ReplaceAll(strings.ReplaceAll(msg, "\r", ""), "\n", " ")
+			fmt.Printf("%s | %s | rc=%d | (stdout) %s\n", hostName, status, hostResult.ExitCode, singleLine)
 		}
 	} else if isVerbose {
 		fmt.Println(result.FormatResult())

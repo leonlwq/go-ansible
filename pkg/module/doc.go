@@ -693,6 +693,7 @@ var moduleDocs = map[string]*ModuleDoc{
 			{Name: "state", Type: "string", Required: true, Default: "", Description: "mounted, unmounted, present, absent, remounted."},
 			{Name: "fstab", Type: "string", Required: false, Default: "/etc/fstab", Description: "Path to fstab file."},
 			{Name: "boot", Type: "bool", Required: false, Default: "true", Description: "Whether to configure in fstab file."},
+			{Name: "backup", Type: "bool", Required: false, Default: "false", Description: "Create a backup file including timestamp before modifying fstab."},
 		},
 		Examples: `- name: Mount data disk to /data
   mount:
@@ -706,6 +707,59 @@ var moduleDocs = map[string]*ModuleDoc{
   mount:
     path: /mnt/share
     state: unmounted`,
+	},
+	"package": {
+		Name:        "package",
+		ShortDesc:   "Generic OS package manager module",
+		Description: "Installs, upgrades, and removes packages using the target system's package manager (apt, dnf, yum, or apk).",
+		Options: []ParamDoc{
+			{Name: "name", Type: "string/list", Required: false, Default: "", Description: "Package name or list of package names."},
+			{Name: "state", Type: "string", Required: false, Default: "present", Description: "Desired package state (present, latest, absent)."},
+			{Name: "update_cache", Type: "bool", Required: false, Default: "false", Description: "Whether to update repository cache prior to action."},
+		},
+		Examples: `- name: Install git via generic package module
+  package:
+    name: git
+    state: present
+
+- name: Update repository cache only
+  package:
+    update_cache: yes`,
+	},
+	"blockinfile": {
+		Name:        "blockinfile",
+		ShortDesc:   "Insert/update/remove a text block surrounded by marker lines",
+		Description: "This module will insert/update/remove a block of multi-line text surrounded by customizable marker lines.",
+		Options: []ParamDoc{
+			{Name: "path", Type: "string", Required: true, Default: "", Description: "The file to modify."},
+			{Name: "block", Type: "string", Required: false, Default: "", Description: "The text block to insert."},
+			{Name: "marker", Type: "string", Required: false, Default: "# {mark} ANSIBLE MANAGED BLOCK", Description: "The marker line template."},
+			{Name: "state", Type: "string", Required: false, Default: "present", Description: "Whether the block should be present or absent."},
+			{Name: "insertafter", Type: "string", Required: false, Default: "EOF", Description: "Insert after regex pattern or EOF."},
+			{Name: "insertbefore", Type: "string", Required: false, Default: "", Description: "Insert before regex pattern or BOF."},
+			{Name: "backup", Type: "bool", Required: false, Default: "false", Description: "Create backup file before changing."},
+			{Name: "create", Type: "bool", Required: false, Default: "false", Description: "Create file if it does not exist."},
+		},
+		Examples: `- name: Add custom environment exports
+  blockinfile:
+    path: /etc/profile
+    block: |
+      export JAVA_HOME=/opt/jdk
+      export PATH=$JAVA_HOME/bin:$PATH`,
+	},
+	"dnf": {
+		Name:        "dnf",
+		ShortDesc:   "Manages packages with the dnf package manager",
+		Description: "Installs, upgrades, and removes packages using the dnf package manager on RHEL 8/9, Fedora, and compatible systems.",
+		Options: []ParamDoc{
+			{Name: "name", Type: "string/list", Required: false, Default: "", Description: "Package name or list of packages to install/remove."},
+			{Name: "state", Type: "string", Required: false, Default: "present", Description: "Desired package state (present, latest, absent)."},
+			{Name: "update_cache", Type: "bool", Required: false, Default: "false", Description: "Whether to run dnf makecache."},
+		},
+		Examples: `- name: Install nginx with dnf
+  dnf:
+    name: nginx
+    state: latest`,
 	},
 	"reboot": {
 		Name:        "reboot",
@@ -750,6 +804,172 @@ var moduleDocs = map[string]*ModuleDoc{
     delay: 10
     timeout: 300
     sleep: 5`,
+	},
+	"authorized_key": {
+		Name:        "authorized_key",
+		ShortDesc:   "Adds or removes authorized keys for particular user accounts",
+		Description: "Adds or removes SSH authorized keys for specific user accounts. Supports fetching public keys from URLs, exclusive key management, and custom key options/comments.",
+		Options: []ParamDoc{
+			{Name: "user", Type: "string", Required: true, Default: "", Description: "The username on the remote host whose authorized_keys file will be modified."},
+			{Name: "key", Type: "string", Required: true, Default: "", Description: "The SSH public key(s), as a string or an http/https URL."},
+			{Name: "state", Type: "string", Required: false, Default: "present", Description: "Whether the given key should or should not be in the file (present or absent)."},
+			{Name: "path", Type: "string", Required: false, Default: "~/.ssh/authorized_keys", Description: "Alternate path to the authorized_keys file."},
+			{Name: "exclusive", Type: "bool", Required: false, Default: "false", Description: "Whether to remove all other non-specified keys from the authorized_keys file."},
+			{Name: "manage_dir", Type: "bool", Required: false, Default: "true", Description: "Whether to manage the directory containing the authorized_keys file with mode 0700."},
+			{Name: "key_options", Type: "string", Required: false, Default: "", Description: "A string of options to prepend to the key line in authorized_keys."},
+			{Name: "comment", Type: "string", Required: false, Default: "", Description: "Change the comment on the public key."},
+			{Name: "validate_certs", Type: "bool", Required: false, Default: "true", Description: "Whether to validate SSL certificates when downloading keys from URLs."},
+		},
+		Examples: `- name: Set authorized key taken from file
+  authorized_key:
+    user: charlie
+    state: present
+    key: "{{ lookup('file', '/home/charlie/.ssh/id_rsa.pub') }}"
+
+- name: Set authorized keys exclusively from GitHub URL
+  authorized_key:
+    user: deploy
+    state: present
+    key: https://github.com/alice.keys
+    exclusive: true`,
+	},
+	"pip": {
+		Name:        "pip",
+		ShortDesc:   "Manages Python library dependencies",
+		Description: "Manage Python library dependencies. To use this module, pip must be installed on the remote host, or a virtualenv must be created.",
+		Options: []ParamDoc{
+			{Name: "name", Type: "string/list", Required: false, Default: "", Description: "The name of a Python library to install or the url(s) of the remote package."},
+			{Name: "version", Type: "string", Required: false, Default: "", Description: "The version number to install of the Python library specified in name."},
+			{Name: "requirements", Type: "string", Required: false, Default: "", Description: "The path to a pip requirements file, which should be local to the remote system."},
+			{Name: "virtualenv", Type: "string", Required: false, Default: "", Description: "An optional path to a virtualenv directory to install into."},
+			{Name: "virtualenv_command", Type: "string", Required: false, Default: "python3 -m venv", Description: "The command to create the virtualenv with."},
+			{Name: "virtualenv_python", Type: "string", Required: false, Default: "", Description: "The Python executable used for virtualenv creation."},
+			{Name: "state", Type: "string", Required: false, Default: "present", Description: "The desired state: present, absent, latest, forcereinstall."},
+			{Name: "extra_args", Type: "string", Required: false, Default: "", Description: "Extra arguments passed to pip."},
+			{Name: "chdir", Type: "string", Required: false, Default: "", Description: "cd into this directory before running pip."},
+			{Name: "executable", Type: "string", Required: false, Default: "pip3", Description: "The explicit executable or pathname for the pip executable."},
+		},
+		Examples: `- name: Install bottle python package
+  pip:
+    name: bottle
+
+- name: Install bottle with version specifier
+  pip:
+    name: bottle
+    version: 0.12.25
+
+- name: Install dependencies into a virtualenv
+  pip:
+    requirements: /my_app/requirements.txt
+    virtualenv: /opt/my_app/venv`,
+	},
+	"synchronize": {
+		Name:        "synchronize",
+		ShortDesc:   "A wrapper around rsync to make common tasks in ansible easier",
+		Description: "synchronize is a wrapper around rsync. It is commonly used to transfer files and directories between the control machine and managed nodes, or between two managed nodes.",
+		Options: []ParamDoc{
+			{Name: "src", Type: "string", Required: true, Default: "", Description: "Path on the source host that will be synchronized to the destination."},
+			{Name: "dest", Type: "string", Required: true, Default: "", Description: "Path on the destination host that will be synchronized from the source."},
+			{Name: "archive", Type: "bool", Required: false, Default: "true", Description: "Mirrors the rsync -a option, which enables recursive copy, links, perms, times, owner, group."},
+			{Name: "delete", Type: "bool", Required: false, Default: "false", Description: "Delete files in dest that do not exist (or no longer exist) in src."},
+			{Name: "checksum", Type: "bool", Required: false, Default: "false", Description: "Skip based on checksum, rather than mod-time & size."},
+			{Name: "compress", Type: "bool", Required: false, Default: "true", Description: "Compress file data during the transfer."},
+			{Name: "mode", Type: "string", Required: false, Default: "push", Description: "Specify the direction of the synchronization: push or pull."},
+			{Name: "rsync_opts", Type: "string/list", Required: false, Default: "", Description: "Specify additional rsync options by passing them in as a string or array."},
+			{Name: "rsync_path", Type: "string", Required: false, Default: "", Description: "Specify the rsync command to run on the remote machine (e.g. sudo rsync)."},
+			{Name: "private_key", Type: "string", Required: false, Default: "", Description: "Specify the SSH private key path for rsync connection."},
+			{Name: "dest_port", Type: "int", Required: false, Default: "22", Description: "Port number for ssh on the destination host."},
+		},
+		Examples: `- name: Synchronization of src on the control machine to dest on the remote hosts
+  synchronize:
+    src: some/relative/path
+    dest: /var/www/site
+
+- name: Synchronization using rsync delete option
+  synchronize:
+    src: /data/static/
+    dest: /var/www/static/
+    delete: yes
+    archive: yes`,
+	},
+	"known_hosts": {
+		Name:        "known_hosts",
+		ShortDesc:   "Add or remove a host from the known_hosts file",
+		Description: "The known_hosts module lets you add or remove a host keys from the known_hosts file.",
+		Options: []ParamDoc{
+			{Name: "name", Type: "string", Required: true, Default: "", Description: "The host to query and add/remove into the known_hosts file."},
+			{Name: "key", Type: "string", Required: false, Default: "", Description: "The host key line(s) for the entry in the known_hosts file. Required if state=present."},
+			{Name: "path", Type: "string", Required: false, Default: "~/.ssh/known_hosts", Description: "The known_hosts file to modify."},
+			{Name: "hash_host", Type: "bool", Required: false, Default: "false", Description: "Hash the host and name in the known_hosts file."},
+			{Name: "state", Type: "string", Required: false, Default: "present", Description: "Whether to ensure the host and key are present or absent."},
+		},
+		Examples: `- name: Tell known_hosts that github.com has this key
+  known_hosts:
+    name: github.com
+    key: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+    path: /etc/ssh/ssh_known_hosts
+    state: present
+
+- name: Add a hashed host entry
+  known_hosts:
+    name: 192.168.1.100
+    key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+    hash_host: yes
+
+- name: Remove a host from known_hosts
+  known_hosts:
+    name: old-server.example.com
+    state: absent`,
+	},
+	"service_facts": {
+		Name:        "service_facts",
+		ShortDesc:   "Return service state information as fact data",
+		Description: "The service_facts module returns information about system services (systemd, sysv, launchd) and populates ansible_facts.services.",
+		Options:     []ParamDoc{},
+		Examples: `- name: Populate service facts
+  service_facts:
+
+- name: Print service status
+  debug:
+    var: ansible_facts.services['ssh.service'].state`,
+	},
+	"package_facts": {
+		Name:        "package_facts",
+		ShortDesc:   "Package information as facts",
+		Description: "The package_facts module fetches information about installed packages on the system (supporting dpkg/apt, rpm/yum, apk, pacman, brew) and populates ansible_facts.packages.",
+		Options: []ParamDoc{
+			{Name: "manager", Type: "string", Required: false, Default: "auto", Description: "The package manager used to query packages (auto, apt, rpm, apk, pacman, brew)."},
+		},
+		Examples: `- name: Gather package facts
+  package_facts:
+    manager: auto
+
+- name: Check if nginx is installed
+  debug:
+    msg: "Nginx version: {{ ansible_facts.packages['nginx'][0].version }}"
+  when: "'nginx' in ansible_facts.packages"`,
+	},
+	"tempfile": {
+		Name:        "tempfile",
+		ShortDesc:   "Creates temporary files and directories",
+		Description: "The tempfile module creates temporary files or directories on remote hosts with restricted permissions (0600 for files, 0700 for directories).",
+		Options: []ParamDoc{
+			{Name: "state", Type: "string", Required: false, Default: "file", Description: "Whether to create file or directory (file, directory)."},
+			{Name: "path", Type: "string", Required: false, Default: "/tmp", Description: "Location where temporary file or directory should be created."},
+			{Name: "prefix", Type: "string", Required: false, Default: "ansible.", Description: "Prefix of temporary file or directory name."},
+			{Name: "suffix", Type: "string", Required: false, Default: "", Description: "Suffix of temporary file or directory name."},
+		},
+		Examples: `- name: Create temporary build file
+  tempfile:
+    state: file
+    suffix: .build
+  register: temp_file
+
+- name: Create temporary workspace directory
+  tempfile:
+    state: directory
+    prefix: deploy_
+  register: temp_dir`,
 	},
 }
 

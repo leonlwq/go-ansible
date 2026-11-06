@@ -33,8 +33,10 @@ type PullOptions struct {
 	AskBecomePass     bool
 	AskVaultPass      bool
 	VaultPasswordFile string
+	VaultIDs          []string
 	Tags              string
 	SkipTags          string
+	Limit             string
 	Playbook          string
 }
 
@@ -86,8 +88,10 @@ and runs the playbook against localhost using the local connection plugin.`,
 	flags.BoolVarP(&opts.AskBecomePass, "ask-become-pass", "K", false, "ask for privilege escalation password")
 	flags.BoolVar(&opts.AskVaultPass, "ask-vault-pass", false, "ask for vault password")
 	flags.StringVar(&opts.VaultPasswordFile, "vault-password-file", "", "vault password file")
+	flags.StringArrayVar(&opts.VaultIDs, "vault-id", nil, "the vault identity to use")
 	flags.StringVarP(&opts.Tags, "tags", "t", "", "only run plays and tasks tagged with these values")
 	flags.StringVar(&opts.SkipTags, "skip-tags", "", "only run plays and tasks whose tags do not match these values")
+	flags.StringVarP(&opts.Limit, "limit", "l", "", "further limit selected hosts to an additional pattern")
 
 	return cmd
 }
@@ -141,21 +145,43 @@ func runPull(opts *PullOptions) error {
 
 	inventoryPath := resolvePullInventory(destDir, opts.Inventory)
 
+	// Switch working directory to destDir so relative paths in repository resolve cleanly
+	origDir, err := os.Getwd()
+	if err == nil {
+		defer func() { _ = os.Chdir(origDir) }()
+	}
+	if chErr := os.Chdir(destDir); chErr != nil {
+		return fmt.Errorf("chdir to repository %s: %w", destDir, chErr)
+	}
+
+	limitTarget := opts.Limit
+	if limitTarget == "" {
+		if inventoryPath == "localhost," {
+			limitTarget = "localhost"
+		} else {
+			limitTarget = fmt.Sprintf("%s,localhost", hostname)
+		}
+	}
+
 	// Execute playbook locally
 	pbOpts := &PlaybookOptions{
-		PlaybookPath:      playbookPath,
-		InventoryPaths:    []string{inventoryPath},
-		ExtraVars:         opts.ExtraVars,
-		Connection:        "local",
-		Check:             opts.Check,
-		Diff:              opts.Diff,
-		Verbose:           opts.Verbose,
-		Tags:              opts.Tags,
-		SkipTags:          opts.SkipTags,
-		AskPass:           opts.AskPass,
-		AskBecomePass:     opts.AskBecomePass,
-		AskVaultPass:      opts.AskVaultPass,
-		VaultPasswordFile: opts.VaultPasswordFile,
+		CommonCLIOptions: CommonCLIOptions{
+			InventoryPaths:    []string{inventoryPath},
+			Limit:             limitTarget,
+			ExtraVars:         opts.ExtraVars,
+			Connection:        "local",
+			Check:             opts.Check,
+			Diff:              opts.Diff,
+			Verbose:           opts.Verbose,
+			AskPass:           opts.AskPass,
+			AskBecomePass:     opts.AskBecomePass,
+			AskVaultPass:      opts.AskVaultPass,
+			VaultPasswordFile: opts.VaultPasswordFile,
+			VaultIDs:          opts.VaultIDs,
+		},
+		PlaybookPath: playbookPath,
+		Tags:         opts.Tags,
+		SkipTags:     opts.SkipTags,
 	}
 
 	if opts.Verbose > 0 {
@@ -312,7 +338,7 @@ func runGitOutput(dir string, args ...string) (string, error) {
 }
 
 func RunPull(args []string, version string) {
-	fmt.Println("Reimplementation and reconstruction of the main features in Python version")
+	fmt.Fprintln(os.Stderr, "Reimplementation and reconstruction of the main features in Python version")
 	cmd := NewPullCmd(version)
 	cmd.SetArgs(normalizeAnsibleArgs(args))
 	if err := cmd.Execute(); err != nil {

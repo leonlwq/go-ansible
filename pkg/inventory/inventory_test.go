@@ -53,3 +53,25 @@ func TestImplicitLocalhost(t *testing.T) {
 		t.Errorf("expected error for non_existent_host, got nil")
 	}
 }
+
+func TestMatchSubPatternScaleOptimization(t *testing.T) {
+	inv := NewInventory()
+	grp := &Group{Name: "webservers", Hosts: make([]*Host, 0)}
+	inv.Groups["webservers"] = grp
+
+	for i := 0; i < 2000; i++ {
+		h := &Host{Name: "host-" + string(rune('a'+(i%26))) + "-" + string(rune('0'+(i%10))) + "-" + string(rune('0'+(i/100)))}
+		inv.AllHosts[h.Name] = h
+		if i%2 == 0 {
+			grp.Hosts = append(grp.Hosts, h)
+		}
+	}
+
+	matched, err := inv.MatchHosts("webservers")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(matched) == 0 {
+		t.Fatalf("expected matched hosts, got 0")
+	}
+}

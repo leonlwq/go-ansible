@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"go-ansible/pkg/ssh"
+	"go-ansible/pkg/util"
 )
 
 // Module 模块接口
@@ -74,8 +75,37 @@ func NewRegistry() *Registry {
 	r.Register(&MountModule{})
 	r.Register(&WaitForConnectionModule{})
 	r.Register(&RebootModule{})
+	r.Register(&AuthorizedKeyModule{})
+	r.Register(&PipModule{})
+	r.Register(&SynchronizeModule{})
+	r.Register(&KnownHostsModule{})
+	r.Register(&ServiceFactsModule{})
+	r.Register(&PackageFactsModule{})
+	r.Register(&TempfileModule{})
+	r.Register(&BlockinfileModule{})
+	r.Register(&DnfModule{})
 
 	return r
+}
+
+// SupportsCheckMode 返回指定模块是否支持 check mode (试运行)
+func SupportsCheckMode(moduleName string) bool {
+	switch moduleName {
+	case "file", "copy", "fetch", "lineinfile", "blockinfile", "replace", "template", "user", "group", "apt", "yum", "dnf", "package", "service", "systemd", "cron", "ping", "stat", "get_url", "sysctl", "hostname", "mount", "wait_for", "wait_for_connection", "authorized_key", "pip", "synchronize", "known_hosts", "service_facts", "package_facts", "tempfile", "archive", "unarchive":
+		return true
+	default:
+		return false
+	}
+}
+
+// SupportsDiffMode 返回指定模块是否支持统一 diff 输出
+func SupportsDiffMode(moduleName string) bool {
+	switch moduleName {
+	case "copy", "template", "lineinfile", "blockinfile", "replace", "sysctl", "hostname", "mount", "authorized_key", "synchronize", "known_hosts":
+		return true
+	default:
+		return false
+	}
 }
 
 // Register 注册模块
@@ -100,11 +130,20 @@ func (r *Registry) List() []string {
 	return names
 }
 
-// GetParam 获取参数值，支持类型转换
+// GetParam 获取参数值，支持类型转换与基础数值/布尔/字符串兜底
 func GetParam[T any](params map[string]interface{}, key string, defaultVal T) T {
-	if val, ok := params[key]; ok {
+	if val, ok := params[key]; ok && val != nil {
 		if v, ok := val.(T); ok {
 			return v
+		}
+		// 基础类型智能兜底（防止 YAML 解析 float64/int64/string 导致类型断言失效）
+		switch any(defaultVal).(type) {
+		case int:
+			return any(GetParamInt(params, key, any(defaultVal).(int))).(T)
+		case bool:
+			return any(GetParamBool(params, key, any(defaultVal).(bool))).(T)
+		case string:
+			return any(GetParamString(params, key, any(defaultVal).(string))).(T)
 		}
 	}
 	return defaultVal
@@ -157,13 +196,8 @@ func GetParamMode(params map[string]interface{}, key, defaultVal string) string 
 
 // GetParamBool 获取布尔参数
 func GetParamBool(params map[string]interface{}, key string, defaultVal bool) bool {
-	if val, ok := params[key]; ok {
-		switch v := val.(type) {
-		case bool:
-			return v
-		case string:
-			return v == "yes" || v == "true" || v == "1"
-		}
+	if val, ok := params[key]; ok && val != nil {
+		return util.ToBool(val)
 	}
 	return defaultVal
 }

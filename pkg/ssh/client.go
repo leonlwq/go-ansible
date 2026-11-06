@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,9 @@ type Client struct {
 	proxyJump   string
 	mu          sync.Mutex
 	connected   bool
+	lastUsed    time.Time
+	sftpClient  *sftp.Client
+	sftpMu      sync.Mutex
 }
 
 // ClientConfig SSH 客户端配置
@@ -138,6 +142,9 @@ func NewClient(host *inventory.Host, config *ClientConfig) (*Client, error) {
 	}
 
 	timeout := config.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	hostKeyCallback, err := resolveHostKeyCallback(host.SSHCommonArgs)
 	if err != nil {
 		return nil, err
@@ -270,28 +277,7 @@ func resolveHostKeyCallback(commonArgs string) (ssh.HostKeyCallback, error) {
 
 // expandKeyPath 展开密钥路径中的 ~ 和环境变量
 func expandKeyPath(path string) string {
-	if path == "" {
-		return path
-	}
-
-	// 展开 ~ 为 home 目录
-	if strings.HasPrefix(path, "~") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return path
-		}
-		if len(path) > 1 {
-			return filepath.Join(home, path[2:])
-		}
-		return home
-	}
-
-	// 展开环境变量
-	if strings.Contains(path, "$") {
-		return os.ExpandEnv(path)
-	}
-
-	return path
+	return util.ExpandPath(path)
 }
 
 // sshAgentAuth 返回 SSH Agent 认证方法
@@ -329,7 +315,13 @@ func (c *Client) Connect() error {
 		}
 		c.authClosers = append(c.authClosers, jumpClient)
 
-		conn, err := jumpClient.Dial("tcp", addr)
+		ctx := context.Background()
+		if c.config != nil && c.config.Timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, c.config.Timeout)
+			defer cancel()
+		}
+		conn, err := jumpClient.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return fmt.Errorf("jump host %s dial target %s: %w", c.proxyJump, addr, err)
 		}
@@ -382,6 +374,8 @@ func dialJumpHost(jumpSpec string, baseConfig *ssh.ClientConfig) (*ssh.Client, e
 
 // Close 关闭连接
 func (c *Client) Close() error {
+	c.invalidateSFTPClient()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -404,67 +398,179 @@ func (c *Client) Close() error {
 	return lastErr
 }
 
+// SetHost 更新当前连接的主机执行属性（如任务级提权）
+func (c *Client) SetHost(host *inventory.Host) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.host = host
+}
+
+// Host 返回当前连接的目标主机
+func (c *Client) Host() *inventory.Host {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.host
+}
+
+// AddAuthCloser 添加需要在连接关闭时释放的资源（如跳板机连接）
+func (c *Client) AddAuthCloser(closer io.Closer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.authClosers = append(c.authClosers, closer)
+}
+
+// AuthClosers 获取当前关联的认证与跳板机资源列表
+func (c *Client) AuthClosers() []io.Closer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	res := make([]io.Closer, len(c.authClosers))
+	copy(res, c.authClosers)
+	return res
+}
+
 // Execute 执行命令并返回输出
 func (c *Client) Execute(cmd string) (*Result, error) {
+	c.mu.Lock()
+	become := c.host != nil && c.host.Become
+	c.mu.Unlock()
+
 	// 如果启用了 become，使用 sudo 执行
-	if c.host.Become {
+	if become {
 		return c.ExecuteWithBecome(cmd)
 	}
 	return c.execute(cmd)
 }
 
-// ExecuteWithBecome 使用 become（sudo）执行命令
+// ExecuteWithBecome 使用 become（sudo/su）执行命令
 func (c *Client) ExecuteWithBecome(cmd string) (*Result, error) {
-	becomeUser := c.host.BecomeUser
-	if becomeUser == "" {
-		becomeUser = "root"
-	}
+	c.mu.Lock()
+	host := c.host
+	c.mu.Unlock()
 
-	becomeMethod := c.host.BecomeMethod
-	if becomeMethod == "" {
-		becomeMethod = "sudo"
-	}
-
-	var sudoCmd string
-	if becomeMethod == "sudo" {
-		// 构建 sudo 命令
-		if c.host.BecomePass != "" {
-			// 有密码时，使用 -S 从 stdin 读取密码
-			sudoCmd = fmt.Sprintf("echo '%s' | sudo -S -u %s", c.host.BecomePass, becomeUser)
-		} else {
-			// 无密码时，使用 -n 避免提示（需要 NOPASSWD 配置）
-			sudoCmd = fmt.Sprintf("sudo -n -u %s", becomeUser)
-		}
-	} else if becomeMethod == "su" {
-		if c.host.BecomePass != "" {
-			sudoCmd = fmt.Sprintf("echo '%s' | su - %s -c", c.host.BecomePass, becomeUser)
-			return c.execute(fmt.Sprintf("%s '%s'", sudoCmd, cmd))
-		}
-		sudoCmd = fmt.Sprintf("su - %s -c", becomeUser)
-		return c.execute(fmt.Sprintf("%s '%s'", sudoCmd, cmd))
-	} else {
-		// 使用自定义 become exe
-		becomeExe := c.host.BecomeExe
-		if becomeExe == "" {
-			becomeExe = "sudo"
-		}
-		sudoCmd = becomeExe
-	}
-
-	// 执行 sudo 命令
-	fullCmd := fmt.Sprintf("%s %s", sudoCmd, cmd)
+	fullCmd := BuildBecomeCommand(cmd, host)
 	return c.execute(fullCmd)
+}
+
+// SetTimeout 动态更新 SSH 客户端连接超时时间
+func (c *Client) SetTimeout(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.config != nil && d > 0 {
+		c.config.Timeout = d
+	}
+}
+
+// GetTimeout 获取当前 SSH 客户端连接超时时间
+func (c *Client) GetTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.config != nil {
+		return c.config.Timeout
+	}
+	return 0
+}
+
+// IsAlive 快速检测底层 SSH 物理连接是否仍然活跃
+func (c *Client) IsAlive() bool {
+	c.mu.Lock()
+	client := c.client
+	connected := c.connected
+	c.mu.Unlock()
+	if !connected || client == nil {
+		return false
+	}
+	_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+	return err == nil
+}
+
+// newSession 安全获取底层 ssh.Session，在连接失效时持有互斥锁自愈重连，杜绝并发竞态与空指针解引用
+func (c *Client) newSession() (*ssh.Session, error) {
+	c.mu.Lock()
+	if !c.connected || c.client == nil {
+		c.mu.Unlock()
+		if err := c.Connect(); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+	}
+
+	client := c.client
+	if client == nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("ssh client not connected")
+	}
+
+	needKeepAlive := !c.lastUsed.IsZero() && time.Since(c.lastUsed) > 30*time.Second
+	c.mu.Unlock()
+
+	if needKeepAlive {
+		if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+			c.mu.Lock()
+			c.connected = false
+			if c.client != nil {
+				_ = c.client.Close()
+				c.client = nil
+			}
+			for _, closer := range c.authClosers {
+				_ = closer.Close()
+			}
+			c.authClosers = nil
+			c.mu.Unlock()
+			c.invalidateSFTPClient()
+
+			if recErr := c.Connect(); recErr != nil {
+				return nil, fmt.Errorf("keepalive reconnect failed: %w", recErr)
+			}
+			c.mu.Lock()
+			client = c.client
+			c.mu.Unlock()
+		}
+	}
+
+	session, err := client.NewSession()
+	if err == nil {
+		c.mu.Lock()
+		c.lastUsed = time.Now()
+		c.mu.Unlock()
+		return session, nil
+	}
+
+	// 探测空闲长连接被对端关闭的情况，在锁内重置并自愈重连
+	c.mu.Lock()
+	c.connected = false
+	if c.client != nil {
+		_ = c.client.Close()
+		c.client = nil
+	}
+	for _, closer := range c.authClosers {
+		_ = closer.Close()
+	}
+	c.authClosers = nil
+	c.mu.Unlock()
+	c.invalidateSFTPClient()
+
+	if recErr := c.Connect(); recErr != nil {
+		return nil, fmt.Errorf("reconnect failed: %w (original error: %v)", recErr, err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client == nil {
+		return nil, fmt.Errorf("ssh client not connected after reconnect")
+	}
+	sess, sessErr := c.client.NewSession()
+	if sessErr != nil {
+		return nil, fmt.Errorf("create session after reconnect: %w", sessErr)
+	}
+	c.lastUsed = time.Now()
+	return sess, nil
 }
 
 // execute 实际执行命令的内部方法（带超时）
 func (c *Client) execute(cmd string) (*Result, error) {
-	if err := c.Connect(); err != nil {
-		return nil, err
-	}
-
-	session, err := c.client.NewSession()
+	session, err := c.newSession()
 	if err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
+		return nil, err
 	}
 	defer session.Close()
 
@@ -502,17 +608,17 @@ func (c *Client) execute(cmd string) (*Result, error) {
 
 		go func() {
 			defer wg.Done()
-			data, err := io.ReadAll(stdout)
+			str, err := readBoundedOutput(stdout, MaxCommandOutputBytes)
 			if err == nil {
-				stdoutStr = string(data)
+				stdoutStr = str
 			}
 		}()
 
 		go func() {
 			defer wg.Done()
-			data, err := io.ReadAll(stderr)
+			str, err := readBoundedOutput(stderr, MaxCommandOutputBytes)
 			if err == nil {
-				stderrStr = string(data)
+				stderrStr = str
 			}
 		}()
 
@@ -527,7 +633,12 @@ func (c *Client) execute(cmd string) (*Result, error) {
 	}()
 
 	// 等待命令执行完成，设置超时
-	timeout := time.After(5 * time.Minute)
+	timeout := 5 * time.Minute
+	if c.GetTimeout() > 0 {
+		timeout = c.GetTimeout()
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case res := <-doneCh:
 		result := &Result{
@@ -543,34 +654,89 @@ func (c *Client) execute(cmd string) (*Result, error) {
 				return result, fmt.Errorf("wait command: %w", res.err)
 			}
 		}
+		result.Failed = result.ExitCode != 0
 
 		return result, nil
 
-	case <-timeout:
+	case <-timer.C:
 		session.Close()
 		return &Result{
 			Host:    c.host.Name,
 			Failed:  true,
-			Message: "command timed out after 5 minutes",
+			Message: fmt.Sprintf("command timed out after %v", timeout),
 		}, fmt.Errorf("command timed out")
 	}
 }
 
-// Upload 上传文件到远程主机
-// Upload 使用 SFTP 上传文件到远程主机
-func (c *Client) Upload(localPath, remotePath string) error {
+// getSFTPClient 获取或复用长连接 SFTP 客户端，支持断开自动重连
+func (c *Client) getSFTPClient() (*sftp.Client, error) {
+	c.sftpMu.Lock()
+	defer c.sftpMu.Unlock()
+
+	if c.sftpClient != nil {
+		return c.sftpClient, nil
+	}
+
 	if err := c.Connect(); err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	sshClient := c.client
+	c.mu.Unlock()
+
+	if sshClient == nil {
+		return nil, fmt.Errorf("ssh client not connected")
+	}
+
+	sftpClient, err := sftp.NewClient(sshClient)
+	if err != nil {
+		// 探测空闲连接异常，自愈重连一次
+		c.mu.Lock()
+		c.connected = false
+		if c.client != nil {
+			_ = c.client.Close()
+			c.client = nil
+		}
+		for _, closer := range c.authClosers {
+			_ = closer.Close()
+		}
+		c.authClosers = nil
+		c.mu.Unlock()
+
+		if recErr := c.Connect(); recErr == nil {
+			c.mu.Lock()
+			sshClient = c.client
+			c.mu.Unlock()
+			if sshClient != nil {
+				sftpClient, err = sftp.NewClient(sshClient)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("create sftp client: %w", err)
+		}
+	}
+
+	c.sftpClient = sftpClient
+	return c.sftpClient, nil
+}
+
+// invalidateSFTPClient 关闭并清空当前 SFTP 客户端缓存
+func (c *Client) invalidateSFTPClient() {
+	c.sftpMu.Lock()
+	defer c.sftpMu.Unlock()
+	if c.sftpClient != nil {
+		_ = c.sftpClient.Close()
+		c.sftpClient = nil
+	}
+}
+
+// Upload 使用 SFTP 上传文件到远程主机（复用长连接 SFTP 会话）
+func (c *Client) Upload(localPath, remotePath string) error {
+	sftpClient, err := c.getSFTPClient()
+	if err != nil {
 		return err
 	}
-
-	fmt.Printf("[SSH] Uploading %s to %s\n", localPath, remotePath)
-
-	// 创建 SFTP 客户端
-	sftpClient, err := sftp.NewClient(c.client)
-	if err != nil {
-		return fmt.Errorf("create sftp client: %w", err)
-	}
-	defer sftpClient.Close()
 
 	// 打开本地文件
 	localFile, err := os.Open(localPath)
@@ -579,62 +745,62 @@ func (c *Client) Upload(localPath, remotePath string) error {
 	}
 	defer localFile.Close()
 
-	// 获取本地文件信息
-	stat, err := localFile.Stat()
-	if err != nil {
-		return fmt.Errorf("stat local file: %w", err)
-	}
-	fmt.Printf("[SSH] File size: %d bytes\n", stat.Size())
-
-	// 构建目标路径
+	// 构建目标路径：若指定以 / 结尾或远端路径已是目录，自动拼接本地文件名
 	destPath := remotePath
-	if remotePath[len(remotePath)-1] == '/' {
+	if len(remotePath) > 0 && remotePath[len(remotePath)-1] == '/' {
 		destPath = remotePath + filepath.Base(localPath)
+	} else if st, err := sftpClient.Stat(remotePath); err == nil && st.IsDir() {
+		destPath = filepath.Join(remotePath, filepath.Base(localPath))
 	}
-	fmt.Printf("[SSH] Destination path: %s\n", destPath)
 
 	// 确保目标目录存在
 	destDir := filepath.Dir(destPath)
-	fmt.Printf("[SSH] Creating directory: %s\n", destDir)
-	sftpClient.MkdirAll(destDir)
+	_ = sftpClient.MkdirAll(destDir)
 
 	// 创建远程文件
 	remoteFile, err := sftpClient.Create(destPath)
 	if err != nil {
-		return fmt.Errorf("create remote file %s: %w", destPath, err)
+		// 如果 SFTP 客户端失效，清理缓存并重试一次
+		c.invalidateSFTPClient()
+		if sftpClient, recErr := c.getSFTPClient(); recErr == nil {
+			_ = sftpClient.MkdirAll(destDir)
+			remoteFile, err = sftpClient.Create(destPath)
+		}
+		if err != nil {
+			return fmt.Errorf("create remote file %s: %w", destPath, err)
+		}
 	}
-	defer remoteFile.Close()
 
-	// 复制文件内容
-	written, err := io.Copy(remoteFile, localFile)
-	if err != nil {
+	// 复制文件内容并显式刷新与校验关闭
+	if _, err := io.Copy(remoteFile, localFile); err != nil {
+		_ = remoteFile.Close()
 		return fmt.Errorf("copy file content: %w", err)
 	}
-	fmt.Printf("[SSH] Written %d bytes\n", written)
+	if err := remoteFile.Close(); err != nil {
+		return fmt.Errorf("flush remote file %s: %w", destPath, err)
+	}
 
-	fmt.Println("[SSH] Upload successful")
 	return nil
 }
 
-// Download 使用 SFTP 从远程主机下载文件
+// Download 使用 SFTP 从远程主机下载文件（复用长连接 SFTP 会话）
 func (c *Client) Download(remotePath, localPath string) error {
-	if err := c.Connect(); err != nil {
+	sftpClient, err := c.getSFTPClient()
+	if err != nil {
 		return err
 	}
-
-	fmt.Printf("[SSH] Downloading %s to %s\n", remotePath, localPath)
-
-	// 创建 SFTP 客户端
-	sftpClient, err := sftp.NewClient(c.client)
-	if err != nil {
-		return fmt.Errorf("create sftp client: %w", err)
-	}
-	defer sftpClient.Close()
 
 	// 打开远程文件
 	remoteFile, err := sftpClient.Open(remotePath)
 	if err != nil {
-		return fmt.Errorf("open remote file %s: %w", remotePath, err)
+		// 如果 SFTP 客户端失效，清理缓存并重试一次
+		c.invalidateSFTPClient()
+		if sftpClient, recErr := c.getSFTPClient(); recErr == nil {
+			remoteFile, err = sftpClient.Open(remotePath)
+		}
+		if err != nil {
+			return fmt.Errorf("open remote file %s: %w", remotePath, err)
+		}
 	}
 	defer remoteFile.Close()
 
@@ -646,13 +812,10 @@ func (c *Client) Download(remotePath, localPath string) error {
 	defer localFile.Close()
 
 	// 复制文件内容
-	written, err := io.Copy(localFile, remoteFile)
-	if err != nil {
+	if _, err := io.Copy(localFile, remoteFile); err != nil {
 		return fmt.Errorf("copy file content: %w", err)
 	}
-	fmt.Printf("[SSH] Downloaded %d bytes\n", written)
 
-	fmt.Println("[SSH] Download successful")
 	return nil
 }
 

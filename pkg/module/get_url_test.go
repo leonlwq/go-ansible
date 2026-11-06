@@ -68,6 +68,39 @@ func TestBuildGetURLCommand(t *testing.T) {
 	}
 }
 
+func TestBuildGetURLCommandWithHeadersAndAuth(t *testing.T) {
+	cmd, err := buildGetURLCommand(getURLSpec{
+		URL:         "https://api.example.com/data.json",
+		Dest:        "/tmp/data.json",
+		URLUsername: "admin",
+		URLPassword: "secretpassword",
+		Headers: map[string]string{
+			"Authorization": "Bearer mytoken",
+			"X-Custom":      "value",
+		},
+		ValidateCerts: true,
+	})
+	if err != nil {
+		t.Fatalf("buildGetURLCommand() error = %v", err)
+	}
+
+	if !strings.Contains(cmd, "-u 'admin':'secretpassword'") {
+		t.Errorf("expected curl basic auth -u, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--http-user='admin' --http-password='secretpassword'") {
+		t.Errorf("expected wget basic auth, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "-H 'Authorization: Bearer mytoken'") {
+		t.Errorf("expected curl custom header Authorization, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--header='Authorization: Bearer mytoken'") {
+		t.Errorf("expected wget custom header Authorization, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "-H 'X-Custom: value'") {
+		t.Errorf("expected curl custom header X-Custom, got: %s", cmd)
+	}
+}
+
 func TestGetURLCommandLocalFileDownload(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		if _, wgetErr := exec.LookPath("wget"); wgetErr != nil {

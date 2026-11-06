@@ -465,12 +465,12 @@ func TestParserParsesTaskAndHandlerBecomeFields(t *testing.T) {
 	}
 
 	task := pb.Plays[0].Tasks[0]
-	if !task.Become || task.BecomeUser != "app" || task.BecomeMethod != "su" || task.BecomePass != "secret" {
+	if task.Become == nil || !*task.Become || task.BecomeUser != "app" || task.BecomeMethod != "su" || task.BecomePass != "secret" {
 		t.Fatalf("unexpected task become fields: %#v", task)
 	}
 
 	handler := pb.Plays[0].Handlers[0]
-	if !handler.Become || handler.BecomeUser != "root" || handler.BecomeMethod != "sudo" || handler.BecomePass != "handler-secret" {
+	if handler.Become == nil || !*handler.Become || handler.BecomeUser != "root" || handler.BecomeMethod != "sudo" || handler.BecomePass != "handler-secret" {
 		t.Fatalf("unexpected handler become fields: %#v", handler)
 	}
 }

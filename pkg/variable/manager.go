@@ -160,6 +160,34 @@ func (m *Manager) LoadVarsFile(path string) (map[string]interface{}, error) {
 	return vars, nil
 }
 
+// ExtractTargetNameFromVarsPath 从变量文件路径解析出对应的组名或主机名。
+// 兼容单文件模式 (group_vars/webservers.yml -> "webservers")
+// 以及子目录拆分模式 (group_vars/webservers/main.yml -> "webservers", group_vars/all/db.yml -> "all")。
+func ExtractTargetNameFromVarsPath(baseDir, filePath string) (string, bool) {
+	rel, err := filepath.Rel(baseDir, filePath)
+	if err != nil || rel == "" || rel == "." {
+		return "", false
+	}
+	rel = filepath.ToSlash(rel)
+	if strings.HasPrefix(rel, "../") || rel == ".." {
+		return "", false
+	}
+	parts := strings.Split(rel, "/")
+	if len(parts) == 0 {
+		return "", false
+	}
+	if len(parts) == 1 {
+		ext := filepath.Ext(parts[0])
+		return strings.TrimSuffix(parts[0], ext), true
+	}
+	return parts[0], true
+}
+
+func isVarsFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".yml" || ext == ".yaml" || ext == ".json"
+}
+
 // LoadGroupVarsDir 加载组变量目录
 func (m *Manager) LoadGroupVarsDir(dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -174,12 +202,15 @@ func (m *Manager) LoadGroupVarsDir(dir string) error {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".yml" && ext != ".yaml" {
+		if !isVarsFile(path) {
 			return nil
 		}
 
-		groupName := strings.TrimSuffix(filepath.Base(path), ext)
+		groupName, ok := ExtractTargetNameFromVarsPath(dir, path)
+		if !ok || groupName == "" {
+			return nil
+		}
+
 		vars, err := m.LoadVarsFile(path)
 		if err != nil {
 			return err
@@ -210,12 +241,15 @@ func (m *Manager) LoadHostVarsDir(dir string) error {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".yml" && ext != ".yaml" {
+		if !isVarsFile(path) {
 			return nil
 		}
 
-		hostName := strings.TrimSuffix(filepath.Base(path), ext)
+		hostName, ok := ExtractTargetNameFromVarsPath(dir, path)
+		if !ok || hostName == "" {
+			return nil
+		}
+
 		vars, err := m.LoadVarsFile(path)
 		if err != nil {
 			return err
@@ -244,7 +278,7 @@ func (m *Manager) Merge(base, override map[string]interface{}) map[string]interf
 	return result
 }
 
-// Eval 简单表达式求值
+// Deprecated: Eval 为早期原型表达式求值函数，生产环境请统一使用 pkg/module/template_expr 与 template.RenderTemplateString
 func Eval(expr string, vars map[string]interface{}) (interface{}, error) {
 	expr = strings.TrimSpace(expr)
 
@@ -273,7 +307,7 @@ func Eval(expr string, vars map[string]interface{}) (interface{}, error) {
 	return expr, nil
 }
 
-// Interpolate 替换字符串中的变量引用
+// Deprecated: Interpolate 为早期原型字符串插值函数，生产环境请统一使用 pkg/module.RenderTemplateString 进行全量 Jinja2 渲染
 func Interpolate(s string, vars map[string]interface{}) string {
 	result := s
 	for k, v := range vars {

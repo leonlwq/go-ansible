@@ -3,6 +3,7 @@ package playbook
 import (
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"go-ansible/pkg/inventory"
 )
@@ -27,6 +28,10 @@ type ListedPlayHosts struct {
 }
 
 func ListPlaybook(playbook *Playbook, rolePaths []string) ([]ListedPlay, error) {
+	return ListPlaybookWithTags(playbook, rolePaths, nil, nil)
+}
+
+func ListPlaybookWithTags(playbook *Playbook, rolePaths []string, tags, skipTags []string) ([]ListedPlay, error) {
 	if playbook == nil {
 		return nil, nil
 	}
@@ -35,10 +40,12 @@ func ListPlaybook(playbook *Playbook, rolePaths []string) ([]ListedPlay, error) 
 	executor := NewExecutor(nil)
 	executor.baseDir = baseDir
 	executor.SetRolePaths(rolePaths)
+	executor.SetTags(tags)
+	executor.SetSkipTags(skipTags)
 
 	result := make([]ListedPlay, 0, len(playbook.Plays))
 	for _, play := range playbook.Plays {
-		roleTasks, _, _, err := executor.loadPlayRoles(play)
+		roleTasks, _, _, _, err := executor.loadPlayRoles(play)
 		if err != nil {
 			return nil, err
 		}
@@ -60,7 +67,12 @@ func ListPlaybook(playbook *Playbook, rolePaths []string) ([]ListedPlay, error) 
 		}
 		for _, tasks := range [][]*Task{preTasks, roleTasks, mainTasks, postTasks} {
 			for _, task := range tasks {
-				listed.Tasks = append(listed.Tasks, listTasks(task, baseDir)...)
+				allListed := listTasks(task, baseDir)
+				for _, lt := range allListed {
+					if executor.shouldRunTaskByTags(lt.Tags) {
+						listed.Tasks = append(listed.Tasks, lt)
+					}
+				}
 			}
 		}
 		listed.Tags = collectListedTags(listed.Tasks)
@@ -109,7 +121,7 @@ func loadStaticListedInclude(task *Task, baseDir string) []*Task {
 		return nil
 	}
 	raw, ok := task.Params["_raw_params"].(string)
-	if !ok || raw == "" || contains(raw, "{{") {
+	if !ok || raw == "" || strings.Contains(raw, "{{") {
 		return nil
 	}
 	path := raw

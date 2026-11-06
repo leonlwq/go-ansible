@@ -24,8 +24,8 @@ func (m *HostnameModule) Execute(client ssh.Connection, params map[string]interf
 	targetName := strings.TrimSpace(GetParamString(params, "name", ""))
 	use := strings.ToLower(strings.TrimSpace(GetParamString(params, "use", "")))
 
-	checkMode := GetParamBool(params, "_ansible_check_mode", false)
-	diffMode := GetParamBool(params, "_ansible_diff", false)
+	checkMode := IsCheckMode(params)
+	diffMode := IsDiffMode(params)
 
 	// 1. 查询当前系统主机名
 	currentHostname := ""

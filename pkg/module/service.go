@@ -2,6 +2,7 @@ package module
 
 import (
 	"fmt"
+	"strings"
 
 	"go-ansible/pkg/ssh"
 )
@@ -22,11 +23,115 @@ func (m *ServiceModule) Execute(client ssh.Connection, params map[string]interfa
 	name := GetParamString(params, "name", "")
 	state := GetParamString(params, "state", "")
 	enabled, hasEnabled := getOptionalBoolParam(params, "enabled")
+	masked, hasMasked := getOptionalBoolParam(params, "masked")
+	if state == "masked" {
+		masked = true
+		hasMasked = true
+		state = ""
+	}
+	daemonReload := GetParamBool(params, "daemon_reload", false)
 
 	// 检查是否使用 systemctl
 	checkSystemd, _ := client.Execute("which systemctl 2>/dev/null")
 	useSystemd := checkSystemd.ExitCode == 0
+
+	if daemonReload && useSystemd && !IsCheckMode(params) {
+		_, _ = client.Execute("systemctl daemon-reload")
+	}
+
+	if IsCheckMode(params) {
+		statusCmd := buildServiceStatusCommand(useSystemd, name)
+		statusRes, _ := client.Execute(statusCmd)
+		isActive := statusRes != nil && statusRes.ExitCode == 0
+
+		stateChanged := false
+		switch state {
+		case "started":
+			if !isActive {
+				stateChanged = true
+			}
+		case "stopped":
+			if isActive {
+				stateChanged = true
+			}
+		case "restarted":
+			stateChanged = true
+		case "reloaded":
+			if isActive {
+				stateChanged = true
+			}
+		}
+
+		enabledChanged := false
+		if hasEnabled {
+			if useSystemd {
+				eRes, _ := client.Execute(fmt.Sprintf("systemctl is-enabled %s 2>/dev/null", shellQuote(name)))
+				isCurrentlyEnabled := eRes != nil && strings.TrimSpace(eRes.Stdout) == "enabled"
+				if isCurrentlyEnabled != enabled {
+					enabledChanged = true
+				}
+			} else {
+				enabledChanged = true
+			}
+		}
+
+		maskedChanged := false
+		if hasMasked {
+			if useSystemd {
+				mRes, _ := client.Execute(fmt.Sprintf("systemctl is-enabled %s 2>/dev/null", shellQuote(name)))
+				isCurrentlyMasked := mRes != nil && strings.TrimSpace(mRes.Stdout) == "masked"
+				if isCurrentlyMasked != masked {
+					maskedChanged = true
+				}
+			} else {
+				maskedChanged = true
+			}
+		}
+
+		return &Result{
+			Changed: stateChanged || enabledChanged || maskedChanged,
+			Message: "check mode: service state checked",
+		}, nil
+	}
+
 	result := &Result{}
+
+	// 支持 masked 控制
+	if hasMasked && useSystemd {
+		cmd := buildSystemdMaskedCommandWithCmd("systemctl", name, masked)
+		stepResult, err := client.Execute(cmd)
+		if err != nil {
+			return stepResult, err
+		}
+		changed := true
+		if cleaned, markerChanged, hasMarker := parseChangedMarker(stepResult.Stdout); hasMarker {
+			stepResult.Stdout = cleaned
+			changed = markerChanged
+		}
+		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
+			stepResult.Stderr = cleaned
+		}
+		result = mergeModuleResults(result, stepResult, changed)
+	}
+
+	// Ansible 官方规范：当 enabled 与 state 同时存在时，必须先评估/设置 enabled，再执行 state 变更
+	if hasEnabled {
+		cmd := buildServiceEnabledCommand(useSystemd, name, enabled)
+		stepResult, err := client.Execute(cmd)
+		if err != nil {
+			return stepResult, err
+		}
+		changed := true
+		if cleaned, markerChanged, hasMarker := parseChangedMarker(stepResult.Stdout); hasMarker {
+			stepResult.Stdout = cleaned
+			changed = markerChanged
+		}
+		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
+			stepResult.Stderr = cleaned
+		}
+		result = mergeModuleResults(result, stepResult, changed)
+	}
+
 	if state != "" {
 		cmd, expectedChange, err := buildServiceStateCommand(useSystemd, name, state)
 		if err != nil {
@@ -47,24 +152,7 @@ func (m *ServiceModule) Execute(client ssh.Connection, params map[string]interfa
 		result = mergeModuleResults(result, stepResult, changed)
 	}
 
-	if hasEnabled {
-		cmd := buildServiceEnabledCommand(useSystemd, name, enabled)
-		stepResult, err := client.Execute(cmd)
-		if err != nil {
-			return stepResult, err
-		}
-		changed := true
-		if cleaned, markerChanged, hasMarker := parseChangedMarker(stepResult.Stdout); hasMarker {
-			stepResult.Stdout = cleaned
-			changed = markerChanged
-		}
-		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
-			stepResult.Stderr = cleaned
-		}
-		result = mergeModuleResults(result, stepResult, changed)
-	}
-
-	if state == "" && !hasEnabled {
+	if state == "" && !hasEnabled && !hasMasked {
 		cmd := buildServiceStatusCommand(useSystemd, name)
 		return client.Execute(cmd)
 	}
@@ -151,55 +239,4 @@ func buildServiceStatusCommand(useSystemd bool, name string) string {
 		return fmt.Sprintf("systemctl is-active %s", quotedName)
 	}
 	return fmt.Sprintf("service %s status", quotedName)
-}
-
-func mergeModuleResults(base, next *Result, changed bool) *Result {
-	if base == nil {
-		base = &Result{}
-	}
-	if next == nil {
-		base.Changed = base.Changed || changed
-		return base
-	}
-	if next.Stdout != "" {
-		if base.Stdout != "" {
-			base.Stdout += "\n"
-		}
-		base.Stdout += next.Stdout
-	}
-	if next.Stderr != "" {
-		if base.Stderr != "" {
-			base.Stderr += "\n"
-		}
-		base.Stderr += next.Stderr
-	}
-	if next.Message != "" {
-		if base.Message != "" {
-			base.Message += "\n"
-		}
-		base.Message += next.Message
-	}
-	base.ExitCode = next.ExitCode
-	base.Failed = base.Failed || next.Failed
-	base.Changed = base.Changed || changed || next.Changed
-	return base
-}
-
-func getOptionalBoolParam(params map[string]interface{}, key string) (bool, bool) {
-	value, ok := params[key]
-	if !ok {
-		return false, false
-	}
-	switch v := value.(type) {
-	case bool:
-		return v, true
-	case string:
-		switch v {
-		case "yes", "true", "1", "on":
-			return true, true
-		case "no", "false", "0", "off":
-			return false, true
-		}
-	}
-	return GetParamBool(params, key, false), true
 }

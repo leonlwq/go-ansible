@@ -2,7 +2,7 @@ package module
 
 import (
 	"fmt"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 
@@ -95,7 +95,7 @@ func parseFstab(content string) []fstabEntry {
 
 		entries = append(entries, fstabEntry{
 			Src:     fields[0],
-			Path:    filepath.Clean(fields[1]),
+			Path:    path.Clean(fields[1]),
 			Fstype:  fields[2],
 			Opts:    fields[3],
 			Dump:    dump,
@@ -124,8 +124,8 @@ func serializeFstab(entries []fstabEntry) string {
 	return res
 }
 
-func checkMountPointMounted(client ssh.Connection, path string) (bool, string, error) {
-	cleanPath := filepath.Clean(path)
+func checkMountPointMounted(client ssh.Connection, mountPath string) (bool, string, error) {
+	cleanPath := path.Clean(mountPath)
 	cmd := "cat /proc/mounts 2>/dev/null || mount"
 	res, err := client.Execute(cmd)
 	if err != nil || res == nil || res.ExitCode != 0 {
@@ -137,7 +137,7 @@ func checkMountPointMounted(client ssh.Connection, path string) (bool, string, e
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
 			mp := strings.ReplaceAll(fields[1], "\\040", " ")
-			if filepath.Clean(mp) == cleanPath {
+			if path.Clean(mp) == cleanPath {
 				return true, fields[0], nil
 			}
 		}
@@ -146,7 +146,7 @@ func checkMountPointMounted(client ssh.Connection, path string) (bool, string, e
 }
 
 func (m *MountModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
-	path := filepath.Clean(strings.TrimSpace(GetParamString(params, "path", "")))
+	path := path.Clean(strings.TrimSpace(GetParamString(params, "path", "")))
 	src := strings.TrimSpace(GetParamString(params, "src", ""))
 	fstype := strings.TrimSpace(GetParamString(params, "fstype", ""))
 	opts := GetParamString(params, "opts", "defaults")
@@ -167,8 +167,8 @@ func (m *MountModule) Execute(client ssh.Connection, params map[string]interface
 		}
 	}
 
-	checkMode := GetParamBool(params, "_ansible_check_mode", false)
-	diffMode := GetParamBool(params, "_ansible_diff", false)
+	checkMode := IsCheckMode(params)
+	diffMode := IsDiffMode(params)
 
 	// 1. 查询当前挂载状态
 	isMounted, currentDev, _ := checkMountPointMounted(client, path)
@@ -250,6 +250,8 @@ func (m *MountModule) Execute(client ssh.Connection, params map[string]interface
 
 		if !isMounted {
 			mountChanged = true
+		} else if fstabChanged {
+			mountChanged = true
 		}
 
 	case "unmounted":
@@ -319,6 +321,10 @@ func (m *MountModule) Execute(client ssh.Connection, params map[string]interface
 
 	// 3. 执行 fstab 写入
 	if fstabChanged {
+		if GetParamBool(params, "backup", false) {
+			backupCmd := fmt.Sprintf("cp -p %s %s.$(date +%%Y%%m%%d-%%H%%M%%S).bak 2>/dev/null || cp %s %s.bak", shellQuote(fstabPath), shellQuote(fstabPath), shellQuote(fstabPath), shellQuote(fstabPath))
+			_, _ = client.Execute(backupCmd)
+		}
 		writeCmd := buildContentWriteCommand(fstabPath, afterFstab)
 		if writeCmd != "" {
 			if writeRes, err := client.Execute(writeCmd); err != nil || (writeRes != nil && writeRes.ExitCode != 0) {
@@ -354,6 +360,19 @@ func (m *MountModule) Execute(client ssh.Connection, params map[string]interface
 					Message:  fmt.Sprintf("failed to mount %s: %s", path, errMsg),
 				}, fmt.Errorf("mount %s: %v %s", path, err, errMsg)
 			}
+		} else if fstabChanged {
+			remountCmd := fmt.Sprintf("mount -o remount,%s %s", opts, shellQuote(path))
+			if rRes, err := client.Execute(remountCmd); err != nil || (rRes != nil && rRes.ExitCode != 0) {
+				errMsg := ""
+				if rRes != nil {
+					errMsg = rRes.Stderr
+				}
+				return &Result{
+					Failed:   true,
+					ExitCode: 1,
+					Message:  fmt.Sprintf("failed to remount %s after configuration change: %s", path, errMsg),
+				}, fmt.Errorf("remount %s: %v %s", path, err, errMsg)
+			}
 		}
 	case "unmounted", "absent":
 		if isMounted {
@@ -385,6 +404,24 @@ func (m *MountModule) Execute(client ssh.Connection, params map[string]interface
 				}, fmt.Errorf("remount %s: %v %s", path, err, errMsg)
 			}
 		} else {
+			if fstabIdx != -1 {
+				if src == "" {
+					src = entries[fstabIdx].Src
+				}
+				if fstype == "" {
+					fstype = entries[fstabIdx].Fstype
+				}
+				if opts == "defaults" && entries[fstabIdx].Opts != "" {
+					opts = entries[fstabIdx].Opts
+				}
+			}
+			if src == "" || fstype == "" {
+				return &Result{
+					Failed:   true,
+					ExitCode: 1,
+					Message:  fmt.Sprintf("cannot mount %s on remount: src and fstype are required when target is not currently mounted and not found in fstab", path),
+				}, fmt.Errorf("cannot remount %s: missing src or fstype", path)
+			}
 			_, _ = client.Execute(fmt.Sprintf("mkdir -p %s", shellQuote(path)))
 			mountCmd := fmt.Sprintf("mount -t %s -o %s %s %s", shellQuote(fstype), shellQuote(opts), shellQuote(src), shellQuote(path))
 			if mRes, err := client.Execute(mountCmd); err != nil || (mRes != nil && mRes.ExitCode != 0) {

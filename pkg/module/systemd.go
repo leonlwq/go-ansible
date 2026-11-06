@@ -2,6 +2,7 @@ package module
 
 import (
 	"fmt"
+	"strings"
 
 	"go-ansible/pkg/ssh"
 )
@@ -49,13 +50,75 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 	state := GetParamString(params, "state", "")
 	enabled, hasEnabled := getOptionalBoolParam(params, "enabled")
 	masked, hasMasked := getOptionalBoolParam(params, "masked")
+	if state == "masked" {
+		masked = true
+		hasMasked = true
+		state = ""
+	}
 	daemonReload := GetParamBool(params, "daemon_reload", false)
 	daemonReexec := GetParamBool(params, "daemon_reexec", false)
+
+	scope := strings.ToLower(strings.TrimSpace(GetParamString(params, "scope", "system")))
+	systemctlCmd := "systemctl"
+	switch scope {
+	case "user":
+		systemctlCmd = "systemctl --user"
+	case "global":
+		systemctlCmd = "systemctl --global"
+	}
+
+	if IsCheckMode(params) {
+		stateChanged := false
+		if state != "" {
+			activeRes, _ := client.Execute(fmt.Sprintf("%s is-active %s 2>/dev/null", systemctlCmd, shellQuote(name)))
+			isActive := activeRes != nil && strings.TrimSpace(activeRes.Stdout) == "active"
+			switch state {
+			case "started":
+				if !isActive {
+					stateChanged = true
+				}
+			case "stopped":
+				if isActive {
+					stateChanged = true
+				}
+			case "restarted":
+				stateChanged = true
+			case "reloaded":
+				if isActive {
+					stateChanged = true
+				}
+			}
+		}
+
+		enabledChanged := false
+		if hasEnabled {
+			enRes, _ := client.Execute(fmt.Sprintf("%s is-enabled %s 2>/dev/null", systemctlCmd, shellQuote(name)))
+			isCurrentlyEnabled := enRes != nil && strings.TrimSpace(enRes.Stdout) == "enabled"
+			if isCurrentlyEnabled != enabled {
+				enabledChanged = true
+			}
+		}
+
+		maskedChanged := false
+		if hasMasked {
+			mRes, _ := client.Execute(fmt.Sprintf("%s is-enabled %s 2>/dev/null", systemctlCmd, shellQuote(name)))
+			isCurrentlyMasked := mRes != nil && strings.TrimSpace(mRes.Stdout) == "masked"
+			if isCurrentlyMasked != masked {
+				maskedChanged = true
+			}
+		}
+
+		changed := daemonReload || daemonReexec || stateChanged || enabledChanged || maskedChanged
+		return &Result{
+			Changed: changed,
+			Message: "check mode: systemd state checked",
+		}, nil
+	}
 
 	result := &Result{}
 
 	if daemonReload {
-		stepResult, stepErr := client.Execute("systemctl daemon-reload")
+		stepResult, stepErr := client.Execute(fmt.Sprintf("%s daemon-reload", systemctlCmd))
 		if stepErr != nil {
 			return stepResult, stepErr
 		}
@@ -63,7 +126,7 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 	}
 
 	if daemonReexec {
-		stepResult, stepErr := client.Execute("systemctl daemon-reexec")
+		stepResult, stepErr := client.Execute(fmt.Sprintf("%s daemon-reexec", systemctlCmd))
 		if stepErr != nil {
 			return stepResult, stepErr
 		}
@@ -71,7 +134,7 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 	}
 
 	if hasMasked {
-		cmd := buildSystemdMaskedCommand(name, masked)
+		cmd := buildSystemdMaskedCommandWithCmd(systemctlCmd, name, masked)
 		stepResult, stepErr := client.Execute(cmd)
 		if stepErr != nil {
 			return stepResult, stepErr
@@ -89,6 +152,9 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 
 	if hasEnabled {
 		cmd := buildServiceEnabledCommand(true, name, enabled)
+		if systemctlCmd != "systemctl" {
+			cmd = strings.ReplaceAll(cmd, "systemctl ", systemctlCmd+" ")
+		}
 		stepResult, stepErr := client.Execute(cmd)
 		if stepErr != nil {
 			return stepResult, stepErr
@@ -109,6 +175,9 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 		if cmdErr != nil {
 			return nil, cmdErr
 		}
+		if systemctlCmd != "systemctl" {
+			cmd = strings.ReplaceAll(cmd, "systemctl ", systemctlCmd+" ")
+		}
 		stepResult, stepErr := client.Execute(cmd)
 		if stepErr != nil {
 			return stepResult, stepErr
@@ -125,16 +194,24 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 	}
 
 	if !daemonReload && !daemonReexec && !hasMasked && !hasEnabled && state == "" {
-		return client.Execute(buildServiceStatusCommand(true, name))
+		cmd := buildServiceStatusCommand(true, name)
+		if systemctlCmd != "systemctl" {
+			cmd = strings.ReplaceAll(cmd, "systemctl ", systemctlCmd+" ")
+		}
+		return client.Execute(cmd)
 	}
 
 	return result, nil
 }
 
 func buildSystemdMaskedCommand(name string, masked bool) string {
+	return buildSystemdMaskedCommandWithCmd("systemctl", name, masked)
+}
+
+func buildSystemdMaskedCommandWithCmd(systemctlCmd, name string, masked bool) string {
 	quotedName := shellQuote(name)
 	if masked {
-		return fmt.Sprintf("if systemctl is-enabled %s 2>/dev/null | grep -qx masked; then echo %s; else systemctl mask %s && echo %s; fi", quotedName, changeMarkerFalse, quotedName, changeMarkerTrue)
+		return fmt.Sprintf("if %s is-enabled %s 2>/dev/null | grep -qx masked; then echo %s; else %s mask %s && echo %s; fi", systemctlCmd, quotedName, changeMarkerFalse, systemctlCmd, quotedName, changeMarkerTrue)
 	}
-	return fmt.Sprintf("if ! systemctl is-enabled %s 2>/dev/null | grep -qx masked; then echo %s; else systemctl unmask %s && echo %s; fi", quotedName, changeMarkerFalse, quotedName, changeMarkerTrue)
+	return fmt.Sprintf("if ! %s is-enabled %s 2>/dev/null | grep -qx masked; then echo %s; else %s unmask %s && echo %s; fi", systemctlCmd, quotedName, changeMarkerFalse, systemctlCmd, quotedName, changeMarkerTrue)
 }

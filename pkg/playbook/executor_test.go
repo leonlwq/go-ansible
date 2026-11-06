@@ -17,24 +17,35 @@ func intPtr(v int) *int {
 }
 
 func TestParseRoleSpec(t *testing.T) {
-	name, vars := parseRoleSpec("web")
+	name, vars, when, tags := parseRoleSpec("web")
 	if name != "web" {
 		t.Fatalf("expected role name web, got %q", name)
 	}
 	if vars != nil {
 		t.Fatalf("expected nil vars for string role, got %#v", vars)
 	}
+	if when != nil || tags != nil {
+		t.Fatalf("expected nil when/tags for string role")
+	}
 
-	name, vars = parseRoleSpec(map[string]interface{}{
+	name, vars, when, tags = parseRoleSpec(map[string]interface{}{
 		"role": "app",
 		"vars": map[string]interface{}{"port": 8080},
 		"env":  "prod",
+		"when": "enabled == true",
+		"tags": []string{"app_tag"},
 	})
 	if name != "app" {
 		t.Fatalf("expected role name app, got %q", name)
 	}
 	if vars["port"] != 8080 || vars["env"] != "prod" {
 		t.Fatalf("unexpected inline vars: %#v", vars)
+	}
+	if when != "enabled == true" {
+		t.Fatalf("expected when 'enabled == true', got %#v", when)
+	}
+	if len(tags) != 1 || tags[0] != "app_tag" {
+		t.Fatalf("expected tags [app_tag], got %#v", tags)
 	}
 }
 
@@ -60,8 +71,8 @@ func TestLoadPlayVarsFiles(t *testing.T) {
 	if playVars["env"] != "prod" {
 		t.Fatalf("expected env from vars file, got %#v", playVars["env"])
 	}
-	if playVars["port"] != 9090 {
-		t.Fatalf("expected play vars to override vars file, got %#v", playVars["port"])
+	if playVars["port"] != 8080 {
+		t.Fatalf("expected vars_files to override play vars, got %#v", playVars["port"])
 	}
 }
 
@@ -108,7 +119,7 @@ func TestLoadPlayRoles(t *testing.T) {
 		},
 	}
 
-	tasks, handlers, roleVars, err := executor.loadPlayRoles(play)
+	tasks, handlers, roleVars, roleDefaults, err := executor.loadPlayRoles(play)
 	if err != nil {
 		t.Fatalf("loadPlayRoles() error = %v", err)
 	}
@@ -119,8 +130,8 @@ func TestLoadPlayRoles(t *testing.T) {
 	if len(handlers) != 1 || handlers[0].Listen != "restart web" {
 		t.Fatalf("unexpected role handlers: %#v", handlers)
 	}
-	if roleVars["service_name"] != "nginx" || roleVars["pkg_state"] != "latest" || roleVars["env"] != "prod" {
-		t.Fatalf("unexpected merged role vars: %#v", roleVars)
+	if roleVars["service_name"] != "nginx" || roleDefaults["pkg_state"] != "present" || roleVars["pkg_state"] != "latest" || roleVars["env"] != "prod" {
+		t.Fatalf("unexpected merged role vars/defaults: roleVars=%#v, roleDefaults=%#v", roleVars, roleDefaults)
 	}
 }
 
@@ -147,7 +158,7 @@ func TestLoadPlayRolesUsesConfiguredRolePaths(t *testing.T) {
 		Roles: []interface{}{"web"},
 	}
 
-	tasks, _, _, err := executor.loadPlayRoles(play)
+	tasks, _, _, _, err := executor.loadPlayRoles(play)
 	if err != nil {
 		t.Fatalf("loadPlayRoles() error = %v", err)
 	}

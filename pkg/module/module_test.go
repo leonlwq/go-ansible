@@ -1,6 +1,7 @@
 package module
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"text/template"
@@ -310,7 +311,7 @@ func TestTransformLineinfileContentFirstMatchAndBackrefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transformLineinfileContent(default last match) error = %v", err)
 	}
-	if !changed || updated != "version=3\n" {
+	if !changed || updated != "version=1\nversion=3\n" {
 		t.Fatalf("unexpected default last-match result: changed=%v updated=%q", changed, updated)
 	}
 
@@ -323,7 +324,7 @@ func TestTransformLineinfileContentFirstMatchAndBackrefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transformLineinfileContent(firstmatch) error = %v", err)
 	}
-	if !changed || updated != "version=3\n" {
+	if !changed || updated != "version=3\nversion=2\n" {
 		t.Fatalf("unexpected firstmatch result: changed=%v updated=%q", changed, updated)
 	}
 
@@ -363,7 +364,7 @@ func TestTransformLineinfileContentSearchString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transformLineinfileContent(search_string present) error = %v", err)
 	}
-	if !changed || updated != "option=new\n" {
+	if !changed || updated != "option=old\noption=new\n" {
 		t.Fatalf("unexpected search_string present result: changed=%v updated=%q", changed, updated)
 	}
 
@@ -881,5 +882,91 @@ func TestExpandedTemplateFilters(t *testing.T) {
 	sha256Hash := TemplateHash("sha256", "hello")
 	if sha256Hash != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Fatalf("sha256 hash: %s", sha256Hash)
+	}
+}
+
+func TestItems2DictAndYAMLFilters(t *testing.T) {
+	// 1. dict2items -> items2dict round-trip
+	origMap := map[string]interface{}{
+		"env":  "production",
+		"port": 8080,
+	}
+	items, err := TemplateDict2Items(origMap)
+	if err != nil {
+		t.Fatalf("dict2items failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+
+	convertedMap, err := TemplateItems2Dict(items)
+	if err != nil {
+		t.Fatalf("items2dict failed: %v", err)
+	}
+	if convertedMap["env"] != "production" || convertedMap["port"] != 8080 {
+		t.Fatalf("items2dict mismatch: %#v", convertedMap)
+	}
+
+	// 2. items2dict with custom key_name and value_name
+	customItems := []interface{}{
+		map[string]interface{}{"name": "db_host", "val": "10.0.0.1"},
+		map[string]interface{}{"name": "db_port", "val": 5432},
+	}
+	customMap, err := TemplateItems2Dict(customItems, "key_name=name", "value_name=val")
+	if err != nil {
+		t.Fatalf("custom items2dict failed: %v", err)
+	}
+	if customMap["db_host"] != "10.0.0.1" || customMap["db_port"] != 5432 {
+		t.Fatalf("custom items2dict mismatch: %#v", customMap)
+	}
+
+	// 3. to_yaml & from_yaml
+	data := map[string]interface{}{
+		"service":  "api",
+		"replicas": 3,
+		"tags":     []interface{}{"prod", "v1"},
+	}
+	yamlStr, err := TemplateToYAML(data)
+	if err != nil {
+		t.Fatalf("to_yaml failed: %v", err)
+	}
+	if !strings.Contains(yamlStr, "service: api") || !strings.Contains(yamlStr, "replicas: 3") {
+		t.Fatalf("unexpected to_yaml result:\n%s", yamlStr)
+	}
+
+	decoded, err := TemplateFromYAML(yamlStr)
+	if err != nil {
+		t.Fatalf("from_yaml failed: %v", err)
+	}
+	decodedMap, ok := decoded.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map[string]interface{}, got %T", decoded)
+	}
+	if decodedMap["service"] != "api" || decodedMap["replicas"] != 3 {
+		t.Fatalf("from_yaml mismatch: %#v", decodedMap)
+	}
+
+	// 4. ApplyFilter integration test
+	res, ok, err := ApplyFilter("items2dict", customItems)
+	if err != nil || !ok {
+		t.Fatalf("ApplyFilter items2dict failed: %v", err)
+	}
+	if resMap, ok := res.(map[string]interface{}); !ok || resMap == nil {
+		t.Fatalf("expected map result from ApplyFilter items2dict, got %T", res)
+	}
+	resYAML, ok, err := ApplyFilter("to_yaml", data)
+	if err != nil || !ok {
+		t.Fatalf("ApplyFilter to_yaml failed: %v", err)
+	}
+	if !strings.Contains(fmt.Sprintf("%v", resYAML), "service: api") {
+		t.Fatalf("ApplyFilter to_yaml content mismatch: %v", resYAML)
+	}
+
+	resDecoded, ok, err := ApplyFilter("from_yaml", resYAML)
+	if err != nil || !ok {
+		t.Fatalf("ApplyFilter from_yaml failed: %v", err)
+	}
+	if resDecoded.(map[string]interface{})["service"] != "api" {
+		t.Fatalf("ApplyFilter from_yaml mismatch: %#v", resDecoded)
 	}
 }

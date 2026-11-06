@@ -2,6 +2,7 @@ package callback
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -243,5 +244,58 @@ func TestCallbackUnreachableAndIgnoredRecap(t *testing.T) {
 	}
 	if !strings.Contains(out, "unreachable=1") || !strings.Contains(out, "ignored=1") {
 		t.Errorf("expected recap unreachable=1 and ignored=1, got: %s", out)
+	}
+}
+
+func TestColorControlAndNoColor(t *testing.T) {
+	result := &playbook.PlaybookResult{
+		Plays: []*playbook.PlayResult{
+			{
+				Name: "test play",
+				Hosts: map[string]*playbook.HostResult{
+					"web1": {
+						Tasks: []*playbook.TaskResult{
+							{Name: "task ok"},
+							{Name: "task changed", Changed: true},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// 1. By default with *bytes.Buffer (non-terminal), colors are disabled
+	os.Unsetenv("NO_COLOR")
+	os.Unsetenv("ANSIBLE_NOCOLOR")
+	os.Unsetenv("ANSIBLE_FORCE_COLOR")
+	var buf1 bytes.Buffer
+	_ = (&DefaultRenderer{}).Render(&buf1, result, "")
+	if strings.Contains(buf1.String(), "\033[") {
+		t.Errorf("expected no ANSI color codes for non-terminal buffer, got %q", buf1.String())
+	}
+
+	// 2. ANSIBLE_FORCE_COLOR=1 enables colors even for buffer
+	t.Setenv("ANSIBLE_FORCE_COLOR", "1")
+	var buf2 bytes.Buffer
+	_ = (&DefaultRenderer{}).Render(&buf2, result, "")
+	if !strings.Contains(buf2.String(), "\033[33mchanged: [web1]\033[0m") {
+		t.Errorf("expected colored changed task with FORCE_COLOR=1, got %q", buf2.String())
+	}
+
+	// 3. NO_COLOR=1 overrides FORCE_COLOR and disables colors
+	t.Setenv("NO_COLOR", "1")
+	var buf3 bytes.Buffer
+	_ = (&DefaultRenderer{}).Render(&buf3, result, "")
+	if strings.Contains(buf3.String(), "\033[") {
+		t.Errorf("expected NO_COLOR to suppress colors, got %q", buf3.String())
+	}
+
+	// 4. ANSIBLE_NOCOLOR=1 disables colors
+	os.Unsetenv("NO_COLOR")
+	t.Setenv("ANSIBLE_NOCOLOR", "true")
+	var buf4 bytes.Buffer
+	_ = (&DefaultRenderer{}).Render(&buf4, result, "")
+	if strings.Contains(buf4.String(), "\033[") {
+		t.Errorf("expected ANSIBLE_NOCOLOR to suppress colors, got %q", buf4.String())
 	}
 }

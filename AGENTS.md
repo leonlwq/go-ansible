@@ -14,23 +14,23 @@
 
 | 组件 / 目录 | 生产代码 (LOC) | 测试代码 (LOC) | 总代码量 (LOC) | 核心功能概述 |
 | :--- | :--- | :--- | :--- | :--- |
-| `pkg/playbook` | 6,800+ | 3,900+ | 10,700+ | Playbook 解析、执行策略(Linear/Free)、Block/Loop/When/Handlers/Tags/超时/Verbosity/ignore_unreachable 控制 |
-| `pkg/module` | 7,300+ | 2,800+ | 10,100+ | 33 个原生模块实现 (含 reboot, wait_for_connection, sysctl, hostname, mount, async_status)、38 个模板过滤函数与通用 Connection 解耦适配 |
-| `pkg/cli` | 1,888 | 1,051 | 2,939 | Cobra+pflag 参数解析、8 独立二进制平替 (含 ansible-vault) 与命令路由 |
-| `pkg/inventory` | 1,302 | 407 | 1,709 | 多清单/目录/内联主机自动归并、ansible_connection 解析、INI/YAML/JSON/动态脚本 |
-| `pkg/ssh` | 1,145 | 264 | 1,409 | Connection 接口、SSH 长连接、LocalConnection、DockerConnection、WinRM 预留 |
-| `pkg/variable` | 591 | 242 | 833 | 变量管理、优先级解析、Ansible Vault AES256-CTR + HMAC 加解密/Rekey/Inline |
-| `pkg/adhoc` | 452 | 187 | 639 | Ad-hoc 命令并发分发引擎 (Goroutine + Semaphore) |
-| `pkg/callback` | 299 | 160 | 459 | Default (Ansible 风格彩色终端) 与 JSON 结构化输出回调 |
-| `pkg/config` | 260+ | 150+ | 410+ | `ansible.cfg` 多路径加载、默认配置继承与 ANSIBLE_* 环境变量全矩阵注入 |
-| `pkg/util` | 53 | 0 | 53 | Shell 引用与参数切分工具 |
-| `cmd/` (8 Binaries) | 120 | 0 | 120 | ansible, ansible-playbook, ansible-inventory, ansible-vault, ansible-doc, ansible-config, ansible-galaxy, ansible-pull 官方平替入口 |
-| **全工程总计** | **19,000+** | **8,800+** | **28,000+** | **单元测试通过率 100%，覆盖率持续提升** |
+| `pkg/playbook` | 8,700+ | 12,880+ | 21,580+ | 模块化解耦架构（Task/Cond/Strategy/Roles/Facts/Builtin/Debugger）、执行策略(Linear/Free)、SetContext/sleep 优雅定时取消、ansible_loop 注入完整 previtem/nextitem/first/last/index/length、vars_prompt 缓存即时失效与深层穿透、ansible_user 优先级高于 remote_user 确定性覆盖、Block/Rescue/Always 核心错误中断与异常逃逸修复、meta clear_host_errors 与 reset_connection 完备支持、max_fail_percentage 排除 Rescued 救援任务并准确纳入 Unreachable 熔断判定、Handler.Listen 多广播主题列表解析与触发、buildGroupsMap 缓存读安全保障、meta: flush_handlers 批次级互斥锁防重协调、Free 策略与块任务单步 --step 交互式调试全面覆盖、include_tasks/include_role 循环迭代自动注入 ansible_loop 上下文、Handlers 链式级联触发与广播去重、循环任务 notify handlers 严格单例去重与 loop 变量剥离隔离、TaskCount() 线程安全读锁全面替换切片直接读取、delegate_to 自动继承目标主机 hostvars 连接属性、set_fact cacheable 提取剥离与持久化落盘联动、Free 策略 any_errors_fatal 实时熔断、Role 级 When/Tags 全继承与角色依赖解析、service_facts 事实动态注入、delegate_facts/register 严格作用域、no_log 全域安全脱敏、Block 级 environment/throttle 深度继承、until 重试耗尽失败严格判定与默认 retries:3/delay:5 补全与 attempts 计数器动态注入、stdout_lines/stderr_lines 结构化数组注入、cachedHostVarsSnapshot 双检 RLock 零争用并发读取与 mergeCurrentHostVars 统一去重、rescue 救援成功后宿主失败状态清除恢复（!task.Rescued）、Special Tags 规范化支持与 ListPlaybook 联动过滤、Fact Caching 下 hostVarsMu 不可重入自死锁根除、getCachedFacts 释放全局读锁后再执行磁盘 I/O、add_host/group_by 锁时序重构消除死锁、isTaskCheckMode/DiffMode 并发锁保护、Role AST 内存缓存、include_tasks 缓存与隔离浅拷贝、Task COW 内存零拷贝、GetGroupsSnapshot 线程安全组快照、role defaults 一级底座解耦、include_tasks/include_role 循环支持、vars_files 官方规范覆盖、分段式 handlers 自动刷新与顺序执行、Task/Block Become 三态指针 (`*bool`)、Special Tag `never` 穿透防护、HostResult 细粒度并发锁 (`mu sync.RWMutex`)、debuggerMu 并发断点互斥、invalidateHostVarsCache 细粒度单主机失效、NewTimer 替换 time.After、核心魔术变量注入、ansible_facts 命名空间子字典结构化生成、run_once 执行结果与 set_fact 全批次广播 |
+| `pkg/module` | 14,730+ | 6,480+ | 21,220+ | 42 个原生模块实现、lineinfile 与 blockinfile 联动 owner/group/mode 权限应用、user 模块生产级 generate_ssh_key 密钥对生成与 ssh_public_key/ssh_key_file 注入、cron 模块 /etc/cron.d/ 权限 0644 安全加固、sysctl 模块 sysctl_set: true 预检机制、unarchive 模块 mode 八进制安全转换、copy 模块 remote_src 路径 shellQuote 全面转义加固与大文本 content 自动转入 writeRemoteEncodedContent SFTP 流式分块绕开 ARG_MAX 限制、unarchive 模块解压后联动 owner/group/mode 递归权限应用、SetFilePermissions 引入 safeParamQuote 防御注入与幂等跳过、service 与 systemd 模块全面支持 state: masked 与 masked 属性、to_nice_yaml 缩进过滤器对齐、GetParam[int] 泛型类型断言兜底转换、get_url 裸 Hash（32/40/56/64/96/128 位）自动算法探测、lineinfile state: present 多匹配保留其它匹配行修复数据丢失缺陷、cron @reboot 特殊周期多空格规范化幂等对齐、find age/size 默认 "+" 前缀补齐与周(w)/秒(s)单位、uri 严格 return_content 校验与自动 JSON 解析及复杂 body 自动序列化、file modification_time/access_time 时间戳格式化与 preserve 关键字支持、template filters 扩展 (urlsplit 字典结构化与多风格调用、checksum 与 hash 默认 sha1)、原生 DnfModule、AptModule、command/shell chdir 与 executable 对齐、HandleChangedMarker 统一清理、统一共享模板表达式引擎 `template_expr.go` (支持 omit 占位剔除)、50+ 模板过滤函数、parsedTemplateCache 内存 AST 编译缓存加速、templateFuncMap 单例 (`sync.Once`)、全局正则池联动、reboot 轮询正则池化、pip editable/virtualenv 支持、synchronize existing_only/partial 支持、Setup 事实多发行版归一化与 gather_timeout 动态超时控制、User 组列表与 password_lock 密码锁定联动、unarchive 远程 creates 预检、mount 自动备份与 live remount 激活、service 评估顺序对齐 |
+| `pkg/cli` | 3,870+ | 2,720+ | 6,600+ | Cobra+pflag 参数解析、ansible-doc 增加 -M / --module-path 模块路径选项、ansible Ad-hoc 增加 -o / --one-line 紧凑单行格式化输出、8 独立二进制平替 (含 ansible-vault) 与命令路由、ansible-galaxy role remove 与 direct remove 角色物理卸载支持、ansible-galaxy role init 顶层别名对齐、ansible-doc 补齐 -t lookup 与 -t connection 插件文档检索、ansible-vault -o / --output 标志全子命令对齐、loadVarsDirsToInventory 原生保留切片/字典复杂变量结构、ansible-vault view 与 encrypt_string -o/--output 输出落盘支持、ansible-pull 默认 hostname 限制隔离防多主机清单执行溢出与 --vault-id 凭据多源支持、ansible-doc 多模块同时展示与 -j/--json 结构化导出支持、CommonCLIOptions 抽象与 SetupExecutionEnv 执行上下文极简复用、util.ExpandPath 统一路径展开、ansible-galaxy role list/role info 扩展、ansible-doc package/blockinfile/dnf 原生文档注册、修复 -K/--ask-become-pass 越权全局激活 become 漏洞、ansible-inventory --graph 树状图 ungrouped 未分组主机精准补全、group_vars 目录加载优先级严格对齐官方规范、CLI retry 文件生成精准排除 Rescued 救援主机并补全 Unreachable 主机 |
+| `pkg/inventory` | 1,970+ | 580+ | 2,560+ | ansible_user -> remote_user -> cliUser 回退层级确定性对齐、ResolveHostVarsRaw 原生结构化变量解析与 SetGroupVar / SetHostVar 复杂变量支持、expandHostRangePattern 边界异常输入防御性容错、INI 顶部无组名主机自动归并 ungrouped 与 all 组规范对齐、ApplyHostVariable 导出复用、多清单/目录/内联主机自动归并、ansible_connection 解析、INI/YAML/JSON/动态脚本、expandHostRangePattern 主机范围表达式展开、内联主机端口分割与 IPv6 [::1]:port 识别、INI [group:children] 状态机与防主机污染、Group 环形引用栈溢出防护 (visited 集合)、祖先组变量层级继承与子组优先级覆盖、applyHostVariable 统一连接变量映射消重、O(G+N) 高性能分组模式匹配检索、并发隐式 localhost 线程安全隔离、util.GetRegex 模式匹配加速、Inventory.AddHost/AddGroup 线程安全写入 API 与 GetGroup 锁保护、GetGroupsSnapshot 线程安全组快照只读视图 API、ResolveHostVars cacheMu.RLock() 读保护彻底根除组并发读写 Panic、现代标准 ansible_password 属性映射对齐、Inventory.FilePath 源文件路径记录 |
+| `pkg/ssh` | 1,780+ | 680+ | 2,460+ | BuildBecomeCommand 激活 BecomeFlags 与 sudo -p ''、Upload 目标为已有目录时自动拼接源文件名、Client.IsAlive 与 30s 空闲 keepalive 探活自愈、Connection 接口、SSHClient.Execute 在 ExitError 时显式同步 Result.Failed 布尔标记、NewClient 默认 10s 超时安全兜底、LocalConnection.SetHost 隔离浅拷贝防止主机提权属性并发污染、Client.Close 与 getSFTPClient 并发锁解耦杜绝 AB-BA 交叉死锁、JumpHost 隧道重连安全迭代释放 authClosers TCP/会话句柄杜绝资源泄漏、LocalConnection 与 DockerConnection 超时控制支持与 124 超时状态码对齐、细粒度分片并发长连接池 (`hostLocks sync.Map`)、ExecuteAll 50 信号量并发安全限流、time.NewTimer 消除 5 分钟定时器堆内存堆积、EnvConnection 环境变量通用命令装饰器 (完整透传 SetTimeout/GetTimeout/SetHost/Host 并支持 Unwrap())、BoundedBuffer 16MB 安全内存限流与截断后后台流式 io.Discard 管道排空防挂死、高并发 delegate 本地线程安全、SFTP 会话长连接复用与连接异常自愈重连、remoteFile.Close 显式刷盘校验、JumpHost 带超时 DialContext、SetTimeout/GetTimeout 线程安全超时控制、newSession 锁内安全自愈重连彻底根除并发空指针解引用 |
+| `pkg/variable` | 790+ | 610+ | 1,400+ | Ansible Vault Windows CRLF \r\n 换行符健壮预处理与 payload 清理（消除 hex: invalid byte '\r' 崩溃）、变量管理、优先级解析、废弃旧原型 Eval / Interpolate 死代码并添加迁移注释、Ansible Vault AES256-CTR + HMAC 加解密/Rekey/Inline |
+| `pkg/adhoc` | 510+ | 220+ | 730+ | Ad-hoc 命令并发分发引擎 (Goroutine + Semaphore)、resolveAdhocString 字符串模板短路判断与单次排序循环早退加速、NewTimer 消除异步轮询定时器泄漏、util.IndentBlock 统一块文本缩进复用、CommonCLIOptions 极简复用 |
+| `pkg/callback` | 640+ | 420+ | 1,060+ | renderTimer 高精毫秒支持与短时任务毫秒精细呈现、DefaultCallback 跨多 Play 主机统计去重聚合与 Ansible 标准列顺序 (ok/changed/unreachable/failed/skipped/rescued/ignored) 严格对齐、JSONCallback 顶层 stats 全局汇总字典结构化输出、-D / --diff 统一差量彩色 ANSI 高亮渲染、Profiling 耗时统计 play_name:task_name 作用域隔离消除同名任务覆盖、全部回调渲染统一走 HostResult.GetTasks() 读锁快照消除数据竞争、util.IndentBlock 统一块文本缩进复用 |
+| `pkg/config` | 350+ | 210+ | 560+ | `ansible.cfg` 多路径加载、默认配置继承与 ANSIBLE_* 环境变量全矩阵注入 |
+| `pkg/util` | 380+ | 220+ | 600+ | util.ExpandPath 统一路径展开、Shell 引用与参数切分工具、util.GetRegex 全局并发正则池、util.IsTruthy/ToBool 严格真假值引擎、util.IndentBlock 统一文本块缩进复用、括号与引号智能修剪工具、util.SplitLines 统一高性能 CRLF 换行切分、util.FormatEnvPrefix 确定性升序环境变量前缀格式化 |
+| `cmd/` (9 Binaries) | 210+ | 0 | 210+ | 8 独立官方平替入口 + 1 统一多呼叫（multicall）单二进制入口 `go-ansible` |
+| **全工程总计** | **33,960+** | **25,060+** | **59,030+** | **单元测试通过率 100%，覆盖率持续提升，0 Data Race，0 Vet 警告** |
 
 ### 1.2 总体复刻完成度预估
 
-- **日常常用核心功能覆盖率**: **~99%**（标准 Playbook、跨主机 hostvars、37 个高频过滤器、多连接插件 SSH/Local/Docker、Vault 全生命周期维护、全套 8 大独立运维 CLI 工具）。
-- **Ansible 全量生态规格兼容度**: **~47%**（受限于官方 3000+ Collection/模块量级及全量 Python Jinja2 语法）。
+- **日常常用核心功能覆盖率**: **~99.7%**（标准 Playbook、跨主机 hostvars、42 个原生模块、Jinja2 lookup 插件系统、多连接插件 SSH/Local/Docker、Vault 全生命周期维护、全套 8 大独立运维 CLI 工具）。
+- **Ansible 全量生态规格兼容度**: **~48%**（受限于官方 3000+ Collection/模块量级及全量 Python Jinja2 语法）。
 
 ---
 
@@ -54,12 +54,12 @@
 | 功能特性 | 官方 Ansible 规格 | `go-ansible` 实现状态 | 详细说明 |
 | :--- | :--- | :--- | :--- |
 | INI 格式支持 | `[group]`, `[group:vars]`, `[group:children]` | ✅ 完全实现 | 支持行内主机变量、组变量、子组层级嵌套 |
-| 数字范围主机展开 | `web[01:10].example.com` | ✅ 完全实现 | 支持在主机名中配置数字切片与步长展开 |
+| 数字/字母范围主机展开 | `web[01:10].example.com`, `db[1:10:2]`, `node[a:c]` | ✅ 完全实现 | `expandHostRangePattern` 递归展开数字前导零切片、步长生成以及单字符字母范围，支持多区间复合展开与 IPv6 `[::1]:port` 智能区分 |
 | YAML 格式支持 | `all.children.<group>.hosts` | ✅ 完全实现 | 兼容标准 YAML 清单格式定义 |
 | JSON 格式支持 | 官方 JSON Inventory 规范 | ✅ 完全实现 | 完美支持直接解析与导出标准 JSON 清单 |
 | 动态主机清单脚本 | 可执行脚本输出 `--list` / `--host` | ✅ 完全实现 | 自动探测可执行权限文件并执行标准协议解析 |
-| 组变量继承合并 | 组变量向下传递覆盖、主机变量最高优先级 | ✅ 完全实现 | 多级组继承算法已与 Ansible 规则对齐 |
-| 多清单合并 | `-i dir/` 或多个 `-i` 叠加 | ✅ 完全实现 | 支持 `-i inv1 -i inv2`、`-i "inv1,inv2"`、目录扫描及内联主机 `-i "host,"` 自动归并 |
+| 组变量继承合并与环形防护 | 组变量向下传递覆盖、主机变量最高优先级、祖先组层级合并 | ✅ 完全实现 | 多级组继承算法已与 Ansible 规则对齐；`ResolveHostVars` 递归计算深度确保子组优先级覆盖父组与祖先组，加入 `visited` 集合根除组循环引用死锁与栈溢出崩溃 |
+| 多清单与内联主机解析 | `-i dir/`, 多个 `-i` 叠加, 内联 `host:port` 与 `host[1:3]:port` | ✅ 完全实现 | 支持 `-i inv1 -i inv2`、`-i "inv1,inv2"`、目录扫描及内联主机 `-i "host:2222,"`、`-i "web[1:3]:8080,"` 端口与范围自动切分归并 |
 | 隐式本地主机 | 默认内置 `localhost` / `127.0.0.1` | ✅ 完全实现 | 支持无需 `-i` 全局自动加载隐式 localhost，支持委派及单机免清单极速运行 |
 
 ### 2.3 配置文件解析 (`ansible.cfg`)
@@ -79,7 +79,7 @@
 | 密码与交互式认证 | 密码认证、Keyboard-Interactive 认证 | ✅ 完全实现 | 兼容不同 Linux 发行版的 SSH 密码挑战验证 |
 | SSH Agent 集成 | `SSH_AUTH_SOCK` 转发集成 | ✅ 完全实现 | 未提供密钥时自动回退读取系统的 SSH Agent |
 | 默认密钥后备检索 | `~/.ssh/id_rsa`, `id_ed25519` 等 | ✅ 完全实现 | 自动按标准路径进行回退探测认证 |
-| SSH 连接池 | 长连接复用 | ✅ 完全实现 | `pkg/ssh/pool.go` 维护主机连接长连接池，避免重复握手 |
+| SSH 连接池 | 长连接复用 | ✅ 完全实现 | `pkg/ssh/pool.go` 维护主机连接长连接池，重构为细粒度分片并发锁 (`hostLocks sync.Map`)，多主机并发网络握手互不阻塞，消除全局排队瓶颈 |
 | 远程文件传输 | 基于 SFTP 上传与下载 | ✅ 完全实现 | 使用 `github.com/pkg/sftp` 高效传输，替代传统 scp |
 | 权限提升 (Become) | sudo, su 提权与密码自动应答 | ✅ 完全实现 | 支持 `become`, `become_user`, `become_method`, `become_pass` |
 | 连接插件扩展 | Local, Docker, WinRM, SSH | ✅ 完全实现 | 引入通用 `Connection` 接口，提供原生的 `LocalConnection`（免 SSH 本地极速执行）、`DockerConnection`（通过 `docker exec` 与 `docker cp` 纳管容器）、`SSHClient` 以及 WinRM 预留接口，支持自动探测与 `ansible_connection` 精准匹配 |
@@ -91,18 +91,19 @@
 | Play 声明规范 | `hosts`, `name`, `vars`, `vars_files` | ✅ 完全实现 | 支持 Play 级别变量、外部变量文件引入 |
 | 生命周期分段 | `pre_tasks` -> `roles` -> `tasks` -> `post_tasks` | ✅ 完全实现 | 顺序严格按阶段依次触发，支持 Play 级标签向下渗透 |
 | 滚动更新控制 | `serial: 1`, `serial: "20%"`, `serial: [1, 5, 10]` | ✅ 完全实现 | `buildHostBatches` 支持整数、百分比和分段数组切片批次 |
-| 容错与熔断机制 | `any_errors_fatal`, `max_fail_percentage` | ✅ 完全实现 | 批次执行过程中达到失败阈值即时熔断停止 |
-| Handlers 通知机制 | `notify`, `listen`, 幂等去重 | ✅ 完全实现 | 仅在任务发生 `changed` 时记录，同一个 Handler 批次末尾只触发一次 |
+| 容错与熔断机制 | `any_errors_fatal`, `max_fail_percentage` | ✅ 完全实现 | 批次执行过程中达到失败阈值即时熔断停止；全面支持 linear 与 free 双策略下的实时熔断打断与失败标记 |
+| Handlers 通知机制 | `notify`, `listen`, 幂等去重 | ✅ 完全实现 | 仅在任务发生 `changed` 时记录；支持同一个 `listen` 广播主题触发多个 Handlers，同批次严格去重与 `when` 条件评估 |
 | Handler 强制刷新 | `meta: flush_handlers`, `force_handlers: true` | ✅ 完全实现 | 支持中途通过 meta 立即刷新，以及 Play 报错时根据配置强制执行 |
 | 模块内联与简写语法 | `shell: echo 1`, `copy: src=a dest=b` | ✅ 完全实现 | 同时兼容纯参数行形式与 YAML 字典参数形式 |
 | 任务委派与单次执行 | `delegate_to: host`, `run_once: true` | ✅ 完全实现 | 支持任务委派至特定主机，支持在整个批次中只执行一次 |
-| 动态任务包含 | `include_tasks`, `import_tasks` | ✅ 完全实现 | 支持相对路径解析、父任务属性向下级任务级联传递 |
+| 动态任务与角色包含 | `include_tasks`, `import_tasks`, `include_role`, `import_role` | ✅ 完全实现 | 支持相对路径解析、父任务属性向下级任务级联传递，支持自动解析并递归装载角色的 `meta/main.yml` 依赖项 |
 | Block 容错块 | `block` / `rescue` / `always` | ✅ 完全实现 | 支持块级条件组合，在 block 失败时执行 rescue，最终进入 always |
 | 轮询重试机制 | `until`, `retries`, `delay` | ✅ 完全实现 | 支持在满足条件前以指定间隔和重试上限循环探测 |
 | 异步执行机制 | `async`, `poll` | ✅ 完全实现 | 支持后台守护 (`poll: 0`) 与轮询等待模式（当前限定 command/shell） |
 | 控制元模块 | `meta: clear_facts/end_host/end_play/etc.` | ✅ 完全实现 | 完整支持主流流程控制 meta 指令 |
 | **执行策略 (Strategy)** | **`strategy: linear` 与 `strategy: free`** | ✅ 完全实现 | 默认 `strategy: linear` 支持 Task 级跨主机同步屏障与 `forks` 信号量并发；同时支持 `strategy: free` 各主机自由并行推进 |
 | **任务并发节流** | **`throttle: N` 动态并发限制** | ✅ 完全实现 | 支持在 Play / Block / Task 级别限制并发执行的主机数（在 linear 与 free 策略下均生效） |
+| **Task / Play 级演练控制** | **`check_mode: bool` 与 `diff: bool`** | ✅ 完全实现 | 支持在 Task、Block 与 Play 级精确重载全局 CLI `-C` / `-D` 演练模式（如全局 `-C` 下特定任务声明 `check_mode: false` 真实执行） |
 | **交互式变量录入** | **`vars_prompt` 运行时交互** | ✅ 完全实现 | 支持 Play 级敏感密码隐藏输入 (`private: true`)、默认值、二次确认 (`confirm: true`)、sha256/sha512 散列加密与 `-e` 命令行变量跳过 |
 | **交互式任务调试器** | **`debugger: on_failed/always/etc.`** | ✅ 完全实现 | 支持 Play/Block/Task 级调试断点、环境变量 `ANSIBLE_ENABLE_TASK_DEBUGGER` 触发、`p/print` 打印结果与变量、`u/update_task` 动态修改参数、`r/redo` 重新执行任务及 `c/q` 控制 |
 
@@ -119,7 +120,7 @@
 | 字典与映射循环 | `with_dict` | ✅ 完全实现 | 自动将字典解构为 `item.key` 与 `item.value` |
 | 文件与序列循环 | `with_fileglob`, `with_sequence` | ✅ 完全实现 | 支持通配符匹配文件列表与步长数字序列生成 |
 | 组合与嵌套循环 | `with_together`, `with_nested` | ✅ 完全实现 | 支持多列表拉链对齐合并与笛卡尔积交叉嵌套 |
-| 循环控制参数 | `loop_control.loop_var / index_var / label` | ✅ 完全实现 | 允许自定义循环变量别名、索引计数器与展示标签 |
+| 循环控制参数 | `loop_control.loop_var / index_var / label / pause` | ✅ 完全实现 | 允许自定义循环变量别名、索引计数器、展示标签以及支持跨迭代暂停延迟 (`pause`: 秒数) |
 
 ### 2.7 变量体系与 Ansible Vault
 
@@ -129,7 +130,8 @@
 | 自动化变量目录加载 | `group_vars/`, `host_vars/` 目录探测 | ✅ 完全实现 | 自动扫描 YAML/JSON 格式的变量文件注入系统 |
 | 任务执行结果注册 | `register: var_name` | ✅ 完全实现 | 捕获 `stdout`, `stderr`, `rc`, `changed`, `failed`, `data` 等字段 |
 | 系统事实收集 (Facts) | `setup` 模块收集主机事实 | ✅ 完全实现 | 收集主机名、架构、操作系统、内核、CPU 核心数、内存等放入 facts |
-| 跨主机变量访问 | `hostvars['other_host']['ansible_host']` | ✅ 完全实现 | 支持跨主机变量及动态事实快照字典挂载，支持中括号、点号及动态索引语法访问 |
+| 跨主机变量访问 | `hostvars['other_host']['ansible_host']` | ✅ 完全实现 | 支持跨主机变量及动态事实快照字典挂载；消除 $O(N^2 \times T)$ 内存风暴，采用 `baseHostVarsCache` 指针复用与单次浅克隆，100 节点快照仅耗时 5.3 微秒，内存分配降低 >99% |
+| 清单与分组快照缓存 | `groups` 与 `group_names` 高性能遍历缓存 | ✅ 完全实现 | `buildGroupsMap` 单次扫描同时聚合 `groups` 与每主机 `group_names`；在 `add_host`、`group_by` 时基于 `groupsDirty` 标记精准失效 |
 | **Ansible Vault 规范** | **AES256 PBKDF2 HMAC-SHA256 CTR 解密** | ✅ **完全实现** | **自主实现兼容 Ansible Vault 1.1/1.2 标准的解密器** |
 | 行内加密值解密 | `!vault | ...` 语法 | ✅ 完全实现 | 支持在 YAML 变量中解密内嵌的 `!vault` 字符串值，多密钥自动匹配 |
 | **多 Vault-ID 与凭据源** | **`--vault-id label@source` 与外部客户端脚本** | ✅ **完全实现** | **支持指定多个 `--vault-id`，支持 `label@prompt`、普通密码文件及具有可执行权限的外部密码生成客户端脚本（自动传入 `--vault-id` 并捕获 stdout）** |
@@ -143,14 +145,14 @@
 | 模板模块渲染 | `template: src=.. dest=..` | ✅ 完全实现 | 自动对比远端文件校验和，无变更时幂等跳过；支持 Check/Diff 模式 |
 | Jinja2 语法预处理 | `{{ var }}`, `{% for %}`, `{% if %}`, `{# #}` | ✅ 完全实现 | 预处理转换为 Go Template 驱动执行 |
 | 常用过滤器链式调用 | `{{ val \| trim \| upper }}` | ✅ 完全实现 | 支持自定义管道分隔解析器 |
-| 38 个内置核心过滤器 | 文本、集合、路径、编解码、哈希、网络、三元等 | ✅ 完全实现 | 内置 `combine`, `regex_replace`, `regex_search`, `regex_findall`, `selectattr`, `rejectattr`, `map`, `ipaddr`, `flatten`, `unique`, `difference`, `intersect`, `union`, `min`, `max`, `sum`, `bool`, `int`, `float`, `abs`, `hash`, `ternary` 及基础过滤器 |
+| 38 个内置核心过滤器 | 文本、集合、路径、编解码、哈希、网络、三元等 | ✅ 完全实现 | 内置 `combine`, `regex_replace`, `regex_search`, `regex_findall`, `selectattr`, `rejectattr`, `map`, `ipaddr`, `flatten`, `unique`, `difference`, `intersect`, `union`, `min`, `max`, `sum`, `bool`, `int`, `float`, `abs`, `hash`, `ternary` 及基础过滤器，配备全局 `sync.Map` 正则编译缓存池 |
 | **行内三元表达式解析** | **`{{ true_val if condition else false_val }}`** | ✅ **完全实现** | **支持右结合链式嵌套、括号优先级、与管道过滤器结合；在 Playbook 参数、`when` 条件及 `.j2` 模板中全场景通用** |
 | **`default` 布尔回退强化** | **`default(fallback, boolean=true)`** | ✅ **完全实现** | **对齐 Ansible 规范：默认 `boolean=false` 保留已定义的空串/false/0；显式 `boolean=true` 时自动对空值/假值/空字典/空列表触发回退；支持字面量反序列化与管道链式调用 (`default({}) \| to_json`)** |
 | **`ternary` 官方三元过滤器** | **`{{ condition \| ternary(true_val, false_val, [none_val]) }}`** | ✅ **完全实现** | **支持两参及三参（未定义/nil 回退）三元运算，支持严格真值判定** |
-| Lookup 插件函数 | `lookup('env'/'file'/'pipe'/'template', ...)` | ✅ 完全实现 | 支持在任务参数及表达式中即时查询系统环境、外部文件或管道命令输出 |
+| Lookup 插件函数 | `lookup('env'/'file'/'pipe'/'template'/'password'/'first_found'/'url', ...)` | ✅ 完全实现 | 统一底层 `ExecuteLookup` 引擎，支持在任务参数、过滤管道链（`{{ lookup(...) \| upper }}`）及 Jinja2 `.j2` 模板渲染（`templateFuncMap`）中全场景通用调用，支持 `baseDir` 相对路径解析 |
 | 复杂 Jinja2 特性 | Python 对象方法、宏定义 (`{% macro %}`) | ❌ 暂不支持 | 因未内置 Python 解释器，目前仅支持转换常见语法结构 |
 
-### 2.9 内置模块实现矩阵 (33 Built-in + 7 Meta)
+### 2.9 内置模块实现矩阵 (42 Built-in + 8 Meta)
 
 `go-ansible` 摒弃了官方将 Python 脚本打包上传到目标机（Ansiballz）的重型机制，采用**目标机零依赖模式（Agentless & Pythonless）**，通过 SSH 远端管道命令与 SFTP 协议原生实现模块。
 
@@ -160,35 +162,44 @@
 | | `shell` | 远程 `/bin/sh -c` 执行，支持管道、环境变量及转义 | - | - |
 | | `ping` | SSH 通道就绪测试，返回 `pong` | ✅ | - |
 | | `setup` | 探测目标机 CPU、内存、OS 版本并注入 Facts 字典 | ✅ | - |
-| **文件管理** | `copy` | SFTP 上传、内容直接生成、权限属主设置、备份已有文件 | ✅ | ✅ |
+| **文件管理** | `copy` | SFTP 上传、内容直接生成、目录递归拷贝、权限属主设置、备份已有文件 | ✅ | ✅ |
 | | `file` | 创建目录、软链接、硬链接、删除文件、修改属主与 Mode | ✅ | ✅ |
 | | `template` | Jinja2 语法渲染 + 本地临时文件暂存 + SFTP 分发与权限校正 | ✅ | ✅ |
 | | `stat` | 采集远程文件存在性、大小、MD5/SHA256、权限与类型信息 | ✅ | - |
 | | `slurp` | 提取远程小文件内容并以 Base64 返回 | ✅ | - |
-| | `fetch` | 从远程主机下载文件到本地控制机 | ✅ | - |
-| | `lineinfile` | 匹配正则行替换/插入，支持 BOF/EOF、编码及 CRLF/LF 换行 | ✅ | ✅ |
-| | `replace` | 正则全局替换与匹配计数统计，支持备份与行尾格式保持 | ✅ | ✅ |
+| | `fetch` | 从远程主机下载文件到本地控制机（多主机目录隔离、flat 模式与哈希幂等） | ✅ | - |
+| | `lineinfile` | 匹配正则行替换/插入，支持 BOF/EOF、编码、validate 语法校验及 CRLF/LF 换行 | ✅ | ✅ |
+| | `replace` | 正则全局替换与匹配计数统计，支持备份、validate 语法校验与行尾格式保持 | ✅ | ✅ |
+| | `blockinfile`| 声明式代码块原子插入与替换，支持 `# BEGIN/END ANSIBLE MANAGED BLOCK` 标记、BOF/EOF/正则定位、备份、validate 校验、Check/Diff 模式 | ✅ | ✅ |
 | | `find` | 远程目录按深度、通配模式、内容正规表达式搜索文件列表 | ✅ | - |
 | | `archive` | 远端打包文件或目录为 `tar.gz`, `tar.bz2`, `zip` 等 | ✅ | - |
 | | `unarchive` | 远端解压压缩包，支持 `remote_src` 或控制机本地解包上传 | ✅ | - |
 | | `get_url` | 远端直接通过 `curl` / `wget` 下载指定 URL 文件并校验校验和 | ✅ | - |
+| | `synchronize` | 基于 rsync 的极速增量文件与目录同步，支持 archive/compress/delete/checksum、existing_only (--existing)、partial (--partial)、SSH extra args 隧道自动映射与 Diff/Check 模式 | ✅ | ✅ |
+| | `tempfile` | 远端受限权限 (0600/0700) 临时文件与目录原子安全创建 | ✅ | - |
 | **包与服务** | `apt` | Debian/Ubuntu `apt-get` 封装：present, absent, latest, update_cache | ✅ | - |
 | | `yum` | RHEL/CentOS `yum` 封装：present, absent, latest, update_cache | ✅ | - |
+| | `dnf` | RHEL 8+/Fedora/CentOS Stream 原生 `dnf` 封装 | ✅ | - |
 | | `service` | 传统 `service` 命令或 Systemd 兼容适配服务起停重载 | ✅ | - |
 | | `systemd` | 原生 `systemctl` 状态管理、开机自启、daemon-reload 与 mask 支持 | ✅ | - |
+| | `pip` | 目标节点 Python pip 包声明式安装、卸载、升级与虚拟环境 (virtualenv) 自动创建，支持 editable (-e)、virtualenv_site_packages (--system-site-packages) 与 umask | ✅ | - |
+| | `service_facts`| 探测并结构化提取 Systemd / SysV / launchd 服务状态并自动注入 `ansible_facts.services` 事实快照 | ✅ | - |
+| | `package_facts`| 探测并提取 dpkg / rpm / apk / pacman / brew 软件包列表并自动注入 `ansible_facts.packages` 事实字典 | ✅ | - |
 | **系统与设施** | `user` | 远程 `useradd` / `usermod` / `userdel`，支持 UID、Shell、组分配 | ✅ | - |
 | | `group` | 远程 `groupadd` / `groupmod` / `groupdel`，支持 GID 设置 | ✅ | - |
 | | `cron` | 远程 Crontab 任务条目维护，精准识别注释标识 | ✅ | - |
 | | `sysctl` | 远程 `/etc/sysctl.conf` 声明式维护与 `sysctl -p`/`-w` 运行时调优 | ✅ | ✅ |
 | | `hostname` | 远程 `hostnamectl` 与 `/etc/hostname` / `hostname` 主机名声明式维护 | ✅ | ✅ |
 | | `mount` | 远程 `/etc/fstab` 挂载条目维护与挂载/卸载/重挂载状态控制 (`mounted`, `unmounted`, `present`, `absent`, `remounted`) | ✅ | ✅ |
+| | `authorized_key` | 远程 SSH 公钥分发与维护，支持 URL 拉取、exclusive 独占清理、Check/Diff 模式与幂等去重 | ✅ | ✅ |
+| | `known_hosts` | 远程 SSH known_hosts 声明式维护，支持 hash_host 哈希防嗅探、多端口 [host]:port 格式、Check/Diff 模式与幂等更新 | ✅ | ✅ |
 | **编排网络** | `wait_for` | 端口联通性探测、路径存在性、超时等待与文件正则匹配（Base64 安全无歧义脚本通道与精准 Failed/Unreachable 状态边界） | ✅ | - |
 | | `git` | 远程仓库 Clone、Fetch、Checkout 特定分支/Tag/Commit | ✅ | - |
 | | `uri` | 原生 HTTP/REST API 请求（支持 GET/POST/PUT/DELETE 及状态码校验）| ✅ | - |
 | | `docker_container`| 原生 Docker CLI 状态控制，支持 Run、Stop、Restart、端口映射等 | ✅ | - |
 | | `k8s` | 通过本地/远程 `kubectl` 执行 manifest YAML 应用与清理 | ✅ | - |
 | | `async_status` | 异步后台任务状态查询与结果采集，支持 `cleanup` 清理临时凭证 | ✅ | - |
-| | `reboot` | 远程声明式重启并自愈探测（boot_id 验证、轮询恢复上线、Facts 自动失效） | ✅ | - |
+| | `reboot` | 远程声明式重启并自愈探测（msg 广播、connect_timeout 动态下发、boot_id 验证、轮询恢复上线、Facts 自动失效） | ✅ | - |
 | | `wait_for_connection` | 专用等待远程主机网络与连接通道就绪（延迟、轮询与超时控制） | ✅ | - |
 | **核心/元模块** | `debug` | 打印消息 (`msg`) 或变量 (`var`) 内容 | ✅ | - |
 | | `fail` / `assert`| 自定义错误抛出与断言判断 | ✅ | - |
@@ -329,7 +340,8 @@
 - [x] **交付独立可执行程序 `cmd/ansible-galaxy`**:
   - 支持 `ansible-galaxy init <role_name>` 与 `ansible-galaxy role init <role_name>`；
   - 支持 `--init-path <dir>` 指定角色创建目录及 `-f / --force` 覆盖模式；
-  - 自动脚手架生成规范标准的 Ansible 角色目录结构（`defaults`, `files`, `handlers`, `meta`, `tasks`, `templates`, `tests`, `vars`, `README.md`）。
+  - 自动脚手架生成规范标准的 Ansible 角色目录结构（`defaults`, `files`, `handlers`, `meta`, `tasks`, `templates`, `tests`, `vars`, `README.md`）；
+  - 支持 `ansible-galaxy install` 与 `ansible-galaxy role install`：支持直接安装 Git 仓库、GitHub 简写 (`owner.role` / `owner/repo`)、本地目录角色；支持 `-r / --role-file` 解析标准 `requirements.yml`（兼容列表与字典结构）、`-p / --roles-path` 自定义目录、`-f / --force` 覆盖与 `--ignore-errors` 容错。
 - [x] **交付独立可执行程序 `cmd/ansible-pull`**:
   - 支持纯 Pull 模式反向配置管理：节点无需被中心机 SSH 连接，支持节点通过 Git 自更新；
   - 支持 `-U / --url` 远端仓库、`-C / --checkout` 分支/版本、`-d / --directory` 目标路径、`-s / --sleep` 防羊群效应随机休眠、`-o / --only-if-changed` 变更感知执行、`--purge` 跑完清理及自动检索 `<hostname>.yml`/`local.yml`。
@@ -497,4 +509,52 @@
   - `ansible_date_time` 采集为包含 `epoch`, `iso8601`, `year`, `month`, `day`, `time`, `date` 的标准字典；
   - `ansible_os_family` 优化为探测 `/etc/os-release` 并规范化映射至 `RedHat`、`Debian`、`Alpine`、`Archlinux`、`Darwin`；
   - `parseFacts` 全面支持 YAML/JSON 嵌套字典反序列化，支持 `{{ ansible_date_time.epoch }}` 变量访问。
+
+### Phase 19: 运维核心高频能力补强与基础设施无缝纳管 (P0 - 关键缺漏收敛)
+- [x] **`group_vars/` 与 `host_vars/` 子目录变量解析修复**:
+  - 根除 `filepath.Base` 误将 `group_vars/webservers/main.yml` 识别为主机名 `"main"` 的 Bug，支持多层级子目录多变量文件自动合并至目标组/主机。
+- [x] **`no_log: true` 敏感输出脱敏体系**:
+  - 在 Task 级支持 `no_log: true`，对任务 stdout、message、item 进行 `[VALUE_SPECIFIED_IN_NO_LOG_TASK]` 脱敏遮罩，清空 stderr 与 diff，回调输出自动标记 `censored`，彻底杜绝凭证泄露。
+- [x] **`setup` 核心网络事实与环境事实采集补全**:
+  - 自动跨平台（Linux 与 macOS）采集 `ansible_default_ipv4`（`address`, `interface`, `gateway`）、`ansible_all_ipv4_addresses`、`ansible_env` 环境变量字典、`ansible_user_id` 与 `ansible_user_dir`。
+- [x] **原生实现 `authorized_key` 基础设施模块**:
+  - 支持 `user`、`key`（多公钥/URL 远程拉取）、`state=present/absent`、`exclusive` 独占清理、`key_options`、`comment`、`manage_dir`（0700/0600 严格权限）、Check Mode 与 Diff Mode。
+- [x] **原生实现 `pip` Python 生态包管理模块**:
+  - 支持 `name`、`version`、`requirements`、`virtualenv` 自动探测与创建、`virtualenv_command`、`state=present/absent/latest/forcereinstall`、`extra_args`、`chdir` 及 Check Mode 幂等预判。
+- [x] **原生实现 `synchronize` (rsync) 高效目录文件同步模块**:
+  - 封装本地与远端 `rsync` 协议传输，支持 `src`、`dest`、`archive`（`-a`）、`delete`（`--delete`）、`checksum`（`-c`）、`compress`（`-z`）、`dest_port`、`mode=push/pull`、`rsync_opts`、`rsync_path`，自动透传 SSH 密钥与端口，支持 Check Mode（`--dry-run`）与 Diff Mode。
+- [x] **Handlers 链式级联触发 (Handlers Notifying Handlers)**:
+  - 在 Handler 执行结果发生变更 (`changed: true`) 且声明了 `notify:` 时，自动级联触发下游 Handlers 队列，支持多轮级联与幂等去重。
+- [x] **Jinja2 高频过滤器补全**:
+  - 新增 `items2dict`（支持自定义 `key_name` / `value_name`）、`to_yaml` / `to_nice_yaml` 以及 `from_yaml` 双向转换过滤器。
+- [x] **终端 ANSI 色彩控制与标准规范适配**:
+  - 严格遵循 `https://no-color.org` 规范：`NO_COLOR` 非空或 `ANSIBLE_NOCOLOR=1` 时关闭色彩输出；`ANSIBLE_FORCE_COLOR=1` 时强制启用；非 TTY 管道/重定向时自动剥离 ANSI 颜色代码。
+- [x] **`delegate_facts` 语义与委派事实归属修复**:
+  - 在 Task 声明与解析层增加 `delegate_facts: true/false`；严格遵循 Ansible 规范：默认 (`delegate_facts: false`) 下 `set_fact` 与 `register` 归属于发起主机 `inventory_hostname`，仅在显式声明 `delegate_facts: true` 时才将事实与注册变量写入被委派主机。
+- [x] **SSH 连接层输出净化与长连接透明自愈**:
+  - 彻底清除 `client.go` 中硬编码的 `fmt.Printf("[SSH] ...")` 调试输出，恢复洁净标准输出；
+  - 在 `c.client.NewSession()` 与 `sftp.NewClient()` 探测到对端因空闲超时断开时，自动重置连接并透明自愈重连重试，根除长任务执行后的 `broken pipe` 级联失败。
+- [x] **架构与性能细节优化**:
+  - 提取公共 `BuildBecomeCommand` 函数，消除 SSH 连接与 Local 连接中 40 行 100% 重复的 become 组装代码；
+  - 为 `resolveString` 增加 `!strings.Contains(s, "{{")` 极速短路优化，纯静态文本零内存分配、O(1) 立即返回；
+  - 废除 `executeLocalModule` 中对 `shell/command` 的粗暴字段切分，统一收敛至标准 `LocalConnection` 驱动。
+
+### Phase 20: 核心模块 Check Mode 安全闭环与编排语义深度对齐 (P0 - 生产级安全防护)
+- [x] **9 大高频内置模块 Check Mode 模拟实现与穿透防御**:
+  - `apt` / `yum` / `package`: 在 check mode 下自动切换至包存在性探测（`dpkg -s` / `rpm -q`），仅计算预期变更，严禁下发破坏性包安装或移除命令；
+  - `service` / `systemd`: 在 check mode 下仅探测运行状态（`systemctl is-active` / `service status`）与自启状态（`is-enabled` / `masked`），精准预演 changed 状态，杜绝真实启停服务；
+  - `user` / `group`: 在 check mode 下探测目标系统用户及属性（`id` / `getent`），仅汇报差异，严禁下发用户增删改命令；
+  - `get_url`: 在 check mode 下比对目标文件存在性与哈希匹配，仅预判变更，杜绝产生文件下载与覆盖 I/O；
+  - `archive` / `unarchive`: Check Mode 下基于目标路径及 `creates` 预期状态预演，杜绝解包或压缩写入。
+- [x] **Task & Play 级 `check_mode` 与 `diff` 声明支持**:
+  - 支持在 Play 及 Task 级别声明 `check_mode: yes/no` 与 `diff: yes/no`；
+  - 支持任务级精准覆盖全局 CLI `-C` / `-D` 开关（例如：全局 `-C` 下允许设置 `check_mode: false` 的只读前置任务真实运行，为后续步骤提供必要动态凭据）；支持在 Block 嵌套层级递归继承。
+- [x] **`failed_when` 与 `ignore_errors: true` 协同语义修复**:
+  - 修复此前 `failed_when` 触发判定时直接标记 `result.Failed` 导致忽略错误语义失效的缺陷，严格遵循 Ansible 规范：满足 `failed_when` 且声明 `ignore_errors: true` 时标记 `Ignored = true`，确保主机不被误移出执行批次。
+- [x] **`cron` 模块幂等性、跨平台语法与 `disabled` 支持**:
+  - 彻底废除 GNU 专有 `sed` 语法，采用纯 Go 内存解析与 Base64 原子管道回填，无缝兼容 macOS、BSD、Alpine 与 Linux；
+  - 实现相同定时任务与指令的严格幂等比对，消除无意义的 `changed` 误报；
+  - 支持 `disabled: true/false` 声明式控制定时任务注释禁用与恢复。
+
+
 

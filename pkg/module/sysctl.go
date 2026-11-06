@@ -57,8 +57,8 @@ func (m *SysctlModule) Execute(client ssh.Connection, params map[string]interfac
 	sysctlSet := GetParamBool(params, "sysctl_set", false)
 	ignoreErrors := GetParamBool(params, "ignoreerrors", false)
 
-	checkMode := GetParamBool(params, "_ansible_check_mode", false)
-	diffMode := GetParamBool(params, "_ansible_diff", false)
+	checkMode := IsCheckMode(params)
+	diffMode := IsDiffMode(params)
 
 	targetVal, _ := getSysctlValue(params)
 	targetVal = strings.TrimSpace(targetVal)
@@ -115,18 +115,32 @@ func (m *SysctlModule) Execute(client ssh.Connection, params map[string]interfac
 			fileChanged = true
 		}
 	} else if state == "absent" {
-		if foundLineIdx != -1 {
-			// 删除匹配行
-			lines = append(lines[:foundLineIdx], lines[foundLineIdx+1:]...)
-			afterContent = strings.Join(lines, "\n")
-			fileChanged = true
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+				newLines = append(newLines, line)
+				continue
+			}
+			eqIdx := strings.IndexAny(trimmed, "=:")
+			if eqIdx != -1 {
+				k := strings.TrimSpace(trimmed[:eqIdx])
+				if k == name {
+					fileChanged = true
+					continue
+				}
+			}
+			newLines = append(newLines, line)
+		}
+		if fileChanged {
+			afterContent = strings.Join(newLines, "\n")
 		}
 	}
 
 	// 3. 判断运行时是否需要同步变更
 	runtimeChanged := false
 	if state == "present" {
-		if normalizeSysctlValue(currentRuntime) != normalizeSysctlValue(targetVal) || sysctlSet {
+		if normalizeSysctlValue(currentRuntime) != normalizeSysctlValue(targetVal) {
 			runtimeChanged = true
 		}
 	}
@@ -167,7 +181,30 @@ func (m *SysctlModule) Execute(client ssh.Connection, params map[string]interfac
 		}, nil
 	}
 
-	// 4. 写入文件变更
+	// 4. sysctl_set 预检：在写入 sysctlFile 之前先调用 sysctl -w 校验与应用，防止非法配置破坏文件
+	sysctlPreSetDone := false
+	if state == "present" && sysctlSet {
+		setCmd := fmt.Sprintf("sysctl -w %s=%s", name, shellQuote(targetVal))
+		if ignoreErrors {
+			setCmd += " 2>/dev/null || true"
+		}
+		setRes, err := client.Execute(setCmd)
+		if err != nil || (setRes != nil && setRes.ExitCode != 0 && !ignoreErrors) {
+			errMsg := ""
+			if setRes != nil {
+				errMsg = setRes.Stderr
+			}
+			return &Result{
+				Failed:   true,
+				ExitCode: 1,
+				Message:  fmt.Sprintf("failed to pre-set sysctl runtime: %s", errMsg),
+			}, fmt.Errorf("pre-set sysctl runtime: %v %s", err, errMsg)
+		}
+		sysctlPreSetDone = true
+		runtimeChanged = false
+	}
+
+	// 5. 写入文件变更
 	if fileChanged {
 		writeCmd := buildContentWriteCommand(sysctlFile, afterContent)
 		if writeCmd != "" {
@@ -185,28 +222,28 @@ func (m *SysctlModule) Execute(client ssh.Connection, params map[string]interfac
 		}
 	}
 
-	// 5. 应用/重载内核运行时参数
-	if state == "present" {
-		if reload {
-			reloadCmd := fmt.Sprintf("sysctl -p %s", shellQuote(sysctlFile))
-			if ignoreErrors {
-				reloadCmd += " 2>/dev/null || true"
-			}
-			reloadRes, err := client.Execute(reloadCmd)
-			if err != nil || (reloadRes != nil && reloadRes.ExitCode != 0 && !ignoreErrors) {
-				errMsg := ""
-				if reloadRes != nil {
-					errMsg = reloadRes.Stderr
-				}
-				return &Result{
-					Failed:   true,
-					ExitCode: 1,
-					Message:  fmt.Sprintf("failed to reload sysctl: %s", errMsg),
-				}, fmt.Errorf("reload sysctl: %v %s", err, errMsg)
-			}
+	// 6. 应用/重载内核运行时参数
+	if (fileChanged || state == "present") && reload {
+		reloadCmd := fmt.Sprintf("sysctl -p %s", shellQuote(sysctlFile))
+		if ignoreErrors {
+			reloadCmd += " 2>/dev/null || true"
 		}
+		reloadRes, err := client.Execute(reloadCmd)
+		if err != nil || (reloadRes != nil && reloadRes.ExitCode != 0 && !ignoreErrors) {
+			errMsg := ""
+			if reloadRes != nil {
+				errMsg = reloadRes.Stderr
+			}
+			return &Result{
+				Failed:   true,
+				ExitCode: 1,
+				Message:  fmt.Sprintf("failed to reload sysctl: %s", errMsg),
+			}, fmt.Errorf("reload sysctl: %v %s", err, errMsg)
+		}
+	}
 
-		if sysctlSet || runtimeChanged {
+	if state == "present" {
+		if (!sysctlPreSetDone && sysctlSet) || runtimeChanged {
 			setCmd := fmt.Sprintf("sysctl -w %s=%s", name, shellQuote(targetVal))
 			if ignoreErrors {
 				setCmd += " 2>/dev/null || true"

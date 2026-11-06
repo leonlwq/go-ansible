@@ -45,6 +45,9 @@ func ParseSources(sources ...string) (*Inventory, error) {
 		// 检查路径是否存在
 		info, err := os.Stat(src)
 		if err == nil {
+			if result.FilePath == "" {
+				result.FilePath = src
+			}
 			if info.IsDir() {
 				dirInv, err := ParseDirectory(src)
 				if err != nil {
@@ -191,15 +194,22 @@ func ParseInlineHosts(raw string) (*Inventory, error) {
 		if token == "" {
 			continue
 		}
-		host := &Host{
-			Name:      token,
-			Address:   token,
-			Port:      22,
-			Variables: make(map[string]string),
+		hostExpr, port, err := parseHostAndPort(token)
+		if err != nil {
+			return nil, fmt.Errorf("parse inline host %q: %w", token, err)
 		}
-		inv.AllHosts[token] = host
-		allGroup.Hosts = append(allGroup.Hosts, host)
-		ungrouped.Hosts = append(ungrouped.Hosts, host)
+		names := expandHostRangePattern(hostExpr)
+		for _, name := range names {
+			host := &Host{
+				Name:      name,
+				Address:   name,
+				Port:      port,
+				Variables: make(map[string]string),
+			}
+			inv.AllHosts[name] = host
+			allGroup.Hosts = append(allGroup.Hosts, host)
+			ungrouped.Hosts = append(ungrouped.Hosts, host)
+		}
 	}
 
 	if len(inv.AllHosts) == 0 {
@@ -250,6 +260,8 @@ func parseSingleFile(filepath string) (*Inventory, error) {
 		return nil, err
 	}
 
+	inv.FilePath = filepath
+
 	// 应用组变量到主机
 	inv.ApplyGroupVars()
 
@@ -263,7 +275,7 @@ func ParseDynamicFile(path string) (*Inventory, error) {
 		return nil, fmt.Errorf("run dynamic inventory --list: %w", err)
 	}
 
-	return parseJSONInventory(listData, func(hostName string) (map[string]interface{}, error) {
+	inv, err := parseJSONInventory(listData, func(hostName string) (map[string]interface{}, error) {
 		hostData, hostErr := exec.Command(path, "--host", hostName).Output()
 		if hostErr != nil {
 			return nil, hostErr
@@ -275,6 +287,10 @@ func ParseDynamicFile(path string) (*Inventory, error) {
 		}
 		return vars, nil
 	})
+	if err == nil && inv != nil {
+		inv.FilePath = path
+	}
+	return inv, err
 }
 
 // isYAMLFormat 检测是否为 YAML 格式
@@ -293,6 +309,12 @@ func isYAMLFormat(content string) bool {
 	return false
 }
 
+var (
+	iniGroupPattern    = regexp.MustCompile(`^\[([^:]+)\]`)
+	iniChildrenPattern = regexp.MustCompile(`^\[([^:]+):children\]`)
+	iniVarsPattern     = regexp.MustCompile(`^\[([^:]+):vars\]`)
+)
+
 // ParseINI 解析 INI 格式的 inventory
 func ParseINI(data []byte) (*Inventory, error) {
 	inv := NewInventory()
@@ -300,9 +322,7 @@ func ParseINI(data []byte) (*Inventory, error) {
 
 	var currentGroup *Group
 	var inVarsSection bool
-	groupPattern := regexp.MustCompile(`^\[([^:]+)\]`)
-	childrenPattern := regexp.MustCompile(`^\[([^:]+):children\]`)
-	varsPattern := regexp.MustCompile(`^\[([^:]+):vars\]`)
+	var inChildrenSection bool
 
 	lineNum := 0
 	for scanner.Scan() {
@@ -317,52 +337,48 @@ func ParseINI(data []byte) (*Inventory, error) {
 		// 检查是否是分组定义
 		if strings.HasPrefix(line, "[") {
 			inVarsSection = false
+			inChildrenSection = false
 
-			if matches := childrenPattern.FindStringSubmatch(line); matches != nil {
+			if matches := iniChildrenPattern.FindStringSubmatch(line); matches != nil {
 				groupName := matches[1]
-				if inv.Groups[groupName] == nil {
-					inv.Groups[groupName] = &Group{
-						Name:      groupName,
-						Hosts:     make([]*Host, 0),
-						Children:  make([]*Group, 0),
-						Variables: make(map[string]string),
-					}
+				currentGroup = ensureInventoryGroup(inv, groupName)
+				if currentGroup.Children == nil {
+					currentGroup.Children = make([]*Group, 0)
 				}
-				currentGroup = inv.Groups[groupName]
-				currentGroup.Children = make([]*Group, 0)
+				inChildrenSection = true
 				continue
 			}
 
-			if matches := varsPattern.FindStringSubmatch(line); matches != nil {
+			if matches := iniVarsPattern.FindStringSubmatch(line); matches != nil {
 				groupName := matches[1]
-				if inv.Groups[groupName] == nil {
-					inv.Groups[groupName] = &Group{
-						Name:      groupName,
-						Hosts:     make([]*Host, 0),
-						Children:  make([]*Group, 0),
-						Variables: make(map[string]string),
-					}
-				}
-				currentGroup = inv.Groups[groupName]
+				currentGroup = ensureInventoryGroup(inv, groupName)
 				inVarsSection = true
 				continue
 			}
 
-			if matches := groupPattern.FindStringSubmatch(line); matches != nil {
+			if matches := iniGroupPattern.FindStringSubmatch(line); matches != nil {
 				groupName := matches[1]
-				if inv.Groups[groupName] == nil {
-					inv.Groups[groupName] = &Group{
-						Name:      groupName,
-						Hosts:     make([]*Host, 0),
-						Children:  make([]*Group, 0),
-						Variables: make(map[string]string),
-					}
-				}
-				currentGroup = inv.Groups[groupName]
+				currentGroup = ensureInventoryGroup(inv, groupName)
 				continue
 			}
 
-			return nil, fmt.Errorf("invalid group definition at line %d: %s", lineNum, line)
+			// 如果当前处于某组内且为 IPv6 主机语法（如 [2001:db8::1]:2222），放行至下方主机解析
+			if currentGroup != nil && (strings.Contains(line, "]:") || strings.Contains(line, "::")) {
+				// 作为主机行继续处理
+			} else {
+				return nil, fmt.Errorf("invalid group definition at line %d: %s", lineNum, line)
+			}
+		}
+
+		// 在子组定义部分
+		if inChildrenSection && currentGroup != nil {
+			childName := strings.TrimSpace(line)
+			if childName != "" {
+				childGroup := ensureInventoryGroup(inv, childName)
+				childGroup.Parent = currentGroup
+				currentGroup.Children = appendUniqueGroup(currentGroup.Children, childGroup)
+			}
+			continue
 		}
 
 		// 在变量部分
@@ -377,24 +393,24 @@ func ParseINI(data []byte) (*Inventory, error) {
 		}
 
 		// 解析主机行
-		if currentGroup != nil {
-			// 检查是否是子组
-			if childGroup, exists := inv.Groups[line]; exists && currentGroup.Children != nil {
-				childGroup.Parent = currentGroup
-				currentGroup.Children = append(currentGroup.Children, childGroup)
-				continue
-			}
+		targetGroup := currentGroup
+		if targetGroup == nil {
+			targetGroup = ensureInventoryGroup(inv, "ungrouped")
+		}
 
-			// 解析主机
-			host, err := parseHostLine(line)
-			if err != nil {
-				return nil, fmt.Errorf("parse host at line %d: %w", lineNum, err)
-			}
+		// 解析主机（支持 [01:10] 等范围展开）
+		hosts, err := parseHostLines(line)
+		if err != nil {
+			return nil, fmt.Errorf("parse host at line %d: %w", lineNum, err)
+		}
 
+		allGroup := ensureInventoryGroup(inv, "all")
+		for _, host := range hosts {
 			if _, exists := inv.AllHosts[host.Name]; !exists {
 				inv.AllHosts[host.Name] = host
 			}
-			currentGroup.Hosts = append(currentGroup.Hosts, inv.AllHosts[host.Name])
+			targetGroup.Hosts = append(targetGroup.Hosts, inv.AllHosts[host.Name])
+			allGroup.Hosts = append(allGroup.Hosts, inv.AllHosts[host.Name])
 		}
 	}
 
@@ -405,11 +421,23 @@ func ParseINI(data []byte) (*Inventory, error) {
 	return inv, nil
 }
 
-// parseHostLine 解析主机行，支持格式：
+// parseHostLine 解析单主机行（向后兼容，返回展开后的首个主机）
+func parseHostLine(line string) (*Host, error) {
+	hosts, err := parseHostLines(line)
+	if err != nil {
+		return nil, err
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("empty host line")
+	}
+	return hosts[0], nil
+}
+
+// parseHostLines 解析主机行，支持格式：
 // hostname
 // hostname:port
-// hostname ansible_host=192.168.1.1 ansible_user=root ansible_port=22
-func parseHostLine(line string) (*Host, error) {
+// hostname[01:10] ansible_host=192.168.1.1 ansible_user=root ansible_port=22
+func parseHostLines(line string) ([]*Host, error) {
 	parts, err := util.SplitArgs(line)
 	if err != nil {
 		return nil, fmt.Errorf("split host line: %w", err)
@@ -418,71 +446,179 @@ func parseHostLine(line string) (*Host, error) {
 		return nil, fmt.Errorf("empty host line")
 	}
 
-	host := &Host{
-		Name:      parts[0],
-		Port:      22, // 默认端口
-		Variables: make(map[string]string),
+	hostExpr, port, err := parseHostAndPort(parts[0])
+	if err != nil {
+		return nil, err
 	}
 
-	// 如果是 hostname:port 格式
-	if strings.Contains(host.Name, ":") {
-		hp := strings.Split(host.Name, ":")
-		host.Name = hp[0]
-		port, err := strconv.Atoi(hp[1])
-		if err != nil {
-			return nil, fmt.Errorf("invalid port: %s", hp[1])
-		}
-		host.Port = port
-	}
-
-	// 解析其他变量
+	// 预解析变量
+	vars := make(map[string]string)
 	for _, part := range parts[1:] {
 		kv := strings.SplitN(part, "=", 2)
 		if len(kv) == 2 {
-			key := kv[0]
-			value := kv[1]
-			switch key {
-			case "ansible_host", "ansible_ssh_host":
-				host.Address = value
-			case "ansible_user", "ansible_ssh_user":
-				host.User = value
-			case "ansible_port", "ansible_ssh_port":
-				port, err := strconv.Atoi(value)
-				if err != nil {
-					return nil, fmt.Errorf("invalid port: %s", value)
-				}
-				host.Port = port
-			case "ansible_ssh_pass":
-				host.Password = value
-			case "ansible_private_key_file", "ansible_ssh_private_key_file":
-				host.PrivateKey = expandHome(value)
-			case "ansible_ssh_common_args":
-				host.SSHCommonArgs = value
-			case "ansible_connection":
-				host.Connection = value
-			case "ansible_become":
-				host.Become = value == "yes" || value == "true" || value == "1"
-			case "ansible_become_user":
-				host.BecomeUser = value
-			case "ansible_become_method":
-				host.BecomeMethod = value
-			case "ansible_become_pass", "ansible_become_password":
-				host.BecomePass = value
-			case "ansible_become_exe":
-				host.BecomeExe = value
-			case "ansible_become_flags":
-				host.BecomeFlags = value
-			default:
-				host.Variables[key] = value
-			}
+			vars[kv[0]] = kv[1]
 		}
 	}
 
-	if host.Address == "" {
-		host.Address = host.Name
+	expandedNames := expandHostRangePattern(hostExpr)
+	hosts := make([]*Host, 0, len(expandedNames))
+	for _, name := range expandedNames {
+		h := &Host{
+			Name:      name,
+			Port:      port,
+			Variables: make(map[string]string, len(vars)),
+		}
+		for k, v := range vars {
+			applyHostVariable(h, k, v)
+		}
+		if h.Address == "" {
+			h.Address = h.Name
+		}
+		hosts = append(hosts, h)
 	}
 
-	return host, nil
+	return hosts, nil
+}
+
+// parseHostAndPort 解析主机与端口，感知 [start:end] 范围与 IPv6 [::1] 括号语法
+func parseHostAndPort(raw string) (string, int, error) {
+	raw = strings.TrimSpace(raw)
+	lastColon := strings.LastIndex(raw, ":")
+	lastBracket := strings.LastIndex(raw, "]")
+
+	port := 22
+	hostExpr := raw
+
+	if lastColon != -1 && lastColon > lastBracket {
+		// 若包含多个冒号且没有结尾括号，则属于裸写 IPv6 地址，无端口
+		if strings.Count(raw, ":") >= 2 && lastBracket == -1 {
+			return raw, 22, nil
+		}
+		portStr := raw[lastColon+1:]
+		p, err := strconv.Atoi(portStr)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid port: %s", portStr)
+		}
+		port = p
+		hostExpr = raw[:lastColon]
+	}
+
+	// 若主机名为括号包裹的 IPv6 地址，去除外层括号
+	if strings.HasPrefix(hostExpr, "[") && strings.HasSuffix(hostExpr, "]") && strings.Count(hostExpr, ":") >= 2 {
+		hostExpr = hostExpr[1 : len(hostExpr)-1]
+	}
+
+	return hostExpr, port, nil
+}
+
+// expandHostRangePattern 展开 Ansible 主机范围表达式，如 "web[01:10].example.com", "db[1:10:2]", "node[a:c]"
+func expandHostRangePattern(pattern string) []string {
+	startBracket := strings.Index(pattern, "[")
+	if startBracket == -1 {
+		return []string{pattern}
+	}
+	endBracket := strings.Index(pattern[startBracket:], "]")
+	if endBracket == -1 {
+		return []string{pattern}
+	}
+	endBracket += startBracket
+
+	rangeContent := pattern[startBracket+1 : endBracket]
+	parts := strings.Split(rangeContent, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return []string{pattern}
+	}
+
+	startStr := strings.TrimSpace(parts[0])
+	endStr := strings.TrimSpace(parts[1])
+	if startStr == "" || endStr == "" {
+		return []string{pattern}
+	}
+	step := 1
+	if len(parts) == 3 {
+		s, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+		if err != nil || s <= 0 {
+			return []string{pattern}
+		}
+		step = s
+	}
+
+	prefix := pattern[:startBracket]
+	suffix := pattern[endBracket+1:]
+
+	// 1. 数字范围
+	startNum, err1 := strconv.Atoi(startStr)
+	endNum, err2 := strconv.Atoi(endStr)
+	if err1 == nil && err2 == nil {
+		hasLeadingZero := (len(startStr) > 1 && startStr[0] == '0') || (len(endStr) > 1 && endStr[0] == '0')
+		width := len(startStr)
+		if len(endStr) > width {
+			width = len(endStr)
+		}
+
+		var items []string
+		if startNum <= endNum {
+			for i := startNum; i <= endNum; i += step {
+				var val string
+				if hasLeadingZero {
+					val = fmt.Sprintf("%0*d", width, i)
+				} else {
+					val = strconv.Itoa(i)
+				}
+				items = append(items, prefix+val+suffix)
+			}
+		} else {
+			for i := startNum; i >= endNum; i -= step {
+				var val string
+				if hasLeadingZero {
+					val = fmt.Sprintf("%0*d", width, i)
+				} else {
+					val = strconv.Itoa(i)
+				}
+				items = append(items, prefix+val+suffix)
+			}
+		}
+
+		var result []string
+		for _, item := range items {
+			result = append(result, expandHostRangePattern(item)...)
+		}
+		return result
+	}
+
+	// 2. 字母范围
+	if len(startStr) == 1 && len(endStr) == 1 {
+		bStart := startStr[0]
+		bEnd := endStr[0]
+		isLower := bStart >= 'a' && bStart <= 'z' && bEnd >= 'a' && bEnd <= 'z'
+		isUpper := bStart >= 'A' && bStart <= 'Z' && bEnd >= 'A' && bEnd <= 'Z'
+		if isLower || isUpper {
+			var items []string
+			if bStart <= bEnd {
+				for b := bStart; b <= bEnd; b += byte(step) {
+					items = append(items, prefix+string(b)+suffix)
+					if int(b)+step > int(bEnd) {
+						break
+					}
+				}
+			} else {
+				for b := bStart; b >= bEnd; b -= byte(step) {
+					items = append(items, prefix+string(b)+suffix)
+					if int(b)-step < int(bEnd) {
+						break
+					}
+				}
+			}
+
+			var result []string
+			for _, item := range items {
+				result = append(result, expandHostRangePattern(item)...)
+			}
+			return result
+		}
+	}
+
+	return []string{pattern}
 }
 
 // ParseYAML 解析 YAML 格式的 inventory
@@ -633,22 +769,7 @@ func appendUniqueGroup(groups []*Group, group *Group) []*Group {
 
 func applyJSONHostVars(inv *Inventory, host *Host, vars map[string]interface{}) {
 	for key, value := range vars {
-		stringValue := fmt.Sprintf("%v", value)
-		switch key {
-		case "ansible_host", "ansible_ssh_host",
-			"ansible_user", "ansible_ssh_user",
-			"ansible_port", "ansible_ssh_port",
-			"ansible_ssh_pass",
-			"ansible_private_key_file", "ansible_ssh_private_key_file",
-			"ansible_ssh_common_args",
-			"ansible_connection",
-			"ansible_become", "ansible_become_user", "ansible_become_method",
-			"ansible_become_pass", "ansible_become_password",
-			"ansible_become_exe", "ansible_become_flags":
-			inv.applyConnectionVarToHost(host, key, stringValue, true)
-		default:
-			host.Variables[key] = stringValue
-		}
+		applyHostVariable(host, key, fmt.Sprintf("%v", value))
 	}
 }
 
@@ -684,40 +805,7 @@ func parseYAMLGroup(inv *Inventory, name string, data map[string]interface{}, pa
 
 			if hostVars, ok := hostData.(map[string]interface{}); ok {
 				for k, v := range hostVars {
-					val := fmt.Sprintf("%v", v)
-					switch k {
-					case "ansible_host", "ansible_ssh_host":
-						host.Address = val
-					case "ansible_user", "ansible_ssh_user":
-						host.User = val
-					case "ansible_port", "ansible_ssh_port":
-						port, _ := strconv.Atoi(val)
-						if port > 0 {
-							host.Port = port
-						}
-					case "ansible_ssh_pass":
-						host.Password = val
-					case "ansible_private_key_file", "ansible_ssh_private_key_file":
-						host.PrivateKey = expandHome(val)
-					case "ansible_ssh_common_args":
-						host.SSHCommonArgs = val
-					case "ansible_connection":
-						host.Connection = val
-					case "ansible_become":
-						host.Become = val == "yes" || val == "true" || val == "1"
-					case "ansible_become_user":
-						host.BecomeUser = val
-					case "ansible_become_method":
-						host.BecomeMethod = val
-					case "ansible_become_pass", "ansible_become_password":
-						host.BecomePass = val
-					case "ansible_become_exe":
-						host.BecomeExe = val
-					case "ansible_become_flags":
-						host.BecomeFlags = val
-					default:
-						host.Variables[k] = val
-					}
+					applyHostVariable(host, k, fmt.Sprintf("%v", v))
 				}
 			}
 
@@ -743,26 +831,5 @@ func parseYAMLGroup(inv *Inventory, name string, data map[string]interface{}, pa
 
 // expandHome 展开路径中的 ~ 为用户主目录（兼容 Ansible 的路径格式）
 func expandHome(path string) string {
-	if path == "" {
-		return path
-	}
-
-	// 展开 ~ 为 home 目录
-	if path[0] == '~' {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return path
-		}
-		if len(path) > 1 {
-			return filepath.Join(home, path[2:])
-		}
-		return home
-	}
-
-	// 展开环境变量
-	if strings.Contains(path, "$") {
-		return os.ExpandEnv(path)
-	}
-
-	return path
+	return util.ExpandPath(path)
 }

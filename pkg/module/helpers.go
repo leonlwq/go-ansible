@@ -4,10 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"go-ansible/pkg/ssh"
+	"go-ansible/pkg/util"
 )
 
 const (
@@ -16,10 +20,7 @@ const (
 )
 
 func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+	return util.Quote(value)
 }
 
 func packageNames(params map[string]interface{}) string {
@@ -69,10 +70,6 @@ func hasAnySubstring(text string, needles ...string) bool {
 	return false
 }
 
-func contains(text, needle string) bool {
-	return strings.Contains(text, needle)
-}
-
 func parseChangedMarker(text string) (string, bool, bool) {
 	cleaned := strings.ReplaceAll(text, changeMarkerTrue, "")
 	cleaned = strings.ReplaceAll(cleaned, changeMarkerFalse, "")
@@ -84,6 +81,20 @@ func parseChangedMarker(text string) (string, bool, bool) {
 		return cleaned, false, true
 	default:
 		return strings.TrimSpace(text), false, false
+	}
+}
+
+// HandleChangedMarker 统一解析并剔除 Result Stdout/Stderr 中的 changed 标记，更新 Result.Changed
+func HandleChangedMarker(result *Result) {
+	if result == nil {
+		return
+	}
+	if cleaned, changed, found := parseChangedMarker(result.Stdout); found {
+		result.Stdout = cleaned
+		result.Changed = changed
+	}
+	if cleaned, _, found := parseChangedMarker(result.Stderr); found {
+		result.Stderr = cleaned
 	}
 }
 
@@ -257,6 +268,53 @@ func buildEncodedContentWriteCommand(dest, content, encoding string) (string, er
 	return fmt.Sprintf("cat << '%s' | { if command -v base64 >/dev/null 2>&1; then base64 -d; else openssl base64 -A -d; fi; } > %s\n%s\n%s", marker, shellQuote(dest), payload, marker), nil
 }
 
+func writeRemoteEncodedContent(client ssh.Connection, dest, content, encoding string) (*Result, error) {
+	normalizedEncoding, err := normalizeTextEncoding(encoding)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := encodeTextContent(content, normalizedEncoding)
+	if err != nil {
+		return nil, err
+	}
+
+	// For content <= 512KB, use fast shell pipeline with base64
+	if len(data) <= 512*1024 {
+		writeCmd, err := buildEncodedContentWriteCommand(dest, content, normalizedEncoding)
+		if err != nil {
+			return nil, err
+		}
+		return client.Execute(writeCmd)
+	}
+
+	// For content > 512KB, stream via temporary file to bypass Linux ARG_MAX limits
+	tmpFile, err := os.CreateTemp("", "go-ansible-write-*")
+	if err != nil {
+		return nil, fmt.Errorf("create local temp file: %w", err)
+	}
+	defer func() {
+		_ = os.Remove(tmpFile.Name())
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return nil, fmt.Errorf("write local temp file: %w", err)
+	}
+	_ = tmpFile.Close()
+
+	remoteTmp := fmt.Sprintf("/tmp/go-ansible-upload-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if err := client.Upload(tmpFile.Name(), remoteTmp); err != nil {
+		return nil, fmt.Errorf("upload large content: %w", err)
+	}
+	defer func() {
+		_, _ = client.Execute(fmt.Sprintf("rm -f %s", shellQuote(remoteTmp)))
+	}()
+
+	mvCmd := fmt.Sprintf("cp -f %s %s", shellQuote(remoteTmp), shellQuote(dest))
+	return client.Execute(mvCmd)
+}
+
 func decodeTextContent(data []byte, encoding string) (string, error) {
 	normalizedEncoding, err := normalizeTextEncoding(encoding)
 	if err != nil {
@@ -319,3 +377,169 @@ func encodeTextContent(content, encoding string) ([]byte, error) {
 		return nil, fmt.Errorf("unsupported encoding: %s", normalizedEncoding)
 	}
 }
+
+// IsCheckMode 统一判定模块参数中是否启用了 check mode (试运行)
+func IsCheckMode(params map[string]interface{}) bool {
+	return GetParamBool(params, "__check_mode", false) ||
+		GetParamBool(params, "_ansible_check_mode", false) ||
+		GetParamBool(params, "check_mode", false)
+}
+
+// IsDiffMode 统一判定模块参数中是否启用了 diff mode (差量对比)
+func IsDiffMode(params map[string]interface{}) bool {
+	return GetParamBool(params, "__diff", false) ||
+		GetParamBool(params, "_ansible_diff", false) ||
+		GetParamBool(params, "diff", false)
+}
+
+func safeParamQuote(val string) string {
+	if strings.ContainsAny(val, " \t\n\r;|&$`\"'<>(){}\\") {
+		return shellQuote(val)
+	}
+	return val
+}
+
+// SetFilePermissions 统一对远程文件/目录应用 mode、owner、group 权限与属组设置，
+// 自动转义路径，支持递归 (-R)，支持仅指定 group（通过 chgrp），
+// 并具备幂等探测（非递归模式下预检当前权限属组，已一致时免执行 chmod/chown），返回是否有变更和错误。
+func SetFilePermissions(client ssh.Connection, path, mode, owner, group string, recurse bool) (bool, error) {
+	if client == nil || path == "" {
+		return false, nil
+	}
+	changed := false
+	quotedPath := shellQuote(path)
+
+	needChmod := (mode != "")
+	needChown := (owner != "")
+	needChgrp := (group != "")
+
+	if !recurse && (mode != "" || owner != "" || group != "") {
+		statCmd := fmt.Sprintf("stat -c '%%a:%%U:%%G' %s 2>/dev/null || stat -f '%%Lp:%%Su:%%Sg' %s 2>/dev/null", quotedPath, quotedPath)
+		if res, err := client.Execute(statCmd); err == nil && res != nil && res.ExitCode == 0 {
+			parts := strings.Split(strings.TrimSpace(res.Stdout), ":")
+			if len(parts) == 3 && parts[0] != "" {
+				curMode := parts[0]
+				curOwner := parts[1]
+				curGroup := parts[2]
+
+				if mode != "" {
+					modeInt, err1 := strconv.ParseInt(mode, 8, 32)
+					curModeInt, err2 := strconv.ParseInt(curMode, 8, 32)
+					if err1 == nil && err2 == nil {
+						needChmod = (modeInt != curModeInt)
+					} else {
+						needChmod = (strings.TrimLeft(mode, "0") != strings.TrimLeft(curMode, "0"))
+					}
+				}
+
+				if owner != "" {
+					needChown = (owner != curOwner)
+				}
+				if group != "" {
+					needChgrp = (group != curGroup)
+				}
+			}
+		}
+	}
+
+	if needChmod {
+		quotedMode := safeParamQuote(mode)
+		chmodCmd := fmt.Sprintf("chmod %s %s", quotedMode, quotedPath)
+		if recurse {
+			chmodCmd = fmt.Sprintf("chmod -R %s %s", quotedMode, quotedPath)
+		}
+		if _, err := client.Execute(chmodCmd); err != nil {
+			return changed, fmt.Errorf("failed to set mode: %w", err)
+		}
+		changed = true
+	}
+
+	if needChown || (needChgrp && owner != "") {
+		target := owner
+		if group != "" {
+			target = fmt.Sprintf("%s:%s", owner, group)
+		}
+		quotedTarget := safeParamQuote(target)
+		chownCmd := fmt.Sprintf("chown %s %s", quotedTarget, quotedPath)
+		if recurse {
+			chownCmd = fmt.Sprintf("chown -R %s %s", quotedTarget, quotedPath)
+		}
+		if _, err := client.Execute(chownCmd); err != nil {
+			return changed, fmt.Errorf("failed to set owner: %w", err)
+		}
+		changed = true
+	} else if needChgrp {
+		quotedGroup := safeParamQuote(group)
+		chgrpCmd := fmt.Sprintf("chgrp %s %s", quotedGroup, quotedPath)
+		if recurse {
+			chgrpCmd = fmt.Sprintf("chgrp -R %s %s", quotedGroup, quotedPath)
+		}
+		if _, err := client.Execute(chgrpCmd); err != nil {
+			return changed, fmt.Errorf("failed to set group: %w", err)
+		}
+		changed = true
+	}
+
+	return changed, nil
+}
+
+// MergeModuleResults 将后续执行结果合并到基础结果中，累加 stdout/stderr/msg 并更新 exitCode 和 changed/failed 状态
+func MergeModuleResults(base, next *Result, changed bool) *Result {
+	if base == nil {
+		base = &Result{}
+	}
+	if next == nil {
+		base.Changed = base.Changed || changed
+		return base
+	}
+	if next.Stdout != "" {
+		if base.Stdout != "" {
+			base.Stdout += "\n"
+		}
+		base.Stdout += next.Stdout
+	}
+	if next.Stderr != "" {
+		if base.Stderr != "" {
+			base.Stderr += "\n"
+		}
+		base.Stderr += next.Stderr
+	}
+	if next.Message != "" {
+		if base.Message != "" {
+			base.Message += "\n"
+		}
+		base.Message += next.Message
+	}
+	base.ExitCode = next.ExitCode
+	base.Failed = base.Failed || next.Failed
+	base.Changed = base.Changed || changed || next.Changed
+	return base
+}
+
+// GetOptionalBoolParam 提取可选的布尔参数，返回 (布尔值, 参数是否存在)
+func GetOptionalBoolParam(params map[string]interface{}, key string) (bool, bool) {
+	value, ok := params[key]
+	if !ok || value == nil {
+		return false, false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		return util.ToBool(v), true
+	case int, int64, float64:
+		return util.IsTruthy(v), true
+	default:
+		return false, false
+	}
+}
+
+// 兼容包内小写调用的内部别名
+func mergeModuleResults(base, next *Result, changed bool) *Result {
+	return MergeModuleResults(base, next, changed)
+}
+
+func getOptionalBoolParam(params map[string]interface{}, key string) (bool, bool) {
+	return GetOptionalBoolParam(params, key)
+}
+

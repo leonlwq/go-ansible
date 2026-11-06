@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go-ansible/pkg/ssh"
+	"go-ansible/pkg/util"
 )
 
 // RebootModule reboot 原生模块，用于声明式重启目标主机并等待恢复
@@ -30,8 +31,16 @@ func (m *RebootModule) Execute(client ssh.Connection, params map[string]interfac
 	searchRegex := GetParamString(params, "search_regex", "")
 	bootTimeCommand := GetParamString(params, "boot_time_command", "cat /proc/sys/kernel/random/boot_id 2>/dev/null || uptime -s 2>/dev/null || who -b 2>/dev/null")
 	rebootCommand := GetParamString(params, "reboot_command", "")
+	msg := GetParamString(params, "msg", "Reboot initiated by Ansible")
 
-	_ = connectTimeout
+	// 动态配置客户端单次探测连接超时并在退出时恢复
+	if ts, ok := client.(interface{ SetTimeout(time.Duration) }); ok && connectTimeout > 0 {
+		if gt, ok := client.(interface{ GetTimeout() time.Duration }); ok {
+			origTimeout := gt.GetTimeout()
+			defer ts.SetTimeout(origTimeout)
+		}
+		ts.SetTimeout(time.Duration(connectTimeout) * time.Second)
+	}
 
 	if checkMode {
 		return &Result{
@@ -40,6 +49,7 @@ func (m *RebootModule) Execute(client ssh.Connection, params map[string]interfac
 			Data: map[string]interface{}{
 				"rebooted": true,
 				"elapsed":  0,
+				"msg":      msg,
 			},
 		}, nil
 	}
@@ -60,10 +70,10 @@ func (m *RebootModule) Execute(client ssh.Connection, params map[string]interfac
 		time.Sleep(time.Duration(preRebootDelay) * time.Second)
 	}
 
-	// 3. 下发 reboot 命令
+	// 3. 下发 reboot 命令（附带广播信息）
 	cmd := rebootCommand
 	if cmd == "" {
-		cmd = "/bin/sh -c 'sleep 1; reboot' >/dev/null 2>&1 &"
+		cmd = fmt.Sprintf("shutdown -r now %s >/dev/null 2>&1 || /bin/sh -c 'sleep 1; reboot' >/dev/null 2>&1 &", util.Quote(msg))
 	}
 	if client != nil {
 		_, _ = client.Execute(cmd)
@@ -74,6 +84,11 @@ func (m *RebootModule) Execute(client ssh.Connection, params map[string]interfac
 	deadline := startTime.Add(time.Duration(rebootTimeout) * time.Second)
 	// 短暂休眠给系统处理下线
 	time.Sleep(200 * time.Millisecond)
+
+	var searchRe *regexp.Regexp
+	if searchRegex != "" {
+		searchRe, _ = util.GetRegex(searchRegex)
+	}
 
 	var rebootedSuccessfully bool
 	for {
@@ -86,9 +101,8 @@ func (m *RebootModule) Execute(client ssh.Connection, params map[string]interfac
 				res, err := client.Execute(testCommand)
 				if err == nil && res != nil && res.ExitCode == 0 {
 					passed := true
-					if searchRegex != "" {
-						matched, _ := regexp.MatchString(searchRegex, res.Stdout)
-						if !matched {
+					if searchRe != nil {
+						if !searchRe.MatchString(res.Stdout) {
 							passed = false
 						}
 					}
@@ -119,6 +133,7 @@ func (m *RebootModule) Execute(client ssh.Connection, params map[string]interfac
 			Data: map[string]interface{}{
 				"rebooted": false,
 				"elapsed":  elapsed,
+				"msg":      msg,
 			},
 		}, fmt.Errorf("timed out waiting for host to reboot after %d seconds", rebootTimeout)
 	}
@@ -134,6 +149,7 @@ func (m *RebootModule) Execute(client ssh.Connection, params map[string]interfac
 		Data: map[string]interface{}{
 			"rebooted": true,
 			"elapsed":  elapsed,
+			"msg":      msg,
 		},
 	}, nil
 }

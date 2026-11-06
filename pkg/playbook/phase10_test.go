@@ -312,3 +312,63 @@ func TestPlaybookYamlVarsFilesParsing(t *testing.T) {
 		t.Errorf("expected second entry %q, got %q", expectedCandidates, play.VarsFiles[1])
 	}
 }
+
+// TestTaskNoLogMasksSensitiveOutput 测试任务配置 no_log: true 时敏感凭证被掩盖脱敏
+func TestTaskNoLogMasksSensitiveOutput(t *testing.T) {
+	inv := inventory.NewInventory()
+	inv.EnsureLocalhost()
+
+	e := NewExecutor(inv)
+	defer e.Close()
+
+	falseVal := false
+	play := &Play{
+		Name:        "Test NoLog Task",
+		Hosts:       "localhost",
+		GatherFacts: &falseVal,
+		Tasks: []*Task{
+			{
+				Name:       "Task with sensitive secret",
+				ModuleName: "command",
+				Params: map[string]interface{}{
+					"_raw_params": "echo my-secret-password-12345",
+				},
+				NoLog:    true,
+				Register: "secret_result",
+			},
+			{
+				Name:       "Loop task with sensitive items",
+				ModuleName: "command",
+				Params: map[string]interface{}{
+					"_raw_params": "echo secret-token-{{ item }}",
+				},
+				Loop:     []interface{}{"tokenA", "tokenB"},
+				NoLog:    true,
+				Register: "loop_secret_result",
+			},
+		},
+	}
+
+	pb := &Playbook{Plays: []*Play{play}}
+	res, err := e.Execute(pb)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	hostRes := res.Plays[0].Hosts["localhost"]
+	if len(hostRes.Tasks) != 3 { // 1 single + 2 loop iterations
+		t.Fatalf("expected 3 task results, got %d", len(hostRes.Tasks))
+	}
+
+	for i, tr := range hostRes.Tasks {
+		if !tr.NoLog {
+			t.Errorf("task result [%d] expected NoLog=true", i)
+		}
+		if strings.Contains(tr.Stdout, "secret-password") || strings.Contains(tr.Stdout, "token") {
+			t.Errorf("task result [%d] leaked sensitive stdout: %q", i, tr.Stdout)
+		}
+		if tr.Stdout != "[VALUE_SPECIFIED_IN_NO_LOG_TASK]" {
+			t.Errorf("task result [%d] expected masked stdout, got %q", i, tr.Stdout)
+		}
+	}
+}

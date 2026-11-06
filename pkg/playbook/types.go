@@ -35,6 +35,8 @@ type Play struct {
 	BecomeMethod   string                 `yaml:"become_method" json:"become_method"`
 	BecomePass     string                 `yaml:"become_pass" json:"become_pass"`
 	GatherFacts    *bool                  `yaml:"gather_facts" json:"gather_facts"`
+	GatherSubset   []string               `yaml:"gather_subset" json:"gather_subset"`
+	GatherTimeout  int                    `yaml:"gather_timeout" json:"gather_timeout"`
 	Vars           map[string]interface{} `yaml:"vars" json:"vars"`
 	VarsFiles      []string               `yaml:"vars_files" json:"vars_files"`
 	VarsPrompt     []*VarsPrompt          `yaml:"vars_prompt" json:"vars_prompt"`
@@ -52,6 +54,8 @@ type Play struct {
 	Strategy       string                 `yaml:"strategy" json:"strategy"`
 	Throttle       int                    `yaml:"throttle" json:"throttle"`
 	Debugger       string                 `yaml:"debugger" json:"debugger"`
+	CheckMode      *bool                  `yaml:"check_mode" json:"check_mode"`
+	Diff           *bool                  `yaml:"diff" json:"diff"`
 }
 
 // Task 表示一个任务
@@ -79,11 +83,12 @@ type Task struct {
 	IgnoreUnreachable bool                   `yaml:"ignore_unreachable" json:"ignore_unreachable"`
 	NoLog             bool                   `yaml:"no_log" json:"no_log"`
 	DelegateTo        string                 `yaml:"delegate_to" json:"delegate_to"`
+	DelegateFacts     bool                   `yaml:"delegate_facts" json:"delegate_facts"`
 	LocalAction       string                 `yaml:"local_action" json:"local_action"`
 	RunOnce           bool                   `yaml:"run_once" json:"run_once"`
 	Tags              []string               `yaml:"tags" json:"tags"`
 	Notify            interface{}            `yaml:"notify" json:"notify"`
-	Become            bool                   `yaml:"become" json:"become"`
+	Become            *bool                  `yaml:"become" json:"become"`
 	BecomeUser        string                 `yaml:"become_user" json:"become_user"`
 	BecomeMethod      string                 `yaml:"become_method" json:"become_method"`
 	BecomePass        string                 `yaml:"become_pass" json:"become_pass"`
@@ -91,13 +96,16 @@ type Task struct {
 	Timeout           int                    `yaml:"timeout" json:"timeout"`
 	Debugger          string                 `yaml:"debugger" json:"debugger"`
 	Environment       map[string]string      `yaml:"environment" json:"environment"`
+	CheckMode         *bool                  `yaml:"check_mode" json:"check_mode"`
+	Diff              *bool                  `yaml:"diff" json:"diff"`
 }
 
 type LoopControl struct {
-	LoopVar  string `yaml:"loop_var" json:"loop_var"`
-	IndexVar string `yaml:"index_var" json:"index_var"`
-	Label    string `yaml:"label" json:"label"`
-	Extended bool   `yaml:"extended" json:"extended"`
+	LoopVar  string  `yaml:"loop_var" json:"loop_var"`
+	IndexVar string  `yaml:"index_var" json:"index_var"`
+	Label    string  `yaml:"label" json:"label"`
+	Extended bool    `yaml:"extended" json:"extended"`
+	Pause    float64 `yaml:"pause" json:"pause"`
 }
 
 // Handler 表示一个 handler
@@ -106,14 +114,19 @@ type Handler struct {
 	ModuleName   string                 `yaml:"-" json:"-"`
 	Params       map[string]interface{} `yaml:"-" json:"-"`
 	Module       map[string]interface{} `yaml:",inline" json:"module"`
+	When         interface{}            `yaml:"when" json:"when"`
+	DelegateTo   string                 `yaml:"delegate_to" json:"delegate_to"`
 	Loop         interface{}            `yaml:"loop" json:"loop"`
 	WithItems    interface{}            `yaml:"with_items" json:"with_items"`
 	Listen       string                 `yaml:"listen" json:"listen"`
+	Listens      []string               `yaml:"-" json:"-"`
+	Notify       interface{}            `yaml:"notify" json:"notify"`
 	Tags         []string               `yaml:"tags" json:"tags"`
-	Become       bool                   `yaml:"become" json:"become"`
+	Become       *bool                  `yaml:"become" json:"become"`
 	BecomeUser   string                 `yaml:"become_user" json:"become_user"`
 	BecomeMethod string                 `yaml:"become_method" json:"become_method"`
 	BecomePass   string                 `yaml:"become_pass" json:"become_pass"`
+	NoLog        bool                   `yaml:"no_log" json:"no_log"`
 }
 
 // Role 表示一个 role

@@ -348,6 +348,52 @@ func TestWriteRetryFile(t *testing.T) {
 	}
 }
 
+func TestLoadVarsDirsToInventorySubdirectories(t *testing.T) {
+	dir := t.TempDir()
+	groupVarsDir := filepath.Join(dir, "group_vars")
+	hostVarsDir := filepath.Join(dir, "host_vars")
+
+	// group_vars/webservers/main.yml
+	if err := os.MkdirAll(filepath.Join(groupVarsDir, "webservers"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(groupVarsDir, "webservers", "main.yml"), []byte("nginx_port: 8080\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// host_vars/web01/app.yml
+	if err := os.MkdirAll(filepath.Join(hostVarsDir, "web01"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostVarsDir, "web01", "app.yml"), []byte("app_env: staging\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inv := inventory.NewInventory()
+	h := &inventory.Host{
+		Name:      "web01",
+		Variables: make(map[string]string),
+	}
+	inv.AllHosts["web01"] = h
+	g := &inventory.Group{
+		Name:      "webservers",
+		Variables: make(map[string]string),
+		Hosts:     []*inventory.Host{h},
+	}
+	inv.Groups["webservers"] = g
+
+	loadVarsDirsToInventory(inv, nil, dir)
+
+	// Check group var
+	if g.Variables["nginx_port"] != "8080" {
+		t.Fatalf("expected group var nginx_port 8080, got %q", g.Variables["nginx_port"])
+	}
+	// Check host var
+	if h.Variables["app_env"] != "staging" {
+		t.Fatalf("expected host var app_env staging, got %q", h.Variables["app_env"])
+	}
+}
+
 func TestApplyConnectionOptionsToInventory(t *testing.T) {
 	inv := inventory.NewInventory()
 	h := &inventory.Host{

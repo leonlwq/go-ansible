@@ -2,10 +2,13 @@ package module
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"go-ansible/pkg/ssh"
+	"go-ansible/pkg/util"
 )
 
 // LineinfileModule lineinfile 模块
@@ -28,7 +31,7 @@ func (m *LineinfileModule) Validate(params map[string]interface{}) error {
 		}
 	}
 	if regexpText != "" {
-		if _, err := regexp.Compile(regexpText); err != nil {
+		if _, err := util.GetRegex(regexpText); err != nil {
 			return fmt.Errorf("compile regexp: %w", err)
 		}
 	}
@@ -38,8 +41,18 @@ func (m *LineinfileModule) Validate(params map[string]interface{}) error {
 	if regexpText != "" && searchString != "" {
 		return fmt.Errorf("lineinfile regexp and search_string are mutually exclusive")
 	}
-	if GetParamBool(params, "backrefs", false) && searchString != "" {
-		return fmt.Errorf("lineinfile backrefs requires regexp, not search_string")
+	insertafter := GetParamString(params, "insertafter", "")
+	insertbefore := GetParamString(params, "insertbefore", "")
+	if insertafter != "" && insertbefore != "" {
+		return fmt.Errorf("lineinfile insertafter and insertbefore are mutually exclusive")
+	}
+	if GetParamBool(params, "backrefs", false) {
+		if searchString != "" {
+			return fmt.Errorf("lineinfile backrefs requires regexp, not search_string")
+		}
+		if regexpText == "" {
+			return fmt.Errorf("lineinfile backrefs requires regexp")
+		}
 	}
 	return nil
 }
@@ -58,8 +71,12 @@ func (m *LineinfileModule) Execute(client ssh.Connection, params map[string]inte
 	encoding := GetParamString(params, "encoding", "")
 	newline := GetParamString(params, "newline", "")
 	backup := GetParamBool(params, "backup", false)
-	checkMode := GetParamBool(params, "__check_mode", false)
-	diffMode := GetParamBool(params, "__diff", false)
+	validate := GetParamString(params, "validate", "")
+	owner := GetParamString(params, "owner", "")
+	group := GetParamString(params, "group", "")
+	mode := GetParamMode(params, "mode", "")
+	checkMode := IsCheckMode(params)
+	diffMode := IsDiffMode(params)
 
 	normalizedEncoding, err := normalizeTextEncoding(encoding)
 	if err != nil {
@@ -93,6 +110,35 @@ func (m *LineinfileModule) Execute(client ssh.Connection, params map[string]inte
 	}
 	after = applyNewlineMode(after, newline)
 	if !changed {
+		if exists && (owner != "" || group != "" || mode != "") {
+			permChanged, err := SetFilePermissions(client, path, mode, owner, group, false)
+			if err != nil {
+				return nil, fmt.Errorf("set file permissions: %w", err)
+			}
+			if permChanged {
+				if checkMode {
+					return &Result{
+						Changed: true,
+						Message: "check mode: file permissions would be updated",
+					}, nil
+				}
+				return &Result{
+					Changed: true,
+					Message: "file permissions updated",
+					Data: map[string]interface{}{
+						"path":     path,
+						"matched":  false,
+						"count":    0,
+						"action":   "permissions",
+						"created":  false,
+						"encoding": normalizedEncoding,
+						"newline":  normalizeNewlineMode(newline),
+						"before":   before,
+						"after":    after,
+					},
+				}, nil
+			}
+		}
 		return &Result{
 			Changed: false,
 			Message: "content already in desired state",
@@ -147,19 +193,38 @@ func (m *LineinfileModule) Execute(client ssh.Connection, params map[string]inte
 		}, nil
 	}
 
+	// 验证逻辑 (validate)
+	if validate != "" {
+		tmpPath := fmt.Sprintf("/tmp/go-ansible-lineval-%d-%s", time.Now().UnixNano(), filepath.Base(path))
+		if _, err := writeRemoteEncodedContent(client, tmpPath, after, normalizedEncoding); err != nil {
+			return nil, fmt.Errorf("write validate temp file: %w", err)
+		}
+		defer func() {
+			_, _ = client.Execute(fmt.Sprintf("rm -f %s", shellQuote(tmpPath)))
+		}()
+
+		if err := executeValidate(client, validate, tmpPath); err != nil {
+			return &Result{
+				Changed:  false,
+				Failed:   true,
+				Message:  err.Error(),
+				ExitCode: 1,
+			}, nil
+		}
+	}
+
 	backupFile := ""
 	if backup && exists {
 		_, _ = client.Execute(buildBackupCommand(path))
 		backupFile = path + ".bak"
 	}
 
-	writeCmd, err := buildEncodedContentWriteCommand(path, after, normalizedEncoding)
-	if err != nil {
-		return nil, err
-	}
-	result, err := client.Execute(writeCmd)
+	result, err := writeRemoteEncodedContent(client, path, after, normalizedEncoding)
 	if err != nil {
 		return result, err
+	}
+	if owner != "" || group != "" || mode != "" {
+		_, _ = SetFilePermissions(client, path, mode, owner, group, false)
 	}
 	result.Changed = true
 	result.Message = "line updated successfully"
@@ -229,6 +294,21 @@ func transformLineinfileContent(content string, spec lineinfileSpec) (string, bo
 	}
 }
 
+var backrefRegex = regexp.MustCompile(`\\(?:g<([^>]+)>|([0-9]+))`)
+
+func convertPythonBackrefsToGo(template string) string {
+	return backrefRegex.ReplaceAllStringFunc(template, func(m string) string {
+		sub := backrefRegex.FindStringSubmatch(m)
+		if len(sub) > 1 && sub[1] != "" {
+			return "${" + sub[1] + "}"
+		}
+		if len(sub) > 2 && sub[2] != "" {
+			return "$" + sub[2]
+		}
+		return m
+	})
+}
+
 func ensureLinePresent(lines []string, spec lineinfileSpec) ([]string, bool, error) {
 	match, err := buildLineMatcher(spec)
 	if err != nil {
@@ -245,7 +325,7 @@ func ensureLinePresent(lines []string, spec lineinfileSpec) ([]string, bool, err
 			if spec.Backrefs {
 				return lines, false, nil
 			}
-			updated, changed := insertLine(lines, spec.Line, spec.InsertAfter, spec.InsertBefore)
+			updated, changed := insertLine(lines, spec.Line, spec.InsertAfter, spec.InsertBefore, spec.FirstMatch)
 			return updated, changed, nil
 		}
 
@@ -258,8 +338,8 @@ func ensureLinePresent(lines []string, spec lineinfileSpec) ([]string, bool, err
 		copy(out, lines)
 		replacement := spec.Line
 		if spec.Backrefs {
-			pattern, _ := regexp.Compile(spec.Regexp)
-			replacement = pattern.ReplaceAllString(out[targetIndex], spec.Line)
+			pattern, _ := util.GetRegex(spec.Regexp)
+			replacement = pattern.ReplaceAllString(out[targetIndex], convertPythonBackrefsToGo(spec.Line))
 		}
 
 		changed := false
@@ -268,19 +348,7 @@ func ensureLinePresent(lines []string, spec lineinfileSpec) ([]string, bool, err
 			changed = true
 		}
 
-		removed := 0
-		for _, index := range matchIndexes {
-			if index == targetIndex {
-				continue
-			}
-			adjusted := index - removed
-			if adjusted < 0 || adjusted >= len(out) {
-				continue
-			}
-			out = append(out[:adjusted], out[adjusted+1:]...)
-			removed++
-			changed = true
-		}
+		// Ansible 规范：state: present 仅就地替换目标匹配行（首行或末行），严禁删除非目标匹配行
 		return out, changed, nil
 	}
 
@@ -289,7 +357,7 @@ func ensureLinePresent(lines []string, spec lineinfileSpec) ([]string, bool, err
 			return lines, false, nil
 		}
 	}
-	updated, changed := insertLine(lines, spec.Line, spec.InsertAfter, spec.InsertBefore)
+	updated, changed := insertLine(lines, spec.Line, spec.InsertAfter, spec.InsertBefore, spec.FirstMatch)
 	return updated, changed, nil
 }
 
@@ -318,7 +386,7 @@ func ensureLineAbsent(lines []string, spec lineinfileSpec) ([]string, bool, erro
 
 func buildLineMatcher(spec lineinfileSpec) (func(string) bool, error) {
 	if spec.Regexp != "" {
-		pattern, err := regexp.Compile(spec.Regexp)
+		pattern, err := util.GetRegex(spec.Regexp)
 		if err != nil {
 			return nil, fmt.Errorf("compile regexp: %w", err)
 		}
@@ -366,7 +434,7 @@ func describeLineinfileChange(before string, spec lineinfileSpec, after string) 
 	}
 }
 
-func insertLine(lines []string, line, insertafter, insertbefore string) ([]string, bool) {
+func insertLine(lines []string, line, insertafter, insertbefore string, firstmatch bool) ([]string, bool) {
 	if len(lines) == 0 {
 		return []string{line}, true
 	}
@@ -378,7 +446,7 @@ func insertLine(lines []string, line, insertafter, insertbefore string) ([]strin
 			out = append(out, lines...)
 			return out, true
 		}
-		if index, ok := findInsertIndex(lines, insertbefore, true); ok {
+		if index, ok := findInsertIndex(lines, insertbefore, firstmatch); ok {
 			out := make([]string, 0, len(lines)+1)
 			out = append(out, lines[:index]...)
 			out = append(out, line)
@@ -394,7 +462,7 @@ func insertLine(lines []string, line, insertafter, insertbefore string) ([]strin
 			out = append(out, line)
 			return out, true
 		}
-		if index, ok := findInsertIndex(lines, insertafter, false); ok {
+		if index, ok := findInsertIndex(lines, insertafter, firstmatch); ok {
 			out := make([]string, 0, len(lines)+1)
 			out = append(out, lines[:index+1]...)
 			out = append(out, line)
@@ -409,36 +477,48 @@ func insertLine(lines []string, line, insertafter, insertbefore string) ([]strin
 	return out, true
 }
 
-func findInsertIndex(lines []string, patternText string, before bool) (int, bool) {
+func findInsertIndex(lines []string, patternText string, firstmatch bool) (int, bool) {
 	if patternText == "" {
 		return 0, false
 	}
-	pattern, err := regexp.Compile(patternText)
+	pattern, err := util.GetRegex(patternText)
 	if err == nil {
-		for i, current := range lines {
-			if pattern.MatchString(current) {
+		if firstmatch {
+			for i := 0; i < len(lines); i++ {
+				if pattern.MatchString(lines[i]) {
+					return i, true
+				}
+			}
+		} else {
+			for i := len(lines) - 1; i >= 0; i-- {
+				if pattern.MatchString(lines[i]) {
+					return i, true
+				}
+			}
+		}
+	}
+	if firstmatch {
+		for i := 0; i < len(lines); i++ {
+			if lines[i] == patternText {
+				return i, true
+			}
+		}
+	} else {
+		for i := len(lines) - 1; i >= 0; i-- {
+			if lines[i] == patternText {
 				return i, true
 			}
 		}
 	}
-	for i, current := range lines {
-		if current == patternText {
-			return i, true
-		}
-	}
-	_ = before
 	return 0, false
 }
 
 func splitContentLines(content string) []string {
-	if content == "" {
+	res := util.SplitLines(content)
+	if len(res) == 0 {
 		return nil
 	}
-	trimmed := strings.TrimSuffix(content, "\n")
-	if trimmed == "" {
-		return nil
-	}
-	return strings.Split(trimmed, "\n")
+	return res
 }
 
 func joinContentLines(lines []string, trailingNewline bool) string {
@@ -453,32 +533,4 @@ func joinContentLines(lines []string, trailingNewline bool) string {
 		return joined + "\n"
 	}
 	return joined
-}
-
-func escapeForGrep(s string) string {
-	result := ""
-	for _, c := range s {
-		switch c {
-		case '/', '\\', '.', '*', '[', ']', '^', '$':
-			result += "\\" + string(c)
-		default:
-			result += string(c)
-		}
-	}
-	return result
-}
-
-func escapeForEcho(s string) string {
-	result := ""
-	for _, c := range s {
-		switch c {
-		case '\\':
-			result += "\\\\"
-		case '\'':
-			result += "\\'"
-		default:
-			result += string(c)
-		}
-	}
-	return result
 }

@@ -27,12 +27,8 @@ type InventoryOptions struct {
 	Output         string
 }
 
-func runInventory(args []string) {
-	RunInventory(args, "0.1.0")
-}
-
 func RunInventory(args []string, version string) {
-	fmt.Println("Reimplementation and reconstruction of the main features in Python version")
+	fmt.Fprintln(os.Stderr, "Reimplementation and reconstruction of the main features in Python version")
 	cmd := NewInventoryCmd(version)
 	cmd.SetArgs(normalizeAnsibleArgs(args))
 	if err := cmd.Execute(); err != nil {
@@ -158,10 +154,15 @@ func printInventoryGraph(inv *inventory.Inventory) {
 	printInventoryGraphTo(os.Stdout, inv, false)
 }
 
+// PrintInventoryGraphToForTest 供单元测试验证清单树状图输出
+func PrintInventoryGraphToForTest(w io.Writer, inv *inventory.Inventory, showVars bool) {
+	printInventoryGraphTo(w, inv, showVars)
+}
+
 func printInventoryGraphTo(w io.Writer, inv *inventory.Inventory, showVars bool) {
 	fmt.Fprintln(w, "@all:")
 	for _, groupName := range sortedGroupNames(inv.Groups) {
-		if groupName == "all" {
+		if groupName == "all" || groupName == "ungrouped" {
 			continue
 		}
 		group := inv.Groups[groupName]
@@ -170,10 +171,9 @@ func printInventoryGraphTo(w io.Writer, inv *inventory.Inventory, showVars bool)
 		}
 		printGroupGraphTo(w, inv, group, "  |--", showVars)
 	}
-}
-
-func printGroupGraph(inv *inventory.Inventory, group *inventory.Group, prefix string) {
-	printGroupGraphTo(os.Stdout, inv, group, prefix, false)
+	if ungrouped, ok := inv.Groups["ungrouped"]; ok && len(ungrouped.Hosts) > 0 {
+		printGroupGraphTo(w, inv, ungrouped, "  |--", showVars)
+	}
 }
 
 func printGroupGraphTo(w io.Writer, inv *inventory.Inventory, group *inventory.Group, prefix string, showVars bool) {
@@ -206,10 +206,6 @@ func printGroupGraphTo(w io.Writer, inv *inventory.Inventory, group *inventory.G
 		}
 		fmt.Fprintf(w, "%s%s%s\n", childPrefix, host.Name, hVarsInfo)
 	}
-}
-
-func writeJSON(data interface{}) {
-	writeJSONTo(os.Stdout, data)
 }
 
 func writeJSONTo(w io.Writer, data interface{}) {

@@ -19,6 +19,18 @@ func (m *WaitForModule) Validate(params map[string]interface{}) error {
 			return fmt.Errorf("wait_for module requires port or path")
 		}
 	}
+	state := strings.ToLower(strings.TrimSpace(GetParamString(params, "state", "started")))
+	validStates := map[string]bool{
+		"started": true,
+		"stopped": true,
+		"present": true,
+		"absent":  true,
+		"drained": true,
+		"":        true,
+	}
+	if !validStates[state] {
+		return fmt.Errorf("wait_for unsupported state: %s", state)
+	}
 	return nil
 }
 
@@ -36,6 +48,10 @@ func (m *WaitForModule) Execute(client ssh.Connection, params map[string]interfa
 	if timeout <= 0 {
 		timeout = 300
 	}
+	sleep := GetParamInt(params, "sleep", 1)
+	if sleep < 1 {
+		sleep = 1
+	}
 	state := GetParamString(params, "state", "started")
 	script, successMessage, timeoutMessage, err := buildWaitForScript(waitForSpec{
 		Host:        host,
@@ -44,6 +60,7 @@ func (m *WaitForModule) Execute(client ssh.Connection, params map[string]interfa
 		SearchRegex: searchRegex,
 		Delay:       delay,
 		Timeout:     timeout,
+		Sleep:       sleep,
 		State:       state,
 	})
 	if err != nil {
@@ -88,6 +105,7 @@ type waitForSpec struct {
 	SearchRegex string
 	Delay       int
 	Timeout     int
+	Sleep       int
 	State       string
 }
 
@@ -95,6 +113,11 @@ func buildWaitForScript(spec waitForSpec) (string, string, string, error) {
 	condition, successMessage, timeoutMessage, err := buildWaitForCondition(spec)
 	if err != nil {
 		return "", "", "", err
+	}
+
+	sleepSec := spec.Sleep
+	if sleepSec < 1 {
+		sleepSec = 1
 	}
 
 	rawScript := fmt.Sprintf(`delay=%d
@@ -110,12 +133,12 @@ while [ "$SECONDS" -le "$deadline" ]; do
     echo %s
     exit 0
   fi
-  sleep 1
+  sleep %d
 done
 
 echo %s
 exit 1
-`, spec.Delay, spec.Timeout, condition, shellQuote(successMessage), shellQuote(timeoutMessage))
+`, spec.Delay, spec.Timeout, condition, shellQuote(successMessage), sleepSec, shellQuote(timeoutMessage))
 
 	encoded := base64.StdEncoding.EncodeToString([]byte(rawScript))
 	// 使用 base64 管道传递给 bash，彻底杜绝换行、单双引号嵌套与多层 SSH/sudo shell 词法解析截断
@@ -128,13 +151,17 @@ func buildWaitForCondition(spec waitForSpec) (string, string, string, error) {
 	if spec.Port != "" {
 		switch spec.State {
 		case "", "started", "present":
-			return fmt.Sprintf("echo > /dev/tcp/%s/%s", spec.Host, spec.Port),
+			return fmt.Sprintf("timeout 3 bash -c 'echo > /dev/tcp/%s/%s' 2>/dev/null || echo > /dev/tcp/%s/%s", spec.Host, spec.Port, spec.Host, spec.Port),
 				fmt.Sprintf("wait_for condition satisfied on %s:%s", spec.Host, spec.Port),
 				fmt.Sprintf("timed out waiting for %s:%s", spec.Host, spec.Port), nil
 		case "stopped", "absent":
 			return fmt.Sprintf("! echo > /dev/tcp/%s/%s", spec.Host, spec.Port),
 				fmt.Sprintf("wait_for condition satisfied on %s:%s", spec.Host, spec.Port),
 				fmt.Sprintf("timed out waiting for %s:%s", spec.Host, spec.Port), nil
+		case "drained":
+			return fmt.Sprintf("( ! ( ss -tan 2>/dev/null || netstat -tan 2>/dev/null ) | grep -E ':(%s)\\b' | grep -Eq 'ESTAB|SYN_SENT|SYN_RECV|FIN_WAIT' )", spec.Port),
+				fmt.Sprintf("wait_for port %s drained on %s", spec.Port, spec.Host),
+				fmt.Sprintf("timed out waiting for port %s to drain on %s", spec.Port, spec.Host), nil
 		default:
 			return "", "", "", fmt.Errorf("wait_for unsupported state: %s", spec.State)
 		}

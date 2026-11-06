@@ -2,71 +2,83 @@ package playbook
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+
+	"go-ansible/pkg/util"
 )
 
 var reservedTaskFields = map[string]struct{}{
-	"name":            {},
-	"block":           {},
-	"rescue":          {},
-	"always":          {},
-	"vars":            {},
-	"when":            {},
-	"changed_when":    {},
-	"failed_when":     {},
-	"loop":            {},
-	"with_items":      {},
-	"with_dict":       {},
-	"with_fileglob":   {},
-	"with_sequence":   {},
-	"with_together":   {},
-	"with_nested":     {},
-	"loop_control":    {},
-	"register":        {},
-	"until":           {},
-	"retries":         {},
-	"delay":           {},
-	"async":           {},
-	"poll":            {},
-	"ignore_errors":   {},
-	"no_log":          {},
-	"delegate_to":     {},
-	"local_action":    {},
-	"run_once":        {},
-	"tags":            {},
-	"notify":          {},
-	"become":          {},
-	"become_user":     {},
-	"become_method":   {},
-	"become_pass":     {},
-	"become_password": {},
-	"throttle":        {},
-	"timeout":         {},
-	"debugger":        {},
-	"args":            {},
-	"environment":     {},
+	"name":               {},
+	"block":              {},
+	"rescue":             {},
+	"always":             {},
+	"vars":               {},
+	"when":               {},
+	"changed_when":       {},
+	"failed_when":        {},
+	"loop":               {},
+	"with_items":         {},
+	"with_dict":          {},
+	"with_fileglob":      {},
+	"with_sequence":      {},
+	"with_together":      {},
+	"with_nested":        {},
+	"loop_control":       {},
+	"register":           {},
+	"until":              {},
+	"retries":            {},
+	"delay":              {},
+	"async":              {},
+	"poll":               {},
+	"ignore_errors":      {},
+	"ignore_unreachable": {},
+	"no_log":             {},
+	"delegate_to":        {},
+	"delegate_facts":     {},
+	"local_action":       {},
+	"run_once":           {},
+	"tags":               {},
+	"notify":             {},
+	"become":             {},
+	"become_user":        {},
+	"become_method":      {},
+	"become_pass":        {},
+	"become_password":    {},
+	"throttle":           {},
+	"timeout":            {},
+	"debugger":           {},
+	"args":               {},
+	"environment":        {},
+	"check_mode":         {},
+	"diff":               {},
 }
 
 var reservedHandlerFields = map[string]struct{}{
-	"name":            {},
-	"listen":          {},
-	"loop":            {},
-	"with_items":      {},
-	"with_dict":       {},
-	"with_fileglob":   {},
-	"with_sequence":   {},
-	"with_together":   {},
-	"with_nested":     {},
-	"tags":            {},
-	"become":          {},
-	"become_user":     {},
-	"become_method":   {},
-	"become_pass":     {},
-	"become_password": {},
-	"debugger":        {},
-	"args":            {},
-	"changed_when":    {},
-	"failed_when":     {},
+	"name":               {},
+	"listen":             {},
+	"notify":             {},
+	"loop":               {},
+	"with_items":         {},
+	"with_dict":          {},
+	"with_fileglob":      {},
+	"with_sequence":      {},
+	"with_together":      {},
+	"with_nested":        {},
+	"tags":               {},
+	"become":             {},
+	"become_user":        {},
+	"become_method":      {},
+	"become_pass":        {},
+	"become_password":    {},
+	"debugger":           {},
+	"args":               {},
+	"ignore_unreachable": {},
+	"changed_when":       {},
+	"failed_when":        {},
+	"when":               {},
+	"delegate_to":        {},
+	"no_log":             {},
 }
 
 func normalizeModuleName(name string) string {
@@ -148,14 +160,7 @@ func extractStringList(v interface{}) []string {
 }
 
 func extractBool(v interface{}) bool {
-	switch t := v.(type) {
-	case bool:
-		return t
-	case string:
-		return t == "yes" || t == "true" || t == "1"
-	default:
-		return false
-	}
+	return util.ToBool(v)
 }
 
 func extractInt(v interface{}) int {
@@ -255,6 +260,20 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 		if extended, ok := loopControl["extended"]; ok {
 			task.LoopControl.Extended = extractBool(extended)
 		}
+		if pause, ok := loopControl["pause"]; ok {
+			switch p := pause.(type) {
+			case float64:
+				task.LoopControl.Pause = p
+			case int:
+				task.LoopControl.Pause = float64(p)
+			case int64:
+				task.LoopControl.Pause = float64(p)
+			case string:
+				if val, err := strconv.ParseFloat(strings.TrimSpace(p), 64); err == nil {
+					task.LoopControl.Pause = val
+				}
+			}
+		}
 	}
 
 	if register, ok := raw["register"].(string); ok {
@@ -263,6 +282,12 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 
 	if until, ok := raw["until"]; ok {
 		task.Until = until
+		if _, hasRetries := raw["retries"]; !hasRetries {
+			task.Retries = 3
+		}
+		if _, hasDelay := raw["delay"]; !hasDelay {
+			task.Delay = 5
+		}
 	}
 
 	if retries, ok := raw["retries"]; ok {
@@ -296,6 +321,10 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 		task.DelegateTo = delegateTo
 	}
 
+	if delegateFacts, ok := raw["delegate_facts"]; ok {
+		task.DelegateFacts = extractBool(delegateFacts)
+	}
+
 	if localAction, ok := raw["local_action"].(string); ok {
 		task.LocalAction = localAction
 	}
@@ -311,7 +340,8 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 	}
 
 	if become, ok := raw["become"]; ok {
-		task.Become = extractBool(become)
+		b := extractBool(become)
+		task.Become = &b
 	}
 
 	if becomeUser, ok := raw["become_user"].(string); ok {
@@ -344,6 +374,15 @@ func extractTaskCommonFields(raw map[string]interface{}, task *Task) {
 			task.Environment = extractStringMap(envMap)
 		}
 	}
+
+	if checkMode, ok := raw["check_mode"]; ok {
+		cm := extractBool(checkMode)
+		task.CheckMode = &cm
+	}
+	if diff, ok := raw["diff"]; ok {
+		df := extractBool(diff)
+		task.Diff = &df
+	}
 }
 
 func extractHandlerCommonFields(raw map[string]interface{}, handler *Handler) {
@@ -351,8 +390,30 @@ func extractHandlerCommonFields(raw map[string]interface{}, handler *Handler) {
 		handler.Name = name
 	}
 
-	if listen, ok := raw["listen"].(string); ok {
-		handler.Listen = listen
+	if listenVal, ok := raw["listen"]; ok && listenVal != nil {
+		switch lv := listenVal.(type) {
+		case string:
+			handler.Listen = lv
+			handler.Listens = []string{lv}
+		case []interface{}:
+			for _, item := range lv {
+				if s := strings.TrimSpace(fmt.Sprintf("%v", item)); s != "" {
+					handler.Listens = append(handler.Listens, s)
+				}
+			}
+			if len(handler.Listens) > 0 {
+				handler.Listen = handler.Listens[0]
+			}
+		case []string:
+			handler.Listens = lv
+			if len(lv) > 0 {
+				handler.Listen = lv[0]
+			}
+		}
+	}
+
+	if notify, ok := raw["notify"]; ok {
+		handler.Notify = notify
 	}
 
 	if loop, ok := raw["loop"]; ok {
@@ -378,10 +439,18 @@ func extractHandlerCommonFields(raw map[string]interface{}, handler *Handler) {
 		handler.Loop = map[string]interface{}{"__with_nested__": withNested}
 	}
 
+	if when, ok := raw["when"]; ok {
+		handler.When = when
+	}
+	if delegateTo, ok := raw["delegate_to"].(string); ok {
+		handler.DelegateTo = delegateTo
+	}
+
 	handler.Tags = extractStringList(raw["tags"])
 
 	if become, ok := raw["become"]; ok {
-		handler.Become = extractBool(become)
+		b := extractBool(become)
+		handler.Become = &b
 	}
 	if becomeUser, ok := raw["become_user"].(string); ok {
 		handler.BecomeUser = becomeUser
@@ -394,5 +463,8 @@ func extractHandlerCommonFields(raw map[string]interface{}, handler *Handler) {
 	}
 	if becomePasswd, ok := raw["become_password"]; ok && handler.BecomePass == "" {
 		handler.BecomePass = fmt.Sprintf("%v", becomePasswd)
+	}
+	if noLog, ok := raw["no_log"]; ok {
+		handler.NoLog = extractBool(noLog)
 	}
 }

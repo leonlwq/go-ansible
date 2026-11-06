@@ -1,19 +1,23 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"sync"
+	"time"
 
 	"go-ansible/pkg/inventory"
 )
 
 // LocalConnection 本地执行连接（无需 SSH 开销直接执行本地命令）
 type LocalConnection struct {
-	host *inventory.Host
+	host    *inventory.Host
+	timeout time.Duration
+	mu      sync.Mutex
 }
 
 // NewLocalConnection 创建新的本地连接
@@ -28,6 +32,39 @@ func NewLocalConnection(host *inventory.Host) *LocalConnection {
 	return &LocalConnection{host: host}
 }
 
+// SetHost 更新当前连接的主机执行属性（如任务级提权），隔离浅拷贝防止外部并发修改污染
+func (c *LocalConnection) SetHost(host *inventory.Host) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if host != nil {
+		cloned := *host
+		c.host = &cloned
+	} else {
+		c.host = nil
+	}
+}
+
+// Host 返回当前本地连接的目标主机
+func (c *LocalConnection) Host() *inventory.Host {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.host
+}
+
+// SetTimeout 设置执行超时
+func (c *LocalConnection) SetTimeout(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timeout = d
+}
+
+// GetTimeout 获取执行超时
+func (c *LocalConnection) GetTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.timeout
+}
+
 func (c *LocalConnection) Connect() error {
 	return nil
 }
@@ -37,57 +74,62 @@ func (c *LocalConnection) Close() error {
 }
 
 func (c *LocalConnection) Execute(cmd string) (*Result, error) {
-	if c.host != nil && c.host.Become {
+	c.mu.Lock()
+	become := c.host != nil && c.host.Become
+	c.mu.Unlock()
+
+	if become {
 		return c.ExecuteWithBecome(cmd)
 	}
 	return c.execute(cmd)
 }
 
 func (c *LocalConnection) ExecuteWithBecome(cmd string) (*Result, error) {
-	becomeUser := c.host.BecomeUser
-	if becomeUser == "" {
-		becomeUser = "root"
-	}
-	becomeMethod := c.host.BecomeMethod
-	if becomeMethod == "" {
-		becomeMethod = "sudo"
-	}
+	c.mu.Lock()
+	host := c.host
+	c.mu.Unlock()
 
-	var becomeCmd string
-	if becomeMethod == "sudo" {
-		if c.host.BecomePass != "" {
-			becomeCmd = fmt.Sprintf("echo '%s' | sudo -S -u %s", c.host.BecomePass, becomeUser)
-		} else {
-			becomeCmd = fmt.Sprintf("sudo -n -u %s", becomeUser)
-		}
-	} else if becomeMethod == "su" {
-		if c.host.BecomePass != "" {
-			becomeCmd = fmt.Sprintf("echo '%s' | su - %s -c", c.host.BecomePass, becomeUser)
-			return c.execute(fmt.Sprintf("%s '%s'", becomeCmd, cmd))
-		}
-		becomeCmd = fmt.Sprintf("su - %s -c", becomeUser)
-		return c.execute(fmt.Sprintf("%s '%s'", becomeCmd, cmd))
-	} else {
-		becomeExe := c.host.BecomeExe
-		if becomeExe == "" {
-			becomeExe = "sudo"
-		}
-		becomeCmd = becomeExe
-	}
-
-	fullCmd := fmt.Sprintf("%s %s", becomeCmd, cmd)
+	fullCmd := BuildBecomeCommand(cmd, host)
 	return c.execute(fullCmd)
 }
 
 func (c *LocalConnection) execute(cmdStr string) (*Result, error) {
-	cmd := exec.Command("/bin/sh", "-c", cmdStr)
+	timeout := c.GetTimeout()
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+	} else {
+		ctx = context.Background()
+	}
+
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmdStr)
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
 
-	var stdoutBuf, stderrBuf strings.Builder
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	stdoutBuf := NewBoundedBuffer(MaxCommandOutputBytes)
+	stderrBuf := NewBoundedBuffer(MaxCommandOutputBytes)
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
 	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		hostName := "localhost"
+		c.mu.Lock()
+		if c.host != nil {
+			hostName = c.host.Name
+		}
+		c.mu.Unlock()
+		return &Result{
+			Host:     hostName,
+			Stdout:   stdoutBuf.String(),
+			Stderr:   fmt.Sprintf("command timed out after %v", timeout),
+			ExitCode: 124,
+			Changed:  false,
+			Failed:   true,
+		}, fmt.Errorf("command timed out after %v", timeout)
+	}
+
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -100,8 +142,15 @@ func (c *LocalConnection) execute(cmdStr string) (*Result, error) {
 	stdout := stdoutBuf.String()
 	stderr := stderrBuf.String()
 
+	hostName := "localhost"
+	c.mu.Lock()
+	if c.host != nil {
+		hostName = c.host.Name
+	}
+	c.mu.Unlock()
+
 	result := &Result{
-		Host:     c.host.Name,
+		Host:     hostName,
 		Stdout:   stdout,
 		Stderr:   stderr,
 		ExitCode: exitCode,
@@ -118,8 +167,11 @@ func (c *LocalConnection) execute(cmdStr string) (*Result, error) {
 
 func (c *LocalConnection) Upload(localPath, remotePath string) error {
 	localPath = filepath.Clean(localPath)
-	remotePath = filepath.Clean(remotePath)
-	if localPath == remotePath {
+	targetPath := filepath.Clean(remotePath)
+	if dstStat, err := os.Stat(targetPath); err == nil && dstStat.IsDir() {
+		targetPath = filepath.Join(targetPath, filepath.Base(localPath))
+	}
+	if localPath == targetPath {
 		return nil
 	}
 
@@ -134,19 +186,19 @@ func (c *LocalConnection) Upload(localPath, remotePath string) error {
 		return fmt.Errorf("stat src file %s: %w", localPath, err)
 	}
 
-	parentDir := filepath.Dir(remotePath)
+	parentDir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return fmt.Errorf("create parent dir %s: %w", parentDir, err)
 	}
 
-	dstFile, err := os.OpenFile(remotePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcStat.Mode().Perm())
+	dstFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcStat.Mode().Perm())
 	if err != nil {
-		return fmt.Errorf("open dst file %s: %w", remotePath, err)
+		return fmt.Errorf("open dst file %s: %w", targetPath, err)
 	}
 	defer dstFile.Close()
 
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return fmt.Errorf("copy content from %s to %s: %w", localPath, remotePath, err)
+		return fmt.Errorf("copy content from %s to %s: %w", localPath, targetPath, err)
 	}
 	return nil
 }

@@ -50,6 +50,19 @@ func (m *ArchiveModule) Execute(client ssh.Connection, params map[string]interfa
 		Group:  GetParamString(params, "group", ""),
 	}
 
+	if IsCheckMode(params) {
+		res, _ := client.Execute(fmt.Sprintf("test -e %s", shellQuote(spec.Dest)))
+		destExists := res != nil && res.ExitCode == 0
+		msg := "check mode: archive file would be created"
+		if destExists {
+			msg = "check mode: archive file would be updated"
+		}
+		return &Result{
+			Changed: true,
+			Message: msg,
+		}, nil
+	}
+
 	cmd, err := buildArchiveCommand(spec)
 	if err != nil {
 		return nil, err
@@ -59,13 +72,7 @@ func (m *ArchiveModule) Execute(client ssh.Connection, params map[string]interfa
 	if err != nil {
 		return result, err
 	}
-	if cleaned, changed, found := parseChangedMarker(result.Stdout); found {
-		result.Stdout = cleaned
-		result.Changed = changed
-	}
-	if cleaned, _, found := parseChangedMarker(result.Stderr); found {
-		result.Stderr = cleaned
-	}
+	HandleChangedMarker(result)
 	return result, nil
 }
 
@@ -157,7 +164,7 @@ func buildArchiveCommand(spec archiveSpec) (string, error) {
 	if spec.Backup {
 		lines = append(lines,
 			fmt.Sprintf(`if [ -e %s ]; then`, quotedDest),
-			fmt.Sprintf(`  cp -p %s %s.bak 2>/dev/null || true`, quotedDest, quotedDest),
+			fmt.Sprintf(`  %s`, buildBackupCommand(spec.Dest)),
 			`fi`,
 		)
 	}

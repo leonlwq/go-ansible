@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"go-ansible/pkg/ssh"
+	"go-ansible/pkg/util"
 )
 
 // FindModule find 模块
@@ -56,18 +57,18 @@ func (m *FindModule) Validate(params map[string]interface{}) error {
 	}
 	if spec.UseRegex {
 		for _, pattern := range spec.Patterns {
-			if _, err := regexp.Compile(pattern); err != nil {
+			if _, err := util.GetRegex(pattern); err != nil {
 				return fmt.Errorf("compile find pattern regexp %q: %w", pattern, err)
 			}
 		}
 		for _, pattern := range spec.Excludes {
-			if _, err := regexp.Compile(pattern); err != nil {
+			if _, err := util.GetRegex(pattern); err != nil {
 				return fmt.Errorf("compile find exclude regexp %q: %w", pattern, err)
 			}
 		}
 	}
 	if spec.Contains != "" {
-		if _, err := regexp.Compile(spec.Contains); err != nil {
+		if _, err := util.GetRegex(spec.Contains); err != nil {
 			return fmt.Errorf("compile find contains regexp %q: %w", spec.Contains, err)
 		}
 	}
@@ -352,7 +353,7 @@ func buildFindAgeExpr(age string) (string, error) {
 	if original == "" {
 		return "", nil
 	}
-	prefix := ""
+	prefix := "+" // Ansible 默认无符号表示大于等于/早于
 	age = original
 	if strings.HasPrefix(age, "+") || strings.HasPrefix(age, "-") {
 		prefix = age[:1]
@@ -368,12 +369,20 @@ func buildFindAgeExpr(age string) (string, error) {
 		return "", fmt.Errorf("invalid find age: %s", original)
 	}
 	switch unit {
-	case 'd':
+	case 'w', 'W':
+		return fmt.Sprintf("-mtime %s%d", prefix, number*7), nil
+	case 'd', 'D':
 		return fmt.Sprintf("-mtime %s%d", prefix, number), nil
-	case 'h':
+	case 'h', 'H':
 		return fmt.Sprintf("-mmin %s%d", prefix, number*60), nil
-	case 'm':
+	case 'm', 'M':
 		return fmt.Sprintf("-mmin %s%d", prefix, number), nil
+	case 's', 'S':
+		mins := (number + 59) / 60
+		if mins < 1 {
+			mins = 1
+		}
+		return fmt.Sprintf("-mmin %s%d", prefix, mins), nil
 	default:
 		return "", fmt.Errorf("unsupported find age unit: %c", unit)
 	}
@@ -384,7 +393,7 @@ func buildFindSizeExpr(size string) (string, error) {
 	if original == "" {
 		return "", nil
 	}
-	prefix := ""
+	prefix := "+" // Ansible 默认无符号表示大于等于
 	size = original
 	if strings.HasPrefix(size, "+") || strings.HasPrefix(size, "-") {
 		prefix = size[:1]
@@ -456,7 +465,7 @@ func extractFindPaths(files []map[string]interface{}) []string {
 }
 
 func filterFindEntriesByContent(client ssh.Connection, files []map[string]interface{}, pattern string, readWholeFile bool) ([]map[string]interface{}, error) {
-	re, err := regexp.Compile(pattern)
+	re, err := util.GetRegex(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("compile find contains regexp: %w", err)
 	}

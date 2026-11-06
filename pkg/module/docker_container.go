@@ -51,13 +51,7 @@ func (m *DockerContainerModule) Execute(client ssh.Connection, params map[string
 	if err != nil {
 		return result, err
 	}
-	if cleaned, changed, found := parseChangedMarker(result.Stdout); found {
-		result.Stdout = cleaned
-		result.Changed = changed
-	}
-	if cleaned, _, found := parseChangedMarker(result.Stderr); found {
-		result.Stderr = cleaned
-	}
+	HandleChangedMarker(result)
 	return result, nil
 }
 

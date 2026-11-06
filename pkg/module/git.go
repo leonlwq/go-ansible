@@ -52,7 +52,7 @@ func (m *GitModule) Execute(client ssh.Connection, params map[string]interface{}
 		Update:        GetParamBool(params, "update", true),
 		Force:         GetParamBool(params, "force", false),
 		AcceptHostKey: GetParamBool(params, "accept_hostkey", false),
-		Depth:         GetParam[int](params, "depth", 0),
+		Depth:         GetParamInt(params, "depth", 0),
 		SingleBranch:  GetParamBool(params, "single_branch", false),
 	}
 
@@ -66,13 +66,7 @@ func (m *GitModule) Execute(client ssh.Connection, params map[string]interface{}
 		return result, err
 	}
 
-	if cleaned, changed, found := parseChangedMarker(result.Stdout); found {
-		result.Stdout = cleaned
-		result.Changed = changed
-	}
-	if cleaned, _, found := parseChangedMarker(result.Stderr); found {
-		result.Stderr = cleaned
-	}
+	HandleChangedMarker(result)
 	return result, nil
 }
 

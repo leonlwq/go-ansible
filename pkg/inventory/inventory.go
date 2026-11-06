@@ -2,16 +2,20 @@ package inventory
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+
+	"go-ansible/pkg/util"
 )
 
 // EnsureLocalhost 确保 Inventory 中具备隐式 localhost 主机定义
 func (inv *Inventory) EnsureLocalhost() *Host {
+	inv.cacheMu.Lock()
+	defer inv.cacheMu.Unlock()
+
+	inv.resolvedVarsCache = nil
 	if inv.AllHosts == nil {
 		inv.AllHosts = make(map[string]*Host)
 	}
@@ -36,25 +40,155 @@ func (inv *Inventory) EnsureLocalhost() *Host {
 
 // GetHost 获取指定名称的主机
 func (inv *Inventory) GetHost(name string) (*Host, error) {
+	inv.cacheMu.RLock()
 	if host, ok := inv.AllHosts[name]; ok {
+		inv.cacheMu.RUnlock()
 		return host, nil
 	}
+	inv.cacheMu.RUnlock()
+
 	if name == "localhost" || name == "127.0.0.1" {
 		return inv.EnsureLocalhost(), nil
 	}
 	return nil, fmt.Errorf("host not found: %s", name)
 }
 
+// AddHost 线程安全地向 Inventory 添加或更新主机，并将其加入指定组中（若提供）。
+func (inv *Inventory) AddHost(host *Host, groupNames ...string) {
+	if inv == nil || host == nil {
+		return
+	}
+	inv.cacheMu.Lock()
+	defer inv.cacheMu.Unlock()
+
+	if inv.AllHosts == nil {
+		inv.AllHosts = make(map[string]*Host)
+	}
+	if inv.Groups == nil {
+		inv.Groups = make(map[string]*Group)
+	}
+
+	inv.AllHosts[host.Name] = host
+
+	for _, gName := range groupNames {
+		gName = strings.TrimSpace(gName)
+		if gName == "" {
+			continue
+		}
+		grp, exists := inv.Groups[gName]
+		if !exists {
+			grp = &Group{
+				Name:      gName,
+				Hosts:     make([]*Host, 0),
+				Children:  make([]*Group, 0),
+				Variables: make(map[string]string),
+			}
+			inv.Groups[gName] = grp
+		}
+		found := false
+		for _, h := range grp.Hosts {
+			if h.Name == host.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			grp.Hosts = append(grp.Hosts, host)
+		}
+	}
+
+	inv.resolvedVarsCache = nil
+}
+
+// AddGroup 线程安全地向 Inventory 添加或更新组，并可关联父组。
+func (inv *Inventory) AddGroup(group *Group, parentNames ...string) {
+	if inv == nil || group == nil {
+		return
+	}
+	inv.cacheMu.Lock()
+	defer inv.cacheMu.Unlock()
+
+	if inv.Groups == nil {
+		inv.Groups = make(map[string]*Group)
+	}
+
+	if existing, ok := inv.Groups[group.Name]; ok {
+		for _, h := range group.Hosts {
+			found := false
+			for _, eh := range existing.Hosts {
+				if eh.Name == h.Name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				existing.Hosts = append(existing.Hosts, h)
+			}
+		}
+	} else {
+		inv.Groups[group.Name] = group
+	}
+
+	for _, pName := range parentNames {
+		pName = strings.TrimSpace(pName)
+		if pName == "" {
+			continue
+		}
+		pGrp, pExists := inv.Groups[pName]
+		if !pExists {
+			pGrp = &Group{
+				Name:      pName,
+				Hosts:     make([]*Host, 0),
+				Children:  make([]*Group, 0),
+				Variables: make(map[string]string),
+			}
+			inv.Groups[pName] = pGrp
+		}
+		childFound := false
+		for _, child := range pGrp.Children {
+			if child.Name == group.Name {
+				childFound = true
+				break
+			}
+		}
+		if !childFound {
+			pGrp.Children = append(pGrp.Children, group)
+		}
+	}
+
+	inv.resolvedVarsCache = nil
+}
+
 // GetGroup 获取指定名称的组
 func (inv *Inventory) GetGroup(name string) (*Group, error) {
+	inv.cacheMu.RLock()
+	defer inv.cacheMu.RUnlock()
 	if group, ok := inv.Groups[name]; ok {
 		return group, nil
 	}
 	return nil, fmt.Errorf("group not found: %s", name)
 }
 
+// GetGroupsSnapshot 线程安全地返回当前所有组的浅克隆快照 map[string]*Group
+func (inv *Inventory) GetGroupsSnapshot() map[string]*Group {
+	if inv == nil {
+		return make(map[string]*Group)
+	}
+	inv.cacheMu.RLock()
+	defer inv.cacheMu.RUnlock()
+
+	snapshot := make(map[string]*Group, len(inv.Groups))
+	for name, grp := range inv.Groups {
+		snapshot[name] = grp
+	}
+	return snapshot
+}
+
 // GetAllHosts 获取所有主机列表
 func (inv *Inventory) GetAllHosts() []*Host {
+	inv.cacheMu.RLock()
+	defer inv.cacheMu.RUnlock()
+
 	names := make([]string, 0, len(inv.AllHosts))
 	for name := range inv.AllHosts {
 		names = append(names, name)
@@ -89,15 +223,25 @@ func (inv *Inventory) GetGroupHosts(groupName string) ([]*Host, error) {
 	return hosts, nil
 }
 
-// collectGroupHosts 递归收集组内的主机
+// collectGroupHosts 递归收集组内的主机（具备环形依赖防护）
 func (inv *Inventory) collectGroupHosts(group *Group, hostMap map[string]*Host) {
+	visited := make(map[string]bool)
+	inv.collectGroupHostsWithVisited(group, hostMap, visited)
+}
+
+func (inv *Inventory) collectGroupHostsWithVisited(group *Group, hostMap map[string]*Host, visited map[string]bool) {
+	if group == nil || visited[group.Name] {
+		return
+	}
+	visited[group.Name] = true
+
 	for _, host := range group.Hosts {
 		if _, exists := hostMap[host.Name]; !exists {
 			hostMap[host.Name] = host
 		}
 	}
 	for _, child := range group.Children {
-		inv.collectGroupHosts(child, hostMap)
+		inv.collectGroupHostsWithVisited(child, hostMap, visited)
 	}
 }
 
@@ -211,7 +355,7 @@ func (inv *Inventory) matchSubPattern(hosts []*Host, subPattern string) map[stri
 	// 1. 正则表达式模式: ~regex
 	if strings.HasPrefix(subPattern, "~") {
 		regexStr := strings.TrimSpace(subPattern[1:])
-		if re, err := regexp.Compile(regexStr); err == nil {
+		if re, err := util.GetRegex(regexStr); err == nil {
 			for _, host := range hosts {
 				if re.MatchString(host.Name) || re.MatchString(host.Address) {
 					matched[host.Name] = true
@@ -229,9 +373,28 @@ func (inv *Inventory) matchSubPattern(hosts []*Host, subPattern string) map[stri
 		return matched
 	}
 
-	// 3. 通用组或主机匹配
+	// 3. 通用组或主机匹配 (O(G + N) 算法，避免 O(N * G) 递归树遍历与重复内存分配)
+	if subPattern == "all" || subPattern == "*" {
+		for _, host := range hosts {
+			matched[host.Name] = true
+		}
+		return matched
+	}
+
+	var groupHostMap map[string]*Host
+	if group, err := inv.GetGroup(subPattern); err == nil {
+		groupHostMap = make(map[string]*Host)
+		inv.collectGroupHosts(group, groupHostMap)
+	}
+
 	for _, host := range hosts {
-		if inv.hostMatchesPattern(host, subPattern) {
+		if groupHostMap != nil {
+			if _, ok := groupHostMap[host.Name]; ok {
+				matched[host.Name] = true
+				continue
+			}
+		}
+		if wildcardMatch(subPattern, host.Name) || wildcardMatch(subPattern, host.Address) {
 			matched[host.Name] = true
 		}
 	}
@@ -318,29 +481,6 @@ func (inv *Inventory) resolveGroupSlice(pattern string) ([]*Host, bool) {
 	return nil, true
 }
 
-func (inv *Inventory) hostMatchesPattern(host *Host, pattern string) bool {
-	if host == nil {
-		return false
-	}
-	pattern = strings.TrimSpace(pattern)
-	if pattern == "" {
-		return false
-	}
-	if pattern == "all" || pattern == "*" {
-		return true
-	}
-	if wildcardMatch(pattern, host.Name) || wildcardMatch(pattern, host.Address) {
-		return true
-	}
-	if group, err := inv.GetGroup(pattern); err == nil {
-		hostMap := make(map[string]*Host)
-		inv.collectGroupHosts(group, hostMap)
-		_, ok := hostMap[host.Name]
-		return ok
-	}
-	return false
-}
-
 func splitHostPatterns(patternExpr string) []string {
 	patternExpr = strings.TrimSpace(patternExpr)
 	if patternExpr == "" {
@@ -392,8 +532,34 @@ func wildcardMatch(pattern, value string) bool {
 	return pattern == value
 }
 
+// InvalidateResolvedVarsCache 清理主机变量解析缓存
+func (inv *Inventory) InvalidateResolvedVarsCache() {
+	if inv == nil {
+		return
+	}
+	inv.cacheMu.Lock()
+	inv.resolvedVarsCache = nil
+	inv.cacheMu.Unlock()
+}
+
 // ResolveHostVars 解析主机的完整变量（包括组变量和全局变量）
 func (inv *Inventory) ResolveHostVars(host *Host) map[string]string {
+	if host == nil {
+		return make(map[string]string)
+	}
+
+	inv.cacheMu.RLock()
+	if inv.resolvedVarsCache != nil {
+		if cached, ok := inv.resolvedVarsCache[host.Name]; ok {
+			res := make(map[string]string, len(cached))
+			for k, v := range cached {
+				res[k] = v
+			}
+			inv.cacheMu.RUnlock()
+			return res
+		}
+	}
+
 	vars := make(map[string]string)
 
 	// 全局变量
@@ -401,32 +567,212 @@ func (inv *Inventory) ResolveHostVars(host *Host) map[string]string {
 		vars[k] = v
 	}
 
-	// 查找主机所属的组，并合并组变量
+	// 1. all 组变量作为组基础层
+	if allGroup, exists := inv.Groups["all"]; exists {
+		for k, v := range allGroup.Variables {
+			vars[k] = v
+		}
+	}
+
+	// 2. 收集包含当前主机的非 all 组，按层级深度递增排序（子组优先于父组）
+	type groupDepthItem struct {
+		group *Group
+		depth int
+	}
+	var matchingGroups []groupDepthItem
 	for _, group := range inv.Groups {
-		for _, h := range group.Hosts {
-			if h.Name == host.Name {
-				// 合并组变量
-				for k, v := range group.Variables {
-					if _, exists := vars[k]; !exists {
-						vars[k] = v
-					}
-				}
-				break
+		if group.Name == "all" {
+			continue
+		}
+		if groupContainsHost(group, host.Name, make(map[string]bool)) {
+			d := getGroupDepth(group, make(map[string]bool))
+			matchingGroups = append(matchingGroups, groupDepthItem{group: group, depth: d})
+		}
+	}
+
+	// 稳定排序：按深度升序（父组 -> 子组），深度相同时按组名升序
+	sort.Slice(matchingGroups, func(i, j int) bool {
+		if matchingGroups[i].depth != matchingGroups[j].depth {
+			return matchingGroups[i].depth < matchingGroups[j].depth
+		}
+		return matchingGroups[i].group.Name < matchingGroups[j].group.Name
+	})
+
+	for _, item := range matchingGroups {
+		for k, v := range item.group.Variables {
+			vars[k] = v
+		}
+	}
+
+	// 3. 主机变量（最高优先级），且保持在 RLock 读保护内复制，防止并发读写冲突
+	for k, v := range host.Variables {
+		vars[k] = v
+	}
+	inv.cacheMu.RUnlock()
+
+	inv.cacheMu.Lock()
+	if inv.resolvedVarsCache == nil {
+		inv.resolvedVarsCache = make(map[string]map[string]string)
+	}
+	cachedEntry := make(map[string]string, len(vars))
+	for k, v := range vars {
+		cachedEntry[k] = v
+	}
+	inv.resolvedVarsCache[host.Name] = cachedEntry
+	inv.cacheMu.Unlock()
+
+	return vars
+}
+
+// SetGroupVar 设置组的原生复杂类型变量
+func (inv *Inventory) SetGroupVar(groupName, key string, val interface{}) {
+	inv.cacheMu.Lock()
+	defer inv.cacheMu.Unlock()
+	if inv.GroupVars == nil {
+		inv.GroupVars = make(map[string]map[string]interface{})
+	}
+	if _, ok := inv.GroupVars[groupName]; !ok {
+		inv.GroupVars[groupName] = make(map[string]interface{})
+	}
+	inv.GroupVars[groupName][key] = val
+	inv.resolvedVarsCache = nil
+}
+
+// SetHostVar 设置主机的原生复杂类型变量
+func (inv *Inventory) SetHostVar(hostName, key string, val interface{}) {
+	inv.cacheMu.Lock()
+	defer inv.cacheMu.Unlock()
+	if inv.HostVars == nil {
+		inv.HostVars = make(map[string]map[string]interface{})
+	}
+	if _, ok := inv.HostVars[hostName]; !ok {
+		inv.HostVars[hostName] = make(map[string]interface{})
+	}
+	inv.HostVars[hostName][key] = val
+	inv.resolvedVarsCache = nil
+}
+
+// ResolveHostVarsRaw 解析主机的完整结构化原生变量（保留复合数据类型如切片与映射）
+func (inv *Inventory) ResolveHostVarsRaw(host *Host) map[string]interface{} {
+	if host == nil {
+		return make(map[string]interface{})
+	}
+
+	inv.cacheMu.RLock()
+	defer inv.cacheMu.RUnlock()
+
+	vars := make(map[string]interface{})
+
+	// 1. 全局变量 (Variables 及原生 Vars)
+	for k, v := range inv.Variables {
+		vars[k] = v
+	}
+	if inv.Vars != nil {
+		for k, v := range inv.Vars {
+			vars[k] = v
+		}
+	}
+
+	// 2. all 组变量
+	if allGroup, exists := inv.Groups["all"]; exists {
+		for k, v := range allGroup.Variables {
+			vars[k] = v
+		}
+	}
+	if inv.GroupVars != nil {
+		if allVars, exists := inv.GroupVars["all"]; exists {
+			for k, v := range allVars {
+				vars[k] = v
 			}
 		}
 	}
 
-	// 主机变量（最高优先级）
+	// 3. 收集非 all 组并按层级深度排序合并
+	type groupDepthItem struct {
+		group *Group
+		depth int
+	}
+	var matchingGroups []groupDepthItem
+	for _, group := range inv.Groups {
+		if group.Name == "all" {
+			continue
+		}
+		if groupContainsHost(group, host.Name, make(map[string]bool)) {
+			d := getGroupDepth(group, make(map[string]bool))
+			matchingGroups = append(matchingGroups, groupDepthItem{group: group, depth: d})
+		}
+	}
+
+	sort.Slice(matchingGroups, func(i, j int) bool {
+		if matchingGroups[i].depth != matchingGroups[j].depth {
+			return matchingGroups[i].depth < matchingGroups[j].depth
+		}
+		return matchingGroups[i].group.Name < matchingGroups[j].group.Name
+	})
+
+	for _, item := range matchingGroups {
+		for k, v := range item.group.Variables {
+			vars[k] = v
+		}
+		if inv.GroupVars != nil {
+			if gv, exists := inv.GroupVars[item.group.Name]; exists {
+				for k, v := range gv {
+					vars[k] = v
+				}
+			}
+		}
+	}
+
+	// 4. 主机变量（最高优先级）
 	for k, v := range host.Variables {
 		vars[k] = v
+	}
+	if inv.HostVars != nil {
+		if hv, exists := inv.HostVars[host.Name]; exists {
+			for k, v := range hv {
+				vars[k] = v
+			}
+		}
 	}
 
 	return vars
 }
 
+// groupContainsHost 判定组及其子组是否包含指定主机（防止环形遍历）
+func groupContainsHost(group *Group, hostName string, visited map[string]bool) bool {
+	if group == nil || visited[group.Name] {
+		return false
+	}
+	visited[group.Name] = true
+	for _, h := range group.Hosts {
+		if h.Name == hostName {
+			return true
+		}
+	}
+	for _, child := range group.Children {
+		if groupContainsHost(child, hostName, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// getGroupDepth 计算组在层级树中的深度（防止环形遍历）
+func getGroupDepth(group *Group, visited map[string]bool) int {
+	if group == nil || visited[group.Name] {
+		return 0
+	}
+	visited[group.Name] = true
+	if group.Parent == nil {
+		return 0
+	}
+	return 1 + getGroupDepth(group.Parent, visited)
+}
+
 // ApplyGroupVars 将组变量应用到组内的主机
 // 用于处理在 [group:vars] 中定义的 SSH 连接参数
 func (inv *Inventory) ApplyGroupVars() {
+	inv.InvalidateResolvedVarsCache()
 	// 首先处理 [all:vars]，将全局变量应用到所有主机
 	if allGroup, ok := inv.Groups["all"]; ok && len(allGroup.Variables) > 0 {
 		// 将 all 组的变量复制到全局变量
@@ -465,6 +811,7 @@ func (inv *Inventory) applyVarsToHost(host *Host, vars map[string]string) {
 // ApplyConnectionVars 将连接相关的 extra vars 应用到所有主机。
 // extra vars 在 Ansible 中优先级最高，这里按覆盖语义处理。
 func (inv *Inventory) ApplyConnectionVars(vars map[string]interface{}) {
+	inv.InvalidateResolvedVarsCache()
 	for _, host := range inv.AllHosts {
 		for key, value := range vars {
 			inv.applyConnectionVarToHost(host, key, fmt.Sprintf("%v", value), true)
@@ -472,60 +819,127 @@ func (inv *Inventory) ApplyConnectionVars(vars map[string]interface{}) {
 	}
 }
 
-func (inv *Inventory) applyConnectionVarToHost(host *Host, key, value string, override bool) {
+// ApplyConnectionVar 将连接变量应用到指定主机
+func (inv *Inventory) ApplyConnectionVar(host *Host, key, value string, override bool) {
+	inv.InvalidateResolvedVarsCache()
+	inv.applyConnectionVarToHost(host, key, value, override)
+}
+
+// ApplyHostVariable 将变量应用到主机属性或主机变量字典中（导出供委派与变量合并等场景复用）
+func ApplyHostVariable(host *Host, key, value string) {
+	applyHostVariable(host, key, value)
+}
+
+// applyHostVariable 将变量应用到主机属性（如果是已知连接变量）或主机变量字典中
+func applyHostVariable(host *Host, key, value string) {
+	if host == nil {
+		return
+	}
 	switch key {
 	case "ansible_host", "ansible_ssh_host":
-		if override || host.Address == "" || host.Address == host.Name {
-			host.Address = value
-		}
+		host.Address = value
 	case "ansible_user", "ansible_ssh_user":
-		if override || host.User == "" {
+		host.User = value
+	case "remote_user":
+		if host.User == "" {
 			host.User = value
 		}
 	case "ansible_port", "ansible_ssh_port":
 		port := 0
 		fmt.Sscanf(value, "%d", &port)
-		if port > 0 && (override || host.Port == 0 || host.Port == 22) {
+		if port > 0 {
 			host.Port = port
 		}
-	case "ansible_ssh_pass":
-		if override || host.Password == "" {
+	case "ansible_ssh_pass", "ansible_password":
+		host.Password = value
+	case "ansible_private_key_file", "ansible_ssh_private_key_file":
+		host.PrivateKey = util.ExpandPath(value)
+	case "ansible_ssh_common_args":
+		host.SSHCommonArgs = value
+	case "ansible_connection":
+		host.Connection = value
+	case "ansible_become":
+		host.Become = value == "yes" || value == "true" || value == "1"
+	case "ansible_become_user":
+		host.BecomeUser = value
+	case "ansible_become_method":
+		host.BecomeMethod = value
+	case "ansible_become_pass", "ansible_become_password":
+		host.BecomePass = value
+	case "ansible_become_exe":
+		host.BecomeExe = value
+	case "ansible_become_flags":
+		host.BecomeFlags = value
+	default:
+		if host.Variables == nil {
+			host.Variables = make(map[string]string)
+		}
+		host.Variables[key] = value
+	}
+}
+
+func (inv *Inventory) applyConnectionVarToHost(host *Host, key, value string, override bool) {
+	if override {
+		applyHostVariable(host, key, value)
+		return
+	}
+	switch key {
+	case "ansible_host", "ansible_ssh_host":
+		if host.Address == "" || host.Address == host.Name {
+			host.Address = value
+		}
+	case "ansible_user", "ansible_ssh_user":
+		if host.User == "" {
+			host.User = value
+		}
+	case "remote_user":
+		if host.User == "" {
+			host.User = value
+		}
+	case "ansible_port", "ansible_ssh_port":
+		port := 0
+		fmt.Sscanf(value, "%d", &port)
+		if port > 0 && (host.Port == 0 || host.Port == 22) {
+			host.Port = port
+		}
+	case "ansible_ssh_pass", "ansible_password":
+		if host.Password == "" {
 			host.Password = value
 		}
 	case "ansible_private_key_file", "ansible_ssh_private_key_file":
-		if override || host.PrivateKey == "" {
-			host.PrivateKey = expandPath(value)
+		if host.PrivateKey == "" {
+			host.PrivateKey = util.ExpandPath(value)
 		}
 	case "ansible_ssh_common_args":
-		if override || host.SSHCommonArgs == "" {
+		if host.SSHCommonArgs == "" {
 			host.SSHCommonArgs = value
 		}
 	case "ansible_connection":
-		if override || host.Connection == "" {
+		if host.Connection == "" {
 			host.Connection = value
 		}
 	case "ansible_become":
-		if override || !host.Become {
+		if !host.Become {
 			host.Become = value == "yes" || value == "true" || value == "1"
 		}
 	case "ansible_become_user":
-		if override || host.BecomeUser == "" {
+		if host.BecomeUser == "" {
 			host.BecomeUser = value
 		}
 	case "ansible_become_method":
-		if override || host.BecomeMethod == "" {
+		if host.BecomeMethod == "" {
 			host.BecomeMethod = value
 		}
 	case "ansible_become_pass", "ansible_become_password":
-		if override || host.BecomePass == "" {
+		if host.BecomePass == "" {
 			host.BecomePass = value
 		}
 	case "ansible_become_exe":
-		if override || host.BecomeExe == "" {
+		if host.BecomeExe == "" {
 			host.BecomeExe = value
 		}
 	case "ansible_become_flags":
-		if override || host.BecomeFlags == "" {
+		if host.BecomeFlags == "" {
 			host.BecomeFlags = value
 		}
 	}
@@ -533,28 +947,7 @@ func (inv *Inventory) applyConnectionVarToHost(host *Host, key, value string, ov
 
 // expandPath 展开路径中的 ~ 和环境变量
 func expandPath(path string) string {
-	if path == "" {
-		return path
-	}
-
-	// 展开 ~ 为 home 目录
-	if path[0] == '~' {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return path
-		}
-		if len(path) > 1 {
-			return filepath.Join(home, path[2:])
-		}
-		return home
-	}
-
-	// 展开环境变量
-	if path[0] == '$' {
-		return os.ExpandEnv(path)
-	}
-
-	return path
+	return util.ExpandPath(path)
 }
 
 // Merge 将另一个 Inventory 的主机、组和变量合并到当前 Inventory 中
@@ -562,6 +955,7 @@ func (inv *Inventory) Merge(other *Inventory) {
 	if other == nil {
 		return
 	}
+	inv.InvalidateResolvedVarsCache()
 
 	if inv.AllHosts == nil {
 		inv.AllHosts = make(map[string]*Host)

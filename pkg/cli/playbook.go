@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -11,51 +12,26 @@ import (
 	"github.com/spf13/cobra"
 
 	"go-ansible/pkg/callback"
-	"go-ansible/pkg/inventory"
 	"go-ansible/pkg/playbook"
 )
 
 type PlaybookOptions struct {
-	InventoryPath     string
-	InventoryPaths    []string
-	Tags              string
-	SkipTags          string
-	StartAtTask       string
-	Limit             string
-	ExtraVars         []string
-	Forks             int
-	RemoteUser        string
-	Check             bool
-	Diff              bool
-	Verbose           int
-	AskPass           bool
-	AskBecomePass     bool
-	AskVaultPass      bool
-	VaultPasswordFile string
-	VaultIDs          []string
-	ListTasks         bool
-	ListTags          bool
-	ListHosts         bool
-	SyntaxCheck       bool
+	CommonCLIOptions
 
-	Connection    string
-	Timeout       int
-	PrivateKey    string
-	SSHCommonArgs string
-	SSHExtraArgs  string
+	PlaybookPath  string
+	Tags          string
+	SkipTags      string
+	StartAtTask   string
+	ListTasks     bool
+	ListTags      bool
+	SyntaxCheck   bool
 	ForceHandlers bool
 	Step          bool
 	FlushCache    bool
-
-	PlaybookPath string
-}
-
-func runPlaybook(args []string) {
-	RunPlaybook(args, "0.1.0")
 }
 
 func RunPlaybook(args []string, version string) {
-	fmt.Println("Reimplementation and reconstruction of the main features in Python version")
+	fmt.Fprintln(os.Stderr, "Reimplementation and reconstruction of the main features in Python version")
 	cmd := NewPlaybookCmd(version)
 	cmd.SetArgs(normalizeAnsibleArgs(args))
 	if err := cmd.Execute(); err != nil {
@@ -70,7 +46,13 @@ func NewPlaybookCmd(version string) *cobra.Command {
 	if version == "" {
 		version = "0.1.0"
 	}
-	opts := &PlaybookOptions{}
+	opts := &PlaybookOptions{
+		CommonCLIOptions: CommonCLIOptions{
+			BecomeUser:   "root",
+			BecomeMethod: "sudo",
+			Forks:        5,
+		},
+	}
 	cmd := &cobra.Command{
 		Use:           "ansible-playbook [options] playbook.yml",
 		Short:         "Runs Ansible playbooks, executing the defined tasks on the targeted hosts.",
@@ -84,38 +66,20 @@ func NewPlaybookCmd(version string) *cobra.Command {
 			opts.PlaybookPath = args[0]
 			opts.ExtraVars, _ = cmd.Flags().GetStringArray("extra-vars")
 			opts.Verbose, _ = cmd.Flags().GetCount("verbose")
+			opts.ForksSet = cmd.Flags().Changed("forks")
 			return opts.Run()
 		},
 	}
 	cmd.SetVersionTemplate("ansible-playbook {{.Version}}\n")
 
 	flags := cmd.Flags()
-	flags.VarP(newInventoryValue(&opts.InventoryPaths), "inventory", "i", "specify inventory host path(s) or comma separated host list")
+	opts.RegisterCommonFlags(flags)
 	flags.StringVarP(&opts.Tags, "tags", "t", "", "only run plays and tasks tagged with these values")
 	flags.StringVar(&opts.SkipTags, "skip-tags", "", "only run plays and tasks whose tags do not match these values")
 	flags.StringVar(&opts.StartAtTask, "start-at-task", "", "start the playbook at the task matching this name")
-	flags.StringVarP(&opts.Limit, "limit", "l", "", "further limit selected hosts to an additional pattern")
-	flags.StringArrayP("extra-vars", "e", nil, "set additional variables as key=value or YAML/JSON, if filename prepend with @")
-	flags.IntVarP(&opts.Forks, "forks", "f", 0, "specify number of parallel processes to use")
-	flags.StringVarP(&opts.RemoteUser, "user", "u", "", "connect as this user")
-	flags.BoolVarP(&opts.Check, "check", "C", false, "don't make any changes; instead, try to predict some of the changes that may occur")
-	flags.BoolVarP(&opts.Diff, "diff", "D", false, "when changing (small) files and templates, show the differences in those files")
-	flags.CountP("verbose", "v", "verbose mode (-v, -vv, -vvv)")
-	flags.BoolVarP(&opts.AskPass, "ask-pass", "k", false, "ask for connection password")
-	flags.BoolVarP(&opts.AskBecomePass, "ask-become-pass", "K", false, "ask for privilege escalation password")
-	flags.BoolVar(&opts.AskVaultPass, "ask-vault-pass", false, "ask for vault password")
-	flags.StringVar(&opts.VaultPasswordFile, "vault-password-file", "", "vault password file")
-	flags.StringArrayVar(&opts.VaultIDs, "vault-id", nil, "the vault identity to use (can be specified multiple times)")
 	flags.BoolVar(&opts.ListTasks, "list-tasks", false, "list all tasks that would be executed")
 	flags.BoolVar(&opts.ListTags, "list-tags", false, "list all available tags")
-	flags.BoolVar(&opts.ListHosts, "list-hosts", false, "outputs a list of matching hosts; does not execute anything else")
 	flags.BoolVar(&opts.SyntaxCheck, "syntax-check", false, "perform a syntax check on the playbook, but do not execute it")
-	flags.StringVarP(&opts.Connection, "connection", "c", "", "connection type to use (default=smart)")
-	flags.IntVarP(&opts.Timeout, "timeout", "T", 0, "override the SSH timeout in seconds")
-	flags.StringVar(&opts.PrivateKey, "private-key", "", "use this file to authenticate the connection")
-	flags.StringVar(&opts.PrivateKey, "key-file", "", "use this file to authenticate the connection")
-	flags.StringVar(&opts.SSHCommonArgs, "ssh-common-args", "", "specify common arguments to pass to sftp/scp/ssh")
-	flags.StringVar(&opts.SSHExtraArgs, "ssh-extra-args", "", "specify extra arguments to pass to ssh only")
 	flags.BoolVar(&opts.ForceHandlers, "force-handlers", false, "run handlers even if a task fails")
 	flags.BoolVar(&opts.Step, "step", false, "one-step-at-a-time: confirm each task before running")
 	flags.BoolVar(&opts.FlushCache, "flush-cache", false, "clear the fact cache for every host in inventory")
@@ -126,58 +90,23 @@ func NewPlaybookCmd(version string) *cobra.Command {
 func (opts *PlaybookOptions) Run() error {
 	cfg := loadCLIConfig()
 
-	var defaultSSHPass string
-	if opts.AskPass {
-		pass, err := promptPassword("SSH password: ")
-		if err != nil {
-			return fmt.Errorf("reading SSH password: %w", err)
-		}
-		defaultSSHPass = pass
-	}
-
-	var defaultBecomePass string
-	if opts.AskBecomePass {
-		pass, err := promptPassword("BECOME password[defaults to SSH password]: ")
-		if err != nil {
-			return fmt.Errorf("reading become password: %w", err)
-		}
-		if pass == "" && defaultSSHPass != "" {
-			pass = defaultSSHPass
-		}
-		defaultBecomePass = pass
-	}
-
-	vaultSecrets, err := resolveVaultSecrets(cfg, opts.VaultPasswordFile, opts.VaultIDs, opts.AskVaultPass)
-	if err != nil {
-		return fmt.Errorf("loading vault password: %w", err)
-	}
-
-	vars := make(map[string]interface{})
-	if defaultBecomePass != "" {
-		vars["ansible_become_pass"] = defaultBecomePass
-	}
-	for _, ev := range opts.ExtraVars {
-		parsed, err := parseExtraVarsWithVaultSecrets(ev, vaultSecrets)
-		if err != nil {
-			return fmt.Errorf("parsing extra vars: %w", err)
-		}
-		for k, v := range parsed {
-			vars[k] = v
-		}
-	}
-
 	isVerbose := opts.Verbose > 0
-	if isVerbose {
-		fmt.Printf("[DEBUG] Extra vars: %+v\n", vars)
+	isJSON := strings.ToLower(strings.TrimSpace(cfg.Defaults.StdoutCallback)) == "json"
+	printInfo := func(format string, a ...interface{}) {
+		if isJSON {
+			fmt.Fprintf(os.Stderr, format+"\n", a...)
+		} else {
+			fmt.Printf(format+"\n", a...)
+		}
 	}
 
-	fmt.Printf("Parsing playbook file: %s\n", opts.PlaybookPath)
+	printInfo("Parsing playbook file: %s", opts.PlaybookPath)
 	parser := playbook.NewParser("")
 	pb, err := parser.ParseFile(opts.PlaybookPath)
 	if err != nil {
 		return fmt.Errorf("parsing playbook: %w", err)
 	}
-	fmt.Printf("Parsing playbook success: %s\n", opts.PlaybookPath)
+	printInfo("Parsing playbook success: %s", opts.PlaybookPath)
 
 	if opts.SyntaxCheck {
 		fmt.Printf("playbook: %s\n", opts.PlaybookPath)
@@ -185,11 +114,11 @@ func (opts *PlaybookOptions) Run() error {
 	}
 
 	if isVerbose {
-		fmt.Printf("[DEBUG] Playbook plays: %d\n", len(pb.Plays))
+		printInfo("[DEBUG] Playbook plays: %d", len(pb.Plays))
 		for _, play := range pb.Plays {
-			fmt.Printf("[DEBUG]   Play hosts: %s, tasks: %d\n", play.Hosts, len(play.Tasks))
+			printInfo("[DEBUG]   Play hosts: %s, tasks: %d", play.Hosts, len(play.Tasks))
 			for _, task := range play.Tasks {
-				fmt.Printf("[DEBUG]     Task: %s, Module: %s, Tags: %v\n", task.Name, task.ModuleName, task.Tags)
+				printInfo("[DEBUG]     Task: %s, Module: %s, Tags: %v", task.Name, task.ModuleName, task.Tags)
 			}
 		}
 	}
@@ -200,7 +129,15 @@ func (opts *PlaybookOptions) Run() error {
 	}
 
 	if opts.ListTasks || opts.ListTags {
-		listed, err := playbook.ListPlaybook(pb, resolvedRolePaths)
+		var tagList []string
+		if opts.Tags != "" {
+			tagList = strings.Split(opts.Tags, ",")
+		}
+		var skipTagList []string
+		if opts.SkipTags != "" {
+			skipTagList = strings.Split(opts.SkipTags, ",")
+		}
+		listed, err := playbook.ListPlaybookWithTags(pb, resolvedRolePaths, tagList, skipTagList)
 		if err != nil {
 			return fmt.Errorf("listing playbook: %w", err)
 		}
@@ -213,66 +150,33 @@ func (opts *PlaybookOptions) Run() error {
 		return nil
 	}
 
-	invPaths := opts.InventoryPaths
-	if len(invPaths) == 0 && opts.InventoryPath != "" {
-		invPaths = []string{opts.InventoryPath}
-	}
-	if len(invPaths) == 0 && cfg.Defaults.Inventory != "" {
-		invPaths = []string{cfg.ResolvePath(cfg.Defaults.Inventory)}
-	}
-	var inv *inventory.Inventory
-	if len(invPaths) == 0 {
-		fmt.Fprintf(os.Stderr, "[WARNING]: No inventory was parsed, only implicit localhost is available\n")
-		inv = inventory.NewInventory()
-		inv.EnsureLocalhost()
-	} else {
-		opts.InventoryPath = invPaths[0]
-		var err error
-		inv, err = inventory.ParseSources(invPaths...)
-		if err != nil {
-			return fmt.Errorf("parsing inventory: %w", err)
-		}
-	}
-	applyConfigDefaultsToInventory(inv, cfg)
-	applyConnectionOptionsToInventory(inv, ConnectionOptions{
-		Connection:    opts.Connection,
-		Timeout:       opts.Timeout,
-		PrivateKey:    opts.PrivateKey,
-		SSHCommonArgs: opts.SSHCommonArgs,
-		SSHExtraArgs:  opts.SSHExtraArgs,
-	})
-
-	resolvedLimit, err := resolveLimitPattern(opts.Limit)
+	env, err := opts.SetupExecutionEnv(cfg, filepath.Dir(opts.PlaybookPath))
 	if err != nil {
-		return fmt.Errorf("resolving limit: %w", err)
+		return err
 	}
-	opts.Limit = resolvedLimit
+	inv := env.Inventory
+	vaultSecrets := env.VaultSecrets
+	forks := env.Forks
 
-	if opts.RemoteUser != "" {
-		for _, host := range inv.AllHosts {
-			host.User = opts.RemoteUser
-		}
+	vars := make(map[string]interface{})
+	if env.DefaultBecomePass != "" {
+		vars["ansible_become_pass"] = env.DefaultBecomePass
 	}
-	if defaultSSHPass != "" {
-		for _, host := range inv.AllHosts {
-			if host.Password == "" {
-				host.Password = defaultSSHPass
-			}
+	for _, ev := range opts.ExtraVars {
+		parsed, err := parseExtraVarsWithVaultSecrets(ev, vaultSecrets)
+		if err != nil {
+			return fmt.Errorf("parsing extra vars: %w", err)
 		}
-	}
-	if defaultBecomePass != "" {
-		for _, host := range inv.AllHosts {
-			host.Become = true
-			if host.BecomePass == "" {
-				host.BecomePass = defaultBecomePass
-			}
+		for k, v := range parsed {
+			vars[k] = v
 		}
 	}
 
 	if isVerbose {
-		fmt.Printf("[DEBUG] Inventory hosts: %d\n", len(inv.AllHosts))
+		printInfo("[DEBUG] Extra vars: %+v", vars)
+		printInfo("[DEBUG] Inventory hosts: %d", len(inv.AllHosts))
 		for name, host := range inv.AllHosts {
-			fmt.Printf("[DEBUG]   Host: %s, User: %s, Become: %v\n", name, host.User, host.Become)
+			printInfo("[DEBUG]   Host: %s, User: %s, Become: %v", name, host.User, host.Become)
 		}
 	}
 
@@ -285,7 +189,7 @@ func (opts *PlaybookOptions) Run() error {
 		return nil
 	}
 
-	fmt.Println("Creating executor...")
+	printInfo("Creating executor...")
 	executor := playbook.NewExecutor(inv)
 	executor.SetVerbose(isVerbose)
 	executor.SetVerbosityLevel(opts.Verbose)
@@ -311,17 +215,13 @@ func (opts *PlaybookOptions) Run() error {
 	if opts.FlushCache {
 		executor.FlushCache()
 	}
-	forks := opts.Forks
-	if forks <= 0 {
-		forks = cfg.Defaults.Forks
-	}
 	if forks > 0 {
 		executor.SetForks(forks)
 	}
 	defer executor.Close()
 
 	if len(vars) > 0 {
-		fmt.Printf("Setting extra vars: %d\n", len(vars))
+		printInfo("Setting extra vars: %d", len(vars))
 		executor.SetExtraVars(vars)
 	}
 
@@ -329,33 +229,33 @@ func (opts *PlaybookOptions) Run() error {
 		tagList := strings.Split(opts.Tags, ",")
 		executor.SetTags(tagList)
 		if isVerbose {
-			fmt.Printf("[DEBUG] Filter tags: %v\n", tagList)
+			printInfo("[DEBUG] Filter tags: %v", tagList)
 		}
-		fmt.Printf("Filtering by tags: %v\n", tagList)
+		printInfo("Filtering by tags: %v", tagList)
 	}
 
 	if opts.SkipTags != "" {
 		skipTagList := strings.Split(opts.SkipTags, ",")
 		executor.SetSkipTags(skipTagList)
 		if isVerbose {
-			fmt.Printf("[DEBUG] Skip tags: %v\n", skipTagList)
+			printInfo("[DEBUG] Skip tags: %v", skipTagList)
 		}
-		fmt.Printf("Skipping tags: %v\n", skipTagList)
+		printInfo("Skipping tags: %v", skipTagList)
 	}
 
 	if opts.StartAtTask != "" {
 		executor.SetStartAtTask(opts.StartAtTask)
-		fmt.Printf("Starting at task: %s\n", opts.StartAtTask)
+		printInfo("Starting at task: %s", opts.StartAtTask)
 	}
 	if opts.Limit != "" {
-		fmt.Printf("Limiting hosts: %s\n", opts.Limit)
+		printInfo("Limiting hosts: %s", opts.Limit)
 	}
 
 	if opts.Check {
-		fmt.Println("Running in check mode...")
+		printInfo("Running in check mode...")
 	}
 	if opts.Diff {
-		fmt.Println("Running with diff output...")
+		printInfo("Running with diff output...")
 	}
 
 	renderer, err := callback.NewWithCallbacks(cfg.Defaults.StdoutCallback, cfg.Defaults.CallbacksEnabled)
@@ -375,12 +275,16 @@ func (opts *PlaybookOptions) Run() error {
 		failedSet := make(map[string]bool)
 		for _, playRes := range result.Plays {
 			for hostName, hostRes := range playRes.Hosts {
-				for _, t := range hostRes.Tasks {
-					if t.Failed {
+				if hostRes == nil {
+					continue
+				}
+				for _, t := range hostRes.GetTasks() {
+					if (t.Failed && !t.Rescued) || (t.Unreachable && !t.Ignored) {
 						if !failedSet[hostName] {
 							failedSet[hostName] = true
 							failedHosts = append(failedHosts, hostName)
 						}
+						break
 					}
 				}
 			}

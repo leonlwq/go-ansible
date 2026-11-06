@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/pflag"
 	"golang.org/x/term"
 
 	"go-ansible/pkg/config"
@@ -161,6 +162,100 @@ func applyConfigDefaultsToInventory(inv *inventory.Inventory, cfg *config.Config
 	}
 }
 
+func loadVarsDirsToInventory(inv *inventory.Inventory, secrets []*variable.VaultSecret, dirs ...string) {
+	if inv == nil {
+		return
+	}
+	manager := variable.NewManager()
+	manager.SetVaultSecrets(secrets)
+
+	for _, baseDir := range dirs {
+		if strings.TrimSpace(baseDir) == "" {
+			continue
+		}
+		// 1. group_vars
+		groupVarsDir := filepath.Join(baseDir, "group_vars")
+		if info, err := os.Stat(groupVarsDir); err == nil && info.IsDir() {
+			_ = filepath.Walk(groupVarsDir, func(path string, fi os.FileInfo, err error) error {
+				if err != nil || fi.IsDir() {
+					return nil
+				}
+				ext := strings.ToLower(filepath.Ext(path))
+				if ext != ".yml" && ext != ".yaml" && ext != ".json" {
+					return nil
+				}
+				groupName, ok := variable.ExtractTargetNameFromVarsPath(groupVarsDir, path)
+				if !ok || groupName == "" {
+					return nil
+				}
+				fileVars, err := manager.LoadVarsFile(path)
+				if err == nil && fileVars != nil {
+					if groupName == "all" {
+						if inv.Vars == nil {
+							inv.Vars = make(map[string]interface{})
+						}
+						for k, v := range fileVars {
+							inv.Variables[k] = fmt.Sprintf("%v", v)
+							inv.Vars[k] = v
+						}
+					}
+					group, ok := inv.Groups[groupName]
+					if !ok {
+						group = &inventory.Group{
+							Name:      groupName,
+							Variables: make(map[string]string),
+						}
+						inv.Groups[groupName] = group
+					}
+					if group.Variables == nil {
+						group.Variables = make(map[string]string)
+					}
+					for k, v := range fileVars {
+						group.Variables[k] = fmt.Sprintf("%v", v)
+						inv.SetGroupVar(groupName, k, v)
+					}
+				}
+				return nil
+			})
+			inv.ApplyGroupVars()
+		}
+
+		// 2. host_vars
+		hostVarsDir := filepath.Join(baseDir, "host_vars")
+		if info, err := os.Stat(hostVarsDir); err == nil && info.IsDir() {
+			_ = filepath.Walk(hostVarsDir, func(path string, fi os.FileInfo, err error) error {
+				if err != nil || fi.IsDir() {
+					return nil
+				}
+				ext := strings.ToLower(filepath.Ext(path))
+				if ext != ".yml" && ext != ".yaml" && ext != ".json" {
+					return nil
+				}
+				hostName, ok := variable.ExtractTargetNameFromVarsPath(hostVarsDir, path)
+				if !ok || hostName == "" {
+					return nil
+				}
+				fileVars, err := manager.LoadVarsFile(path)
+				if err == nil && fileVars != nil {
+					for _, host := range inv.AllHosts {
+						if host.Name == hostName {
+							for k, v := range fileVars {
+								strVal := fmt.Sprintf("%v", v)
+								host.Variables[k] = strVal
+								inv.ApplyConnectionVar(host, k, strVal, true)
+							}
+						}
+					}
+					for k, v := range fileVars {
+						inv.SetHostVar(hostName, k, v)
+					}
+				}
+				return nil
+			})
+		}
+	}
+}
+
 func resolveVaultPassword(cfg *config.Config) (string, error) {
 	return resolveVaultPasswordWithPrompt(cfg, "", false)
 }
@@ -247,7 +342,16 @@ func resolveVaultSecrets(cfg *config.Config, vaultPasswordFile string, vaultIDs 
 	return secrets, nil
 }
 
+var promptPasswordFunc = defaultPromptPassword
+
 func promptPassword(prompt string) (string, error) {
+	if promptPasswordFunc != nil {
+		return promptPasswordFunc(prompt)
+	}
+	return defaultPromptPassword(prompt)
+}
+
+func defaultPromptPassword(prompt string) (string, error) {
 	fmt.Fprint(os.Stderr, prompt)
 	fd := int(os.Stdin.Fd())
 	if term.IsTerminal(fd) {
@@ -279,22 +383,7 @@ func sshClientConfigFromDefaults(cfg *config.Config) *ssh.ClientConfig {
 }
 
 func expandCLIPath(path string) string {
-	if path == "" {
-		return path
-	}
-	if path[0] == '~' {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			if len(path) > 1 {
-				return filepath.Join(home, path[2:])
-			}
-			return home
-		}
-	}
-	if strings.Contains(path, "$") {
-		return os.ExpandEnv(path)
-	}
-	return path
+	return util.ExpandPath(path)
 }
 
 func normalizeAnsibleArgs(args []string) []string {
@@ -422,4 +511,191 @@ func applyConnectionOptionsToInventory(inv *inventory.Inventory, opts Connection
 			host.SSHCommonArgs = strings.Join(args, " ")
 		}
 	}
+}
+
+// CommonCLIOptions encapsulates CLI flags and options shared across ansible and ansible-playbook.
+type CommonCLIOptions struct {
+	InventoryPath     string
+	InventoryPaths    []string
+	ExtraVars         []string
+	Forks             int
+	ForksSet          bool
+	Limit             string
+	RemoteUser        string
+	Become            bool
+	BecomeUser        string
+	BecomeMethod      string
+	Check             bool
+	Diff              bool
+	Verbose           int
+	AskPass           bool
+	AskBecomePass     bool
+	AskVaultPass      bool
+	VaultPasswordFile string
+	VaultIDs          []string
+	ListHosts         bool
+
+	Connection    string
+	Timeout       int
+	PrivateKey    string
+	SSHCommonArgs string
+	SSHExtraArgs  string
+}
+
+// RegisterCommonFlags registers standard connection, privilege escalation, vault and execution flags.
+func (opts *CommonCLIOptions) RegisterCommonFlags(flags *pflag.FlagSet) {
+	flags.VarP(newInventoryValue(&opts.InventoryPaths), "inventory", "i", "specify inventory host path(s) or comma separated host list")
+	flags.StringArrayP("extra-vars", "e", nil, "set additional variables as key=value or YAML/JSON, if filename prepend with @")
+	flags.IntVarP(&opts.Forks, "forks", "f", 5, "specify number of parallel processes to use")
+	flags.StringVarP(&opts.Limit, "limit", "l", "", "further limit selected hosts to an additional pattern")
+	flags.StringVarP(&opts.RemoteUser, "user", "u", "", "connect as this user")
+	flags.BoolVarP(&opts.Become, "become", "b", false, "run operations with become (does not imply password prompting)")
+	flags.StringVarP(&opts.BecomeUser, "become-user", "U", "root", "run operations as this user")
+	flags.StringVar(&opts.BecomeMethod, "become-method", "sudo", "privilege escalation method to use")
+	flags.BoolVarP(&opts.Check, "check", "C", false, "don't make any changes; instead, try to predict some of the changes that may occur")
+	flags.BoolVarP(&opts.Diff, "diff", "D", false, "when changing (small) files and templates, show the differences in those files")
+	flags.CountP("verbose", "v", "verbose mode (-v, -vv, -vvv)")
+	flags.BoolVarP(&opts.AskPass, "ask-pass", "k", false, "ask for connection password")
+	flags.BoolVarP(&opts.AskBecomePass, "ask-become-pass", "K", false, "ask for privilege escalation password")
+	flags.BoolVar(&opts.AskVaultPass, "ask-vault-pass", false, "ask for vault password")
+	flags.StringVar(&opts.VaultPasswordFile, "vault-password-file", "", "vault password file")
+	flags.StringArrayVar(&opts.VaultIDs, "vault-id", nil, "the vault identity to use (can be specified multiple times)")
+	flags.BoolVar(&opts.ListHosts, "list-hosts", false, "outputs a list of matching hosts; does not execute anything else")
+	flags.StringVarP(&opts.Connection, "connection", "c", "", "connection type to use (default=smart)")
+	flags.IntVarP(&opts.Timeout, "timeout", "T", 0, "override the SSH timeout in seconds")
+	flags.StringVar(&opts.PrivateKey, "private-key", "", "use this file to authenticate the connection")
+	flags.StringVar(&opts.PrivateKey, "key-file", "", "use this file to authenticate the connection")
+	flags.StringVar(&opts.SSHCommonArgs, "ssh-common-args", "", "specify common arguments to pass to sftp/scp/ssh")
+	flags.StringVar(&opts.SSHExtraArgs, "ssh-extra-args", "", "specify extra arguments to pass to ssh only")
+}
+
+// ExecutionEnv holds the pre-execution inventory, credentials, and settings.
+type ExecutionEnv struct {
+	Inventory         *inventory.Inventory
+	VaultSecrets      []*variable.VaultSecret
+	DefaultSSHPass    string
+	DefaultBecomePass string
+	Forks             int
+}
+
+// SetupExecutionEnv processes CLI credentials, inventory, group/host vars, limits, and host properties.
+func (opts *CommonCLIOptions) SetupExecutionEnv(cfg *config.Config, extraVarsDirs ...string) (*ExecutionEnv, error) {
+	var defaultSSHPass string
+	if opts.AskPass {
+		pass, err := promptPassword("SSH password: ")
+		if err != nil {
+			return nil, fmt.Errorf("reading SSH password: %w", err)
+		}
+		defaultSSHPass = pass
+	}
+
+	var defaultBecomePass string
+	if opts.AskBecomePass {
+		pass, err := promptPassword("BECOME password[defaults to SSH password]: ")
+		if err != nil {
+			return nil, fmt.Errorf("reading become password: %w", err)
+		}
+		if pass == "" && defaultSSHPass != "" {
+			pass = defaultSSHPass
+		}
+		defaultBecomePass = pass
+	}
+
+	vaultSecrets, err := resolveVaultSecrets(cfg, opts.VaultPasswordFile, opts.VaultIDs, opts.AskVaultPass)
+	if err != nil {
+		return nil, fmt.Errorf("loading vault password: %w", err)
+	}
+
+	invPaths := opts.InventoryPaths
+	if len(invPaths) == 0 && opts.InventoryPath != "" {
+		invPaths = []string{opts.InventoryPath}
+	}
+	if len(invPaths) == 0 && cfg != nil && cfg.Defaults.Inventory != "" {
+		invPaths = []string{cfg.ResolvePath(cfg.Defaults.Inventory)}
+	}
+
+	var inv *inventory.Inventory
+	if len(invPaths) == 0 {
+		fmt.Fprintf(os.Stderr, "[WARNING]: No inventory was parsed, only implicit localhost is available\n")
+		inv = inventory.NewInventory()
+		inv.EnsureLocalhost()
+	} else {
+		opts.InventoryPath = invPaths[0]
+		var parseErr error
+		inv, parseErr = inventory.ParseSources(invPaths...)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parsing inventory: %w", parseErr)
+		}
+	}
+
+	varsDirs := make([]string, 0, len(extraVarsDirs)+len(invPaths))
+	// 按照 Ansible 官方规范，Inventory 变量先加载，Playbook 级变量后加载并覆盖清单变量
+	for _, p := range invPaths {
+		varsDirs = append(varsDirs, filepath.Dir(p))
+	}
+	varsDirs = append(varsDirs, extraVarsDirs...)
+	loadVarsDirsToInventory(inv, vaultSecrets, varsDirs...)
+
+	applyConfigDefaultsToInventory(inv, cfg)
+	applyConnectionOptionsToInventory(inv, ConnectionOptions{
+		Connection:    opts.Connection,
+		Timeout:       opts.Timeout,
+		PrivateKey:    opts.PrivateKey,
+		SSHCommonArgs: opts.SSHCommonArgs,
+		SSHExtraArgs:  opts.SSHExtraArgs,
+	})
+
+	resolvedLimit, err := resolveLimitPattern(opts.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("resolving limit: %w", err)
+	}
+	opts.Limit = resolvedLimit
+
+	if opts.RemoteUser != "" {
+		for _, host := range inv.AllHosts {
+			host.User = opts.RemoteUser
+		}
+	}
+	if defaultSSHPass != "" {
+		for _, host := range inv.AllHosts {
+			if host.Password == "" {
+				host.Password = defaultSSHPass
+			}
+		}
+	}
+	if defaultBecomePass != "" {
+		for _, host := range inv.AllHosts {
+			if host.BecomePass == "" {
+				host.BecomePass = defaultBecomePass
+			}
+		}
+	}
+
+	if opts.Become {
+		for _, host := range inv.AllHosts {
+			host.Become = true
+			if opts.BecomeUser != "" {
+				host.BecomeUser = opts.BecomeUser
+			}
+			if opts.BecomeMethod != "" {
+				host.BecomeMethod = opts.BecomeMethod
+			}
+			if defaultBecomePass != "" && host.BecomePass == "" {
+				host.BecomePass = defaultBecomePass
+			}
+		}
+	}
+
+	forks := opts.Forks
+	if !opts.ForksSet && cfg != nil && cfg.Defaults.Forks > 0 {
+		forks = cfg.Defaults.Forks
+	}
+
+	return &ExecutionEnv{
+		Inventory:         inv,
+		VaultSecrets:      vaultSecrets,
+		DefaultSSHPass:    defaultSSHPass,
+		DefaultBecomePass: defaultBecomePass,
+		Forks:             forks,
+	}, nil
 }
