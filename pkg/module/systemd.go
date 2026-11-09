@@ -14,8 +14,8 @@ func (m *SystemdModule) Name() string { return "systemd" }
 func (m *SystemdModule) Validate(params map[string]interface{}) error {
 	name := GetParamString(params, "name", "")
 	state := GetParamString(params, "state", "")
-	_, hasEnabled := getOptionalBoolParam(params, "enabled")
-	_, hasMasked := getOptionalBoolParam(params, "masked")
+	_, hasEnabled := GetOptionalBoolParam(params, "enabled")
+	_, hasMasked := GetOptionalBoolParam(params, "masked")
 	daemonReload := GetParamBool(params, "daemon_reload", false)
 	daemonReexec := GetParamBool(params, "daemon_reexec", false)
 
@@ -48,8 +48,8 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 
 	name := GetParamString(params, "name", "")
 	state := GetParamString(params, "state", "")
-	enabled, hasEnabled := getOptionalBoolParam(params, "enabled")
-	masked, hasMasked := getOptionalBoolParam(params, "masked")
+	enabled, hasEnabled := GetOptionalBoolParam(params, "enabled")
+	masked, hasMasked := GetOptionalBoolParam(params, "masked")
 	if state == "masked" {
 		masked = true
 		hasMasked = true
@@ -122,7 +122,7 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 		if stepErr != nil {
 			return stepResult, stepErr
 		}
-		result = mergeModuleResults(result, stepResult, true)
+		result = MergeModuleResults(result, stepResult, true)
 	}
 
 	if daemonReexec {
@@ -130,7 +130,7 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 		if stepErr != nil {
 			return stepResult, stepErr
 		}
-		result = mergeModuleResults(result, stepResult, true)
+		result = MergeModuleResults(result, stepResult, true)
 	}
 
 	if hasMasked {
@@ -147,7 +147,7 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
 			stepResult.Stderr = cleaned
 		}
-		result = mergeModuleResults(result, stepResult, changed)
+		result = MergeModuleResults(result, stepResult, changed)
 	}
 
 	if hasEnabled {
@@ -167,7 +167,7 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
 			stepResult.Stderr = cleaned
 		}
-		result = mergeModuleResults(result, stepResult, changed)
+		result = MergeModuleResults(result, stepResult, changed)
 	}
 
 	if state != "" {
@@ -190,7 +190,7 @@ func (m *SystemdModule) Execute(client ssh.Connection, params map[string]interfa
 		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
 			stepResult.Stderr = cleaned
 		}
-		result = mergeModuleResults(result, stepResult, changed)
+		result = MergeModuleResults(result, stepResult, changed)
 	}
 
 	if !daemonReload && !daemonReexec && !hasMasked && !hasEnabled && state == "" {

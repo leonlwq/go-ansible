@@ -50,6 +50,9 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 		if src == "" {
 			return nil, fmt.Errorf("copy module requires src when remote_src is true")
 		}
+		if mode == "preserve" {
+			mode = ResolvePreserveFileMode(client, src, true)
+		}
 		destPath := resolveDestPath(dest, src)
 
 		// 检查远程源文件是否存在
@@ -62,9 +65,21 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 		destChecksum := readRemoteChecksum(client, destPath)
 
 		if srcChecksum != "" && srcChecksum == destChecksum {
+			permChanged, err := CheckOrSetFilePermissions(client, destPath, mode, owner, group, false, checkMode)
+			if err != nil {
+				return nil, fmt.Errorf("set file permissions: %w", err)
+			}
+			msg := "file already exists with matching content"
+			if permChanged {
+				if checkMode {
+					msg = "check mode: file permissions would be updated"
+				} else {
+					msg = "file permissions updated"
+				}
+			}
 			return &Result{
-				Changed: false,
-				Message: "file already exists with matching content",
+				Changed: permChanged,
+				Message: msg,
 			}, nil
 		}
 		if destChecksum != "" && !force {
@@ -116,7 +131,7 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 			}
 		}
 
-		m.setPermissions(client, destPath, mode, owner, group)
+		_, _ = SetFilePermissions(client, destPath, mode, owner, group, false)
 		return &Result{
 			Changed: true,
 			Message: "file copied remotely successfully",
@@ -127,11 +142,14 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 	// 2. 内容直接写入模式 (content)
 	if src == "" {
 		if content, ok := params["content"]; ok {
+			if mode == "preserve" {
+				mode = ""
+			}
 			contentStr := fmt.Sprintf("%v", content)
 			remoteChecksum := readRemoteChecksum(client, dest)
 			localChecksum := stringChecksum(contentStr)
 			if localChecksum == remoteChecksum && remoteChecksum != "" {
-				permChanged, err := SetFilePermissions(client, dest, mode, owner, group, false)
+				permChanged, err := CheckOrSetFilePermissions(client, dest, mode, owner, group, false, checkMode)
 				if err != nil {
 					return nil, fmt.Errorf("set file permissions: %w", err)
 				}
@@ -140,7 +158,11 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 					Message: "file already exists with matching content",
 				}
 				if permChanged {
-					result.Message = "file permissions updated"
+					if checkMode {
+						result.Message = "check mode: file permissions would be updated"
+					} else {
+						result.Message = "file permissions updated"
+					}
 				}
 				return result, nil
 			}
@@ -167,7 +189,7 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 
 			destDir := filepath.Dir(dest)
 			client.Execute(fmt.Sprintf("mkdir -p %s", shellQuote(destDir)))
-			if dirMode := GetParamString(params, "directory_mode", ""); dirMode != "" {
+			if dirMode := GetParamMode(params, "directory_mode", ""); dirMode != "" {
 				client.Execute(fmt.Sprintf("chmod %s %s", shellQuote(dirMode), shellQuote(destDir)))
 			}
 
@@ -191,7 +213,7 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 				Message: "file content written successfully",
 				Diff:    diff,
 			}
-			m.setPermissions(client, dest, mode, owner, group)
+			_, _ = SetFilePermissions(client, dest, mode, owner, group, false)
 			return result, nil
 		}
 		return nil, fmt.Errorf("copy module requires src or content")
@@ -211,6 +233,10 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 		return m.executeCopyDirectory(client, src, dest, mode, owner, group, force, checkMode, diffMode)
 	}
 
+	if mode == "preserve" {
+		mode = fmt.Sprintf("%04o", fileInfo.Mode().Perm())
+	}
+
 	// 计算本地文件 checksum
 	localChecksum, err := fileChecksum(src)
 	if err != nil {
@@ -225,7 +251,7 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 
 	// 如果 checksum 相同，跳过传输，但仍需检查并应用权限和属组
 	if localChecksum == remoteChecksum && remoteChecksum != "" {
-		permChanged, err := SetFilePermissions(client, destPath, mode, owner, group, false)
+		permChanged, err := CheckOrSetFilePermissions(client, destPath, mode, owner, group, false, checkMode)
 		if err != nil {
 			return nil, fmt.Errorf("set file permissions: %w", err)
 		}
@@ -234,7 +260,11 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 			Message: "file already exists with matching content",
 		}
 		if permChanged {
-			result.Message = "file permissions updated"
+			if checkMode {
+				result.Message = "check mode: file permissions would be updated"
+			} else {
+				result.Message = "file permissions updated"
+			}
 		}
 		return result, nil
 	}
@@ -265,7 +295,7 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 	// 确保目标目录存在
 	destDir := filepath.Dir(destPath)
 	client.Execute(fmt.Sprintf("mkdir -p %s", shellQuote(destDir)))
-	if dirMode := GetParamString(params, "directory_mode", ""); dirMode != "" {
+	if dirMode := GetParamMode(params, "directory_mode", ""); dirMode != "" {
 		client.Execute(fmt.Sprintf("chmod %s %s", shellQuote(dirMode), shellQuote(destDir)))
 	}
 
@@ -298,7 +328,7 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 		result.Changed = true
 		result.Message = "file copied successfully"
 		result.Diff = diff
-		m.setPermissions(client, destPath, mode, owner, group)
+		_, _ = SetFilePermissions(client, destPath, mode, owner, group, false)
 		return result, nil
 	}
 
@@ -313,7 +343,7 @@ func (m *CopyModule) Execute(client ssh.Connection, params map[string]interface{
 		Diff:    diff,
 	}
 
-	m.setPermissions(client, destPath, mode, owner, group)
+	_, _ = SetFilePermissions(client, destPath, mode, owner, group, false)
 	return result, nil
 }
 
@@ -352,7 +382,11 @@ func (m *CopyModule) executeCopyDirectory(client ssh.Connection, src, dest, mode
 					if _, err := client.Execute(fmt.Sprintf("mkdir -p %s", shellQuote(remotePath))); err != nil {
 						return fmt.Errorf("create remote directory %s: %w", remotePath, err)
 					}
-					m.setPermissions(client, remotePath, mode, owner, group)
+					targetMode := mode
+					if mode == "preserve" {
+						targetMode = fmt.Sprintf("%04o", info.Mode().Perm())
+					}
+					_, _ = SetFilePermissions(client, remotePath, targetMode, owner, group, false)
 				}
 			}
 			return nil
@@ -382,7 +416,11 @@ func (m *CopyModule) executeCopyDirectory(client ssh.Connection, src, dest, mode
 			if err := client.Upload(localPath, remotePath); err != nil {
 				return fmt.Errorf("upload %s to %s: %w", localPath, remotePath, err)
 			}
-			m.setPermissions(client, remotePath, mode, owner, group)
+			targetMode := mode
+			if mode == "preserve" {
+				targetMode = fmt.Sprintf("%04o", info.Mode().Perm())
+			}
+			_, _ = SetFilePermissions(client, remotePath, targetMode, owner, group, false)
 		}
 
 		return nil
@@ -419,10 +457,6 @@ func readRemoteChecksum(client ssh.Connection, path string) string {
 		return ""
 	}
 	return strings.TrimSpace(checkResult.Stdout)
-}
-
-func (m *CopyModule) setPermissions(client ssh.Connection, path, mode, owner, group string) {
-	_, _ = SetFilePermissions(client, path, mode, owner, group, false)
 }
 
 func fileChecksum(path string) (string, error) {
@@ -546,11 +580,4 @@ func (m *FetchModule) Execute(client ssh.Connection, params map[string]interface
 			"checksum": newChecksum,
 		},
 	}, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

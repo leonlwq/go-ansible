@@ -61,8 +61,10 @@ type Executor struct {
 	forks                 int
 	pendingHandlers       []pendingHandler
 	activePlayHosts       []string
+	activeBatchHosts      []string
+	currentPlayName       string
 	throttleSems          map[string]chan struct{}
-	throttleMu            sync.Mutex
+	throttleMu            sync.RWMutex
 	factCaching           string
 	factCachingConnection string
 	factCachingTimeout    int
@@ -396,6 +398,7 @@ func (e *Executor) ExecutePlay(play *Play) (*PlayResult, error) {
 	e.currentPlayDebugger = play.Debugger
 	e.currentPlayDefaults = nil
 	e.mu.Lock()
+	e.currentPlayName = play.Name
 	e.currentPlayCheckMode = play.CheckMode
 	e.currentPlayDiff = play.Diff
 	e.currentPlayForceHandlers = play.ForceHandlers || e.forceHandlers
@@ -406,6 +409,8 @@ func (e *Executor) ExecutePlay(play *Play) (*PlayResult, error) {
 		e.endedHosts = nil
 		e.failedHosts = nil
 		e.endPlay = false
+		e.currentPlayName = ""
+		e.activeBatchHosts = nil
 		e.currentPlayDebugger = ""
 		e.currentPlayHandlers = nil
 		e.currentPlayCheckMode = nil
@@ -542,6 +547,13 @@ func (e *Executor) ExecutePlay(play *Play) (*PlayResult, error) {
 
 	for batchIndex, batchHosts := range hostBatches {
 		e.log("Executing host batch %d/%d", batchIndex+1, len(hostBatches))
+		batchNames := make([]string, len(batchHosts))
+		for i, bh := range batchHosts {
+			batchNames[i] = bh.Name
+		}
+		e.mu.Lock()
+		e.activeBatchHosts = batchNames
+		e.mu.Unlock()
 
 		failedBeforeBatch := e.failedTaskCount(result)
 		if err := e.executeTaskList(hosts, batchHosts, play.PreTasks, playVars, handlers, taskRunOnceExecuted, play.Environment, result, play.AnyErrorsFatal, play.Strategy); err != nil {
@@ -772,7 +784,36 @@ func (e *Executor) taskVarsForHost(host *inventory.Host, baseVars map[string]int
 	} else {
 		result["group_names"] = []string{}
 	}
-	result["play_hosts"] = e.getActivePlayHosts()
+	allPlayHosts := e.getActivePlayHosts()
+	activeUnfailedPlayHosts := e.filterActiveUnfailedHosts(allPlayHosts)
+	batchHosts := e.getActiveBatchHosts()
+	if len(batchHosts) == 0 {
+		batchHosts = allPlayHosts
+	}
+	activeBatchHosts := e.filterActiveUnfailedHosts(batchHosts)
+
+	result["play_hosts"] = activeUnfailedPlayHosts
+	result["ansible_play_hosts_all"] = allPlayHosts
+	result["ansible_play_hosts"] = activeUnfailedPlayHosts
+	result["ansible_play_batch"] = activeBatchHosts
+
+	e.mu.RLock()
+	playName := e.currentPlayName
+	verbosity := e.verbosityLevel
+	e.mu.RUnlock()
+	result["ansible_play_name"] = playName
+	result["ansible_check_mode"] = e.isTaskCheckMode(nil)
+	result["ansible_diff_mode"] = e.isTaskDiffMode(nil)
+	result["ansible_forks"] = e.GetForks()
+	result["ansible_verbosity"] = verbosity
+	result["ansible_version"] = map[string]interface{}{
+		"full":     "2.16.0",
+		"major":    2,
+		"minor":    16,
+		"revision": 0,
+		"string":   "2.16.0",
+	}
+
 	result["hostvars"] = e.buildHostVarsSnapshot(host, result)
 
 	// 注入核心魔术变量
@@ -974,7 +1015,7 @@ func (e *Executor) getBaseHostVarsLocked(h *inventory.Host) map[string]interface
 }
 
 func mergeCurrentHostVars(hostvars map[string]map[string]interface{}, currentHost *inventory.Host, currentVars map[string]interface{}) {
-	if currentHost == nil {
+	if currentHost == nil || len(currentVars) == 0 {
 		return
 	}
 	base := hostvars[currentHost.Name]
@@ -996,11 +1037,11 @@ func (e *Executor) buildHostVarsSnapshot(currentHost *inventory.Host, currentVar
 		return make(map[string]map[string]interface{})
 	}
 
-	allHosts := e.inventory.GetAllHosts()
+	hostCount := e.inventory.HostCount()
 
-	// 快速无冲突并发读路径：若快照已构建且主机数一致，使用 RLock 共享读取
+	// 快速无冲突并发读路径：若快照已构建且主机数一致，使用 RLock 共享读取（完全杜绝 GetAllHosts 全量排序与切片分配）
 	e.hostVarsMu.RLock()
-	if e.cachedHostVarsSnapshot != nil && len(e.cachedHostVarsSnapshot) == len(allHosts) {
+	if e.cachedHostVarsSnapshot != nil && len(e.cachedHostVarsSnapshot) == hostCount {
 		hostvars := make(map[string]map[string]interface{}, len(e.cachedHostVarsSnapshot)+1)
 		for k, v := range e.cachedHostVarsSnapshot {
 			hostvars[k] = v
@@ -1011,6 +1052,8 @@ func (e *Executor) buildHostVarsSnapshot(currentHost *inventory.Host, currentVar
 		return hostvars
 	}
 	e.hostVarsMu.RUnlock()
+
+	allHosts := e.inventory.GetAllHosts()
 
 	// 慢路径：排他锁重新构建快照
 	e.hostVarsMu.Lock()
@@ -1047,6 +1090,33 @@ func (e *Executor) getActivePlayHosts() []string {
 	}
 	res := make([]string, len(e.activePlayHosts))
 	copy(res, e.activePlayHosts)
+	return res
+}
+
+func (e *Executor) getActiveBatchHosts() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.activeBatchHosts) == 0 {
+		return []string{}
+	}
+	res := make([]string, len(e.activeBatchHosts))
+	copy(res, e.activeBatchHosts)
+	return res
+}
+
+func (e *Executor) filterActiveUnfailedHosts(hosts []string) []string {
+	if len(hosts) == 0 {
+		return []string{}
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	res := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		if (e.failedHosts != nil && e.failedHosts[h]) || (e.endedHosts != nil && e.endedHosts[h]) {
+			continue
+		}
+		res = append(res, h)
+	}
 	return res
 }
 

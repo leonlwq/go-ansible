@@ -94,11 +94,24 @@ func (m *CommandModule) Execute(client ssh.Connection, params map[string]interfa
 		}
 	}
 
+	var stdinStr string
+	hasStdin := false
+	if rawStdin, ok := params["stdin"]; ok && rawStdin != nil {
+		hasStdin = true
+		stdinStr = fmt.Sprintf("%v", rawStdin)
+	}
+	stdinAddNewline := GetParamBool(params, "stdin_add_newline", true)
+
+	targetCmd := cmd
 	if chdir != "" {
-		cmd = fmt.Sprintf("cd %s && %s", shellQuote(chdir), cmd)
+		targetCmd = fmt.Sprintf("cd %s && %s", shellQuote(chdir), cmd)
 	}
 
-	return client.Execute(cmd)
+	if hasStdin {
+		targetCmd = buildStdinPipe(stdinStr, stdinAddNewline, targetCmd)
+	}
+
+	return client.Execute(targetCmd)
 }
 
 // ShellModule shell 模块
@@ -156,13 +169,45 @@ func (m *ShellModule) Execute(client ssh.Connection, params map[string]interface
 		}
 	}
 
+	var stdinStr string
+	hasStdin := false
+	if rawStdin, ok := params["stdin"]; ok && rawStdin != nil {
+		hasStdin = true
+		stdinStr = fmt.Sprintf("%v", rawStdin)
+	}
+	stdinAddNewline := GetParamBool(params, "stdin_add_newline", true)
+
 	targetCmd := cmd
 	if chdir != "" {
 		targetCmd = fmt.Sprintf("cd %s && %s", shellQuote(chdir), cmd)
 	}
 
+	if hasStdin {
+		targetCmd = buildStdinPipe(stdinStr, stdinAddNewline, targetCmd)
+	}
+
 	fullCmd := fmt.Sprintf("%s -c %q", executable, targetCmd)
 	return client.Execute(fullCmd)
+}
+
+func buildStdinPipe(stdinStr string, stdinAddNewline bool, targetCmd string) string {
+	lines := strings.Split(stdinStr, "\n")
+	quotedLines := make([]string, 0, len(lines))
+	for _, l := range lines {
+		quotedLines = append(quotedLines, shellQuote(l))
+	}
+
+	if stdinAddNewline {
+		return fmt.Sprintf("printf '%%s\\n' %s | (%s)", strings.Join(quotedLines, " "), targetCmd)
+	}
+
+	if len(quotedLines) == 1 {
+		return fmt.Sprintf("printf '%%s' %s | (%s)", quotedLines[0], targetCmd)
+	}
+
+	firstPart := strings.Join(quotedLines[:len(quotedLines)-1], " ")
+	lastPart := quotedLines[len(quotedLines)-1]
+	return fmt.Sprintf("(printf '%%s\\n' %s; printf '%%s' %s) | (%s)", firstPart, lastPart, targetCmd)
 }
 
 // PingModule ping 模块

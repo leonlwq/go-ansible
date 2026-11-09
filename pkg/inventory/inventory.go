@@ -16,6 +16,7 @@ func (inv *Inventory) EnsureLocalhost() *Host {
 	defer inv.cacheMu.Unlock()
 
 	inv.resolvedVarsCache = nil
+	inv.resolvedVarsRawCache = nil
 	if inv.AllHosts == nil {
 		inv.AllHosts = make(map[string]*Host)
 	}
@@ -98,6 +99,7 @@ func (inv *Inventory) AddHost(host *Host, groupNames ...string) {
 	}
 
 	inv.resolvedVarsCache = nil
+	inv.resolvedVarsRawCache = nil
 }
 
 // AddGroup 线程安全地向 Inventory 添加或更新组，并可关联父组。
@@ -157,6 +159,7 @@ func (inv *Inventory) AddGroup(group *Group, parentNames ...string) {
 	}
 
 	inv.resolvedVarsCache = nil
+	inv.resolvedVarsRawCache = nil
 }
 
 // GetGroup 获取指定名称的组
@@ -182,6 +185,16 @@ func (inv *Inventory) GetGroupsSnapshot() map[string]*Group {
 		snapshot[name] = grp
 	}
 	return snapshot
+}
+
+// HostCount 获取主机总数（极轻量计数，无切片分配与排序）
+func (inv *Inventory) HostCount() int {
+	if inv == nil {
+		return 0
+	}
+	inv.cacheMu.RLock()
+	defer inv.cacheMu.RUnlock()
+	return len(inv.AllHosts)
 }
 
 // GetAllHosts 获取所有主机列表
@@ -539,6 +552,7 @@ func (inv *Inventory) InvalidateResolvedVarsCache() {
 	}
 	inv.cacheMu.Lock()
 	inv.resolvedVarsCache = nil
+	inv.resolvedVarsRawCache = nil
 	inv.cacheMu.Unlock()
 }
 
@@ -584,8 +598,8 @@ func (inv *Inventory) ResolveHostVars(host *Host) map[string]string {
 		if group.Name == "all" {
 			continue
 		}
-		if groupContainsHost(group, host.Name, make(map[string]bool)) {
-			d := getGroupDepth(group, make(map[string]bool))
+		if groupContainsHost(group, host.Name, nil) {
+			d := getGroupDepth(group, nil)
 			matchingGroups = append(matchingGroups, groupDepthItem{group: group, depth: d})
 		}
 	}
@@ -636,6 +650,7 @@ func (inv *Inventory) SetGroupVar(groupName, key string, val interface{}) {
 	}
 	inv.GroupVars[groupName][key] = val
 	inv.resolvedVarsCache = nil
+	inv.resolvedVarsRawCache = nil
 }
 
 // SetHostVar 设置主机的原生复杂类型变量
@@ -650,6 +665,7 @@ func (inv *Inventory) SetHostVar(hostName, key string, val interface{}) {
 	}
 	inv.HostVars[hostName][key] = val
 	inv.resolvedVarsCache = nil
+	inv.resolvedVarsRawCache = nil
 }
 
 // ResolveHostVarsRaw 解析主机的完整结构化原生变量（保留复合数据类型如切片与映射）
@@ -659,7 +675,16 @@ func (inv *Inventory) ResolveHostVarsRaw(host *Host) map[string]interface{} {
 	}
 
 	inv.cacheMu.RLock()
-	defer inv.cacheMu.RUnlock()
+	if inv.resolvedVarsRawCache != nil {
+		if cached, ok := inv.resolvedVarsRawCache[host.Name]; ok {
+			res := make(map[string]interface{}, len(cached))
+			for k, v := range cached {
+				res[k] = v
+			}
+			inv.cacheMu.RUnlock()
+			return res
+		}
+	}
 
 	vars := make(map[string]interface{})
 
@@ -697,8 +722,8 @@ func (inv *Inventory) ResolveHostVarsRaw(host *Host) map[string]interface{} {
 		if group.Name == "all" {
 			continue
 		}
-		if groupContainsHost(group, host.Name, make(map[string]bool)) {
-			d := getGroupDepth(group, make(map[string]bool))
+		if groupContainsHost(group, host.Name, nil) {
+			d := getGroupDepth(group, nil)
 			matchingGroups = append(matchingGroups, groupDepthItem{group: group, depth: d})
 		}
 	}
@@ -734,18 +759,45 @@ func (inv *Inventory) ResolveHostVarsRaw(host *Host) map[string]interface{} {
 			}
 		}
 	}
+	inv.cacheMu.RUnlock()
+
+	inv.cacheMu.Lock()
+	if inv.resolvedVarsRawCache == nil {
+		inv.resolvedVarsRawCache = make(map[string]map[string]interface{})
+	}
+	cachedEntry := make(map[string]interface{}, len(vars))
+	for k, v := range vars {
+		cachedEntry[k] = v
+	}
+	inv.resolvedVarsRawCache[host.Name] = cachedEntry
+	inv.cacheMu.Unlock()
 
 	return vars
 }
 
 // groupContainsHost 判定组及其子组是否包含指定主机（防止环形遍历）
 func groupContainsHost(group *Group, hostName string, visited map[string]bool) bool {
-	if group == nil || visited[group.Name] {
+	if group == nil {
+		return false
+	}
+	// 针对无子组的扁平主机组，直接循环比对，零 map 分配
+	if len(group.Children) == 0 {
+		for _, h := range group.Hosts {
+			if h != nil && h.Name == hostName {
+				return true
+			}
+		}
+		return false
+	}
+
+	if visited == nil {
+		visited = make(map[string]bool, 4)
+	} else if visited[group.Name] {
 		return false
 	}
 	visited[group.Name] = true
 	for _, h := range group.Hosts {
-		if h.Name == hostName {
+		if h != nil && h.Name == hostName {
 			return true
 		}
 	}
@@ -759,13 +811,15 @@ func groupContainsHost(group *Group, hostName string, visited map[string]bool) b
 
 // getGroupDepth 计算组在层级树中的深度（防止环形遍历）
 func getGroupDepth(group *Group, visited map[string]bool) int {
-	if group == nil || visited[group.Name] {
+	if group == nil || group.Parent == nil {
+		return 0
+	}
+	if visited == nil {
+		visited = make(map[string]bool, 4)
+	} else if visited[group.Name] {
 		return 0
 	}
 	visited[group.Name] = true
-	if group.Parent == nil {
-		return 0
-	}
 	return 1 + getGroupDepth(group.Parent, visited)
 }
 

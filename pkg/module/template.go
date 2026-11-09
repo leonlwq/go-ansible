@@ -56,6 +56,14 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 		varsData = make(map[string]interface{})
 	}
 
+	if mode == "preserve" {
+		if pMode := ResolvePreserveFileMode(client, src, false); pMode != "" {
+			mode = pMode
+		} else {
+			mode = ""
+		}
+	}
+
 	// 读取模板文件
 	tmplContent, err := os.ReadFile(src)
 	if err != nil {
@@ -70,7 +78,7 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 	localChecksum := stringChecksum(renderedContent)
 	remoteChecksum := readRemoteChecksum(client, dest)
 	if localChecksum == remoteChecksum && remoteChecksum != "" {
-		permChanged, err := SetFilePermissions(client, dest, mode, owner, group, false)
+		permChanged, err := CheckOrSetFilePermissions(client, dest, mode, owner, group, false, checkMode)
 		if err != nil {
 			return nil, fmt.Errorf("set file permissions: %w", err)
 		}
@@ -79,7 +87,11 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 			Message: "template already rendered with matching content",
 		}
 		if permChanged {
-			result.Message = "file permissions updated"
+			if checkMode {
+				result.Message = "check mode: file permissions would be updated"
+			} else {
+				result.Message = "file permissions updated"
+			}
 		}
 		return result, nil
 	}
@@ -120,7 +132,10 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 
 	// 确保目标目录存在
 	destDir := filepath.Dir(dest)
-	client.Execute(fmt.Sprintf("mkdir -p %s", destDir))
+	client.Execute(fmt.Sprintf("mkdir -p %s", shellQuote(destDir)))
+	if dirMode := GetParamMode(params, "directory_mode", ""); dirMode != "" {
+		client.Execute(fmt.Sprintf("chmod %s %s", shellQuote(dirMode), shellQuote(destDir)))
+	}
 
 	if become || validate != "" {
 		remoteTmp := fmt.Sprintf("/tmp/go-ansible-tmpl-%d-%s", os.Getpid(), filepath.Base(dest))
@@ -129,18 +144,18 @@ func (m *TemplateModule) Execute(client ssh.Connection, params map[string]interf
 		}
 		if validate != "" {
 			if err := executeValidate(client, validate, remoteTmp); err != nil {
-				client.Execute(fmt.Sprintf("rm -f %s", remoteTmp))
+				client.Execute(fmt.Sprintf("rm -f %s", shellQuote(remoteTmp)))
 				return nil, err
 			}
 		}
-		mvCmd := fmt.Sprintf("mv -f %s %s", remoteTmp, dest)
+		mvCmd := fmt.Sprintf("mv -f %s %s", shellQuote(remoteTmp), shellQuote(dest))
 		result, err := client.Execute(mvCmd)
 		if err != nil {
-			client.Execute(fmt.Sprintf("rm -f %s", remoteTmp))
+			client.Execute(fmt.Sprintf("rm -f %s", shellQuote(remoteTmp)))
 			return nil, fmt.Errorf("move template to dest: %w", err)
 		}
 		if result != nil && result.ExitCode != 0 {
-			client.Execute(fmt.Sprintf("rm -f %s", remoteTmp))
+			client.Execute(fmt.Sprintf("rm -f %s", shellQuote(remoteTmp)))
 			return nil, fmt.Errorf("move template failed: %s", strings.TrimSpace(result.Stderr))
 		}
 	} else {

@@ -91,7 +91,7 @@ func NewRegistry() *Registry {
 // SupportsCheckMode 返回指定模块是否支持 check mode (试运行)
 func SupportsCheckMode(moduleName string) bool {
 	switch moduleName {
-	case "file", "copy", "fetch", "lineinfile", "blockinfile", "replace", "template", "user", "group", "apt", "yum", "dnf", "package", "service", "systemd", "cron", "ping", "stat", "get_url", "sysctl", "hostname", "mount", "wait_for", "wait_for_connection", "authorized_key", "pip", "synchronize", "known_hosts", "service_facts", "package_facts", "tempfile", "archive", "unarchive":
+	case "file", "copy", "fetch", "lineinfile", "blockinfile", "replace", "template", "user", "group", "apt", "yum", "dnf", "package", "service", "systemd", "cron", "ping", "stat", "get_url", "sysctl", "hostname", "mount", "wait_for", "wait_for_connection", "authorized_key", "pip", "synchronize", "known_hosts", "service_facts", "package_facts", "tempfile", "archive", "unarchive", "git", "reboot":
 		return true
 	default:
 		return false
@@ -155,6 +155,31 @@ func GetParamString(params map[string]interface{}, key, defaultVal string) strin
 		return fmt.Sprintf("%v", val)
 	}
 	return defaultVal
+}
+
+// GetParamStringAliases 按优先级候选键获取字符串参数（支持 Ansible 规范别名）
+func GetParamStringAliases(params map[string]interface{}, defaultVal string, keys ...string) string {
+	for _, k := range keys {
+		if val, ok := params[k]; ok && val != nil {
+			s := strings.TrimSpace(fmt.Sprintf("%v", val))
+			if s != "" {
+				return s
+			}
+		}
+	}
+	return defaultVal
+}
+
+// HasAnyParam 判断是否包含任一非空参数键
+func HasAnyParam(params map[string]interface{}, keys ...string) bool {
+	for _, k := range keys {
+		if val, ok := params[k]; ok && val != nil {
+			if s := strings.TrimSpace(fmt.Sprintf("%v", val)); s != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // GetParamMode 获取文件权限参数，数值类型按八进制权限位解释

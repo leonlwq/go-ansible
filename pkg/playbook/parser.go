@@ -60,6 +60,22 @@ func (p *Parser) Parse(data []byte) (*Playbook, error) {
 
 // ParseRole 解析 role 目录
 func (p *Parser) ParseRole(rolePath string) (*Role, error) {
+	return p.ParseRoleWithOptions(rolePath, "main", "main", "main", "main")
+}
+
+func resolveRoleSubCandidates(rolePath, subDir, entry string) []string {
+	if entry == "" {
+		entry = "main"
+	}
+	base := filepath.Join(rolePath, subDir, entry)
+	if filepath.Ext(entry) != "" {
+		return []string{base, base + ".yml", base + ".yaml"}
+	}
+	return []string{base + ".yml", base + ".yaml", base}
+}
+
+// ParseRoleWithOptions 按指定入口文件名 (tasks_from / vars_from / defaults_from / handlers_from) 解析 role 目录
+func (p *Parser) ParseRoleWithOptions(rolePath, tasksFrom, varsFrom, defaultsFrom, handlersFrom string) (*Role, error) {
 	role := &Role{
 		Tasks:    make([]*Task, 0),
 		Handlers: make([]*Handler, 0),
@@ -69,66 +85,88 @@ func (p *Parser) ParseRole(rolePath string) (*Role, error) {
 
 	role.Name = filepath.Base(rolePath)
 
-	// 解析 tasks/main.yml
-	tasksPath := filepath.Join(rolePath, "tasks", "main.yml")
-	if _, err := os.Stat(tasksPath); err == nil {
-		data, err := os.ReadFile(tasksPath)
-		if err == nil {
-			var rawTasks []interface{}
-			if err := yaml.Unmarshal(data, &rawTasks); err == nil {
-				for _, t := range rawTasks {
-					if taskMap, ok := t.(map[string]interface{}); ok {
-						task, err := normalizeTask(taskMap)
-						if err == nil {
-							role.Tasks = append(role.Tasks, task)
+	// 解析 tasks/<tasksFrom>.yml|.yaml
+	tasksFound := false
+	for _, tasksPath := range resolveRoleSubCandidates(rolePath, "tasks", tasksFrom) {
+		if _, err := os.Stat(tasksPath); err == nil {
+			tasksFound = true
+			data, err := os.ReadFile(tasksPath)
+			if err == nil {
+				var rawTasks []interface{}
+				if err := yaml.Unmarshal(data, &rawTasks); err == nil {
+					for _, t := range rawTasks {
+						if taskMap, ok := t.(map[string]interface{}); ok {
+							task, err := normalizeTask(taskMap)
+							if err == nil {
+								role.Tasks = append(role.Tasks, task)
+							}
 						}
 					}
 				}
 			}
+			break
 		}
 	}
+	if !tasksFound && tasksFrom != "" && tasksFrom != "main" {
+		return nil, fmt.Errorf("role %q tasks file %q not found", role.Name, tasksFrom)
+	}
 
-	// 解析 handlers/main.yml
-	handlersPath := filepath.Join(rolePath, "handlers", "main.yml")
-	if _, err := os.Stat(handlersPath); err == nil {
-		data, err := os.ReadFile(handlersPath)
-		if err == nil {
-			var rawHandlers []interface{}
-			if err := yaml.Unmarshal(data, &rawHandlers); err == nil {
-				for _, h := range rawHandlers {
-					if handlerMap, ok := h.(map[string]interface{}); ok {
-						handler, err := normalizeHandler(handlerMap)
-						if err == nil {
-							role.Handlers = append(role.Handlers, handler)
+	// 解析 handlers/<handlersFrom>.yml|.yaml
+	handlersFound := false
+	for _, handlersPath := range resolveRoleSubCandidates(rolePath, "handlers", handlersFrom) {
+		if _, err := os.Stat(handlersPath); err == nil {
+			handlersFound = true
+			data, err := os.ReadFile(handlersPath)
+			if err == nil {
+				var rawHandlers []interface{}
+				if err := yaml.Unmarshal(data, &rawHandlers); err == nil {
+					for _, h := range rawHandlers {
+						if handlerMap, ok := h.(map[string]interface{}); ok {
+							handler, err := normalizeHandler(handlerMap)
+							if err == nil {
+								role.Handlers = append(role.Handlers, handler)
+							}
 						}
 					}
 				}
 			}
+			break
 		}
 	}
+	if !handlersFound && handlersFrom != "" && handlersFrom != "main" {
+		return nil, fmt.Errorf("role %q handlers file %q not found", role.Name, handlersFrom)
+	}
 
-	// 解析 vars/main.yml
-	varsPath := filepath.Join(rolePath, "vars", "main.yml")
-	if _, err := os.Stat(varsPath); err == nil {
-		data, err := os.ReadFile(varsPath)
-		if err == nil {
-			yaml.Unmarshal(data, &role.Vars)
+	// 解析 vars/<varsFrom>.yml|.yaml
+	varsFound := false
+	for _, varsPath := range resolveRoleSubCandidates(rolePath, "vars", varsFrom) {
+		if _, err := os.Stat(varsPath); err == nil {
+			varsFound = true
+			data, err := os.ReadFile(varsPath)
+			if err == nil {
+				yaml.Unmarshal(data, &role.Vars)
+			}
+			break
 		}
 	}
-
-	// 解析 defaults/main.yml 或 defaults/main.yaml
-	defaultsFiles := []string{
-		filepath.Join(rolePath, "defaults", "main.yml"),
-		filepath.Join(rolePath, "defaults", "main.yaml"),
+	if !varsFound && varsFrom != "" && varsFrom != "main" {
+		return nil, fmt.Errorf("role %q vars file %q not found", role.Name, varsFrom)
 	}
-	for _, defaultsPath := range defaultsFiles {
+
+	// 解析 defaults/<defaultsFrom>.yml|.yaml
+	defaultsFound := false
+	for _, defaultsPath := range resolveRoleSubCandidates(rolePath, "defaults", defaultsFrom) {
 		if _, err := os.Stat(defaultsPath); err == nil {
+			defaultsFound = true
 			data, err := os.ReadFile(defaultsPath)
 			if err == nil {
 				yaml.Unmarshal(data, &role.Defaults)
 			}
 			break
 		}
+	}
+	if !defaultsFound && defaultsFrom != "" && defaultsFrom != "main" {
+		return nil, fmt.Errorf("role %q defaults file %q not found", role.Name, defaultsFrom)
 	}
 
 	// 解析 meta/main.yml 或 meta/main.yaml (角色依赖)

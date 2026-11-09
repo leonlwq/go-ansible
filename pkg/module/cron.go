@@ -16,10 +16,14 @@ func (m *CronModule) Name() string { return "cron" }
 
 func (m *CronModule) Validate(params map[string]interface{}) error {
 	state := GetParamString(params, "state", "present")
-	if state != "absent" {
+	isEnv := GetParamBool(params, "env", false)
+	if state != "absent" && !isEnv {
 		if strings.TrimSpace(GetParamString(params, "job", "")) == "" {
 			return fmt.Errorf("cron module requires job")
 		}
+	}
+	if isEnv && strings.TrimSpace(GetParamString(params, "name", "")) == "" {
+		return fmt.Errorf("cron module requires name when env is set")
 	}
 	specialTime := strings.TrimPrefix(strings.TrimSpace(GetParamString(params, "special_time", "")), "@")
 	if specialTime != "" {
@@ -49,6 +53,7 @@ func (m *CronModule) Execute(client ssh.Connection, params map[string]interface{
 	disabled := GetParamBool(params, "disabled", false)
 	cronFile := GetParamString(params, "cron_file", "")
 	backup := GetParamBool(params, "backup", false)
+	isEnv := GetParamBool(params, "env", false)
 
 	var filePath string
 	if cronFile != "" {
@@ -76,7 +81,14 @@ func (m *CronModule) Execute(client ssh.Connection, params map[string]interface{
 
 	// 构造待写入的 job line (cron_file 需要包含 user 列)
 	var jobLine string
-	if cronFile != "" {
+	if isEnv {
+		val := GetParamString(params, "value", job)
+		if val != "" && !strings.HasPrefix(val, "\"") && strings.ContainsAny(val, " \t") {
+			jobLine = fmt.Sprintf("%s=%q", name, val)
+		} else {
+			jobLine = fmt.Sprintf("%s=%s", name, val)
+		}
+	} else if cronFile != "" {
 		if specialTime != "" {
 			specialTime = strings.TrimPrefix(strings.TrimSpace(specialTime), "@")
 			jobLine = fmt.Sprintf("@%s %s %s", specialTime, user, job)
@@ -226,6 +238,10 @@ func updateCrontabContent(existing, name, job, jobLine, state string, disabled b
 			}
 			if isCronCommentFor(line, name) {
 				skipNext = true
+				changed = true
+				continue
+			}
+			if name != "" && strings.HasPrefix(strings.TrimSpace(line), name+"=") {
 				changed = true
 				continue
 			}

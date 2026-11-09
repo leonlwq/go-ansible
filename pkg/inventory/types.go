@@ -38,9 +38,10 @@ type Inventory struct {
 	GroupVars         map[string]map[string]interface{} `yaml:"-" json:"-"`
 	HostVars          map[string]map[string]interface{} `yaml:"-" json:"-"`
 	Vars              map[string]interface{}            `yaml:"-" json:"-"`
-	FilePath          string                            `yaml:"-" json:"-"`
-	resolvedVarsCache map[string]map[string]string      `yaml:"-" json:"-"`
-	cacheMu           sync.RWMutex                      `yaml:"-" json:"-"`
+	FilePath             string                            `yaml:"-" json:"-"`
+	resolvedVarsCache    map[string]map[string]string      `yaml:"-" json:"-"`
+	resolvedVarsRawCache map[string]map[string]interface{} `yaml:"-" json:"-"`
+	cacheMu              sync.RWMutex                      `yaml:"-" json:"-"`
 }
 
 // NewInventory 创建新的主机清单

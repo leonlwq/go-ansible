@@ -13,17 +13,17 @@ type ServiceModule struct{}
 func (m *ServiceModule) Name() string { return "service" }
 
 func (m *ServiceModule) Validate(params map[string]interface{}) error {
-	if _, ok := params["name"]; !ok {
-		return fmt.Errorf("service module requires name")
+	if !HasAnyParam(params, "name", "service") {
+		return fmt.Errorf("service module requires name or service")
 	}
 	return nil
 }
 
 func (m *ServiceModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
-	name := GetParamString(params, "name", "")
+	name := GetParamStringAliases(params, "", "name", "service")
 	state := GetParamString(params, "state", "")
-	enabled, hasEnabled := getOptionalBoolParam(params, "enabled")
-	masked, hasMasked := getOptionalBoolParam(params, "masked")
+	enabled, hasEnabled := GetOptionalBoolParam(params, "enabled")
+	masked, hasMasked := GetOptionalBoolParam(params, "masked")
 	if state == "masked" {
 		masked = true
 		hasMasked = true
@@ -111,7 +111,7 @@ func (m *ServiceModule) Execute(client ssh.Connection, params map[string]interfa
 		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
 			stepResult.Stderr = cleaned
 		}
-		result = mergeModuleResults(result, stepResult, changed)
+		result = MergeModuleResults(result, stepResult, changed)
 	}
 
 	// Ansible 官方规范：当 enabled 与 state 同时存在时，必须先评估/设置 enabled，再执行 state 变更
@@ -129,7 +129,7 @@ func (m *ServiceModule) Execute(client ssh.Connection, params map[string]interfa
 		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
 			stepResult.Stderr = cleaned
 		}
-		result = mergeModuleResults(result, stepResult, changed)
+		result = MergeModuleResults(result, stepResult, changed)
 	}
 
 	if state != "" {
@@ -149,7 +149,7 @@ func (m *ServiceModule) Execute(client ssh.Connection, params map[string]interfa
 		if cleaned, _, hasMarker := parseChangedMarker(stepResult.Stderr); hasMarker {
 			stepResult.Stderr = cleaned
 		}
-		result = mergeModuleResults(result, stepResult, changed)
+		result = MergeModuleResults(result, stepResult, changed)
 	}
 
 	if state == "" && !hasEnabled && !hasMasked {

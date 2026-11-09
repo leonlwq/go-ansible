@@ -29,36 +29,6 @@ type getURLSpec struct {
 	TmpDest       string
 }
 
-func parseHeadersParam(params map[string]interface{}) map[string]string {
-	val, ok := params["headers"]
-	if !ok || val == nil {
-		return nil
-	}
-	result := make(map[string]string)
-	switch v := val.(type) {
-	case map[string]interface{}:
-		for k, item := range v {
-			result[k] = fmt.Sprintf("%v", item)
-		}
-	case map[string]string:
-		for k, item := range v {
-			result[k] = item
-		}
-	case string:
-		lines := strings.Split(v, "\n")
-		for _, line := range lines {
-			if idx := strings.Index(line, ":"); idx != -1 {
-				k := strings.TrimSpace(line[:idx])
-				val := strings.TrimSpace(line[idx+1:])
-				if k != "" {
-					result[k] = val
-				}
-			}
-		}
-	}
-	return result
-}
-
 func (m *GetURLModule) Name() string { return "get_url" }
 
 func (m *GetURLModule) Validate(params map[string]interface{}) error {
@@ -107,7 +77,7 @@ func (m *GetURLModule) Execute(client ssh.Connection, params map[string]interfac
 		ValidateCerts: getOptionalBool(params, "validate_certs", true),
 		URLUsername:   GetParamString(params, "url_username", GetParamString(params, "username", "")),
 		URLPassword:   GetParamString(params, "url_password", GetParamString(params, "password", "")),
-		Headers:       parseHeadersParam(params),
+		Headers:       ParseHeadersParam(params["headers"]),
 		TmpDest:       GetParamString(params, "tmp_dest", "/tmp"),
 	}
 

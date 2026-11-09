@@ -15,8 +15,8 @@ type UserModule struct{}
 func (m *UserModule) Name() string { return "user" }
 
 func (m *UserModule) Validate(params map[string]interface{}) error {
-	if _, ok := params["name"]; !ok {
-		return fmt.Errorf("user module requires name")
+	if !HasAnyParam(params, "name", "user") {
+		return fmt.Errorf("user module requires name or user")
 	}
 	return nil
 }
@@ -50,7 +50,7 @@ func parseGroupsParam(params map[string]interface{}) string {
 }
 
 func (m *UserModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
-	name := GetParamString(params, "name", "")
+	name := GetParamStringAliases(params, "", "name", "user")
 	state := GetParamString(params, "state", "present")
 	system := GetParamBool(params, "system", false)
 	createHome := GetParamBool(params, "create_home", true)
@@ -307,14 +307,14 @@ type GroupModule struct{}
 func (m *GroupModule) Name() string { return "group" }
 
 func (m *GroupModule) Validate(params map[string]interface{}) error {
-	if _, ok := params["name"]; !ok {
-		return fmt.Errorf("group module requires name")
+	if !HasAnyParam(params, "name", "group") {
+		return fmt.Errorf("group module requires name or group")
 	}
 	return nil
 }
 
 func (m *GroupModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
-	name := GetParamString(params, "name", "")
+	name := GetParamStringAliases(params, "", "name", "group")
 	state := GetParamString(params, "state", "present")
 	system := GetParamBool(params, "system", false)
 	gid := GetParamString(params, "gid", "")

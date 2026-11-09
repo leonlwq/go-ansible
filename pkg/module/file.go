@@ -15,19 +15,14 @@ type FileModule struct{}
 func (m *FileModule) Name() string { return "file" }
 
 func (m *FileModule) Validate(params map[string]interface{}) error {
-	if _, ok := params["path"]; !ok {
-		if _, ok := params["dest"]; !ok {
-			return fmt.Errorf("file module requires path or dest")
-		}
+	if !HasAnyParam(params, "path", "dest", "name") {
+		return fmt.Errorf("file module requires path, dest or name")
 	}
 	return nil
 }
 
 func (m *FileModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
-	path := GetParamString(params, "path", "")
-	if path == "" {
-		path = GetParamString(params, "dest", "")
-	}
+	path := GetParamStringAliases(params, "", "path", "dest", "name")
 
 	state := GetParamString(params, "state", "file")
 	mode := GetParamMode(params, "mode", "")
@@ -37,7 +32,7 @@ func (m *FileModule) Execute(client ssh.Connection, params map[string]interface{
 	recurse := GetParamBool(params, "recurse", false)
 	backup := GetParamBool(params, "backup", false)
 	force := GetParamBool(params, "force", false)
-	checkMode := GetParamBool(params, "__check_mode", false)
+	checkMode := IsCheckMode(params)
 	mtime := GetParamString(params, "modification_time", "")
 	atime := GetParamString(params, "access_time", "")
 	cmd, err := buildFileStateCommandWithTimes(state, path, src, backup, force, mtime, atime, checkMode)
@@ -55,7 +50,15 @@ func (m *FileModule) Execute(client ssh.Connection, params map[string]interface{
 		stateChanged = true
 	}
 	if checkMode {
-		result.Changed = stateChanged || mode != "" || owner != "" || group != ""
+		permChanged := false
+		if state != "absent" && (mode != "" || owner != "" || group != "") {
+			if stateChanged {
+				permChanged = true
+			} else {
+				permChanged, _ = CheckOrSetFilePermissions(client, path, mode, owner, group, recurse, true)
+			}
+		}
+		result.Changed = stateChanged || permChanged
 		if result.Changed {
 			result.Message = "check mode: file state would change"
 		} else {
@@ -199,19 +202,24 @@ type StatModule struct{}
 func (m *StatModule) Name() string { return "stat" }
 
 func (m *StatModule) Validate(params map[string]interface{}) error {
-	if _, ok := params["path"]; !ok {
-		return fmt.Errorf("stat module requires path")
+	if !HasAnyParam(params, "path", "dest", "name") {
+		return fmt.Errorf("stat module requires path, dest or name")
 	}
 	return nil
 }
 
 func (m *StatModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
-	path := GetParamString(params, "path", "")
-	getChecksum := GetParamBool(params, "get_checksum", false)
+	path := GetParamStringAliases(params, "", "path", "dest", "name")
+	getChecksum := GetParamBool(params, "get_checksum", true)
 	getMd5 := GetParamBool(params, "get_md5", false)
+	checksumAlgo := strings.ToLower(strings.TrimSpace(GetParamString(params, "checksum_algorithm", GetParamString(params, "checksum_algo", "sha1"))))
+	if checksumAlgo == "" {
+		checksumAlgo = "sha1"
+	}
 
+	quotedPath := shellQuote(path)
 	script := fmt.Sprintf(`
-		P=%q
+		P=%s
 		if [ -e "$P" ] || [ -L "$P" ]; then
 			echo "exists: true"
 			echo "stat:"
@@ -230,18 +238,27 @@ func (m *StatModule) Execute(client ssh.Connection, params map[string]interface{
 				echo "  isfile: false"
 			fi
 			echo "  mode: $(stat -c%%a "$P" 2>/dev/null || stat -f%%Lp "$P" 2>/dev/null)"
+			echo "  atime: $(stat -c%%X "$P" 2>/dev/null || stat -f%%a "$P" 2>/dev/null)"
 			echo "  mtime: $(stat -c%%Y "$P" 2>/dev/null || stat -f%%m "$P" 2>/dev/null)"
+			echo "  ctime: $(stat -c%%Z "$P" 2>/dev/null || stat -f%%c "$P" 2>/dev/null)"
+			echo "  uid: $(stat -c%%u "$P" 2>/dev/null || stat -f%%u "$P" 2>/dev/null)"
+			echo "  gid: $(stat -c%%g "$P" 2>/dev/null || stat -f%%g "$P" 2>/dev/null)"
+			echo "  pw_name: $(stat -c%%U "$P" 2>/dev/null || stat -f%%Su "$P" 2>/dev/null)"
+			echo "  gr_name: $(stat -c%%G "$P" 2>/dev/null || stat -f%%Sg "$P" 2>/dev/null)"
+			if [ -r "$P" ]; then echo "  readable: true"; else echo "  readable: false"; fi
+			if [ -w "$P" ]; then echo "  writable: true"; else echo "  writable: false"; fi
+			if [ -x "$P" ]; then echo "  executable: true"; else echo "  executable: false"; fi
 		else
 			echo "exists: false"
 		fi
-	`, path)
+	`, quotedPath)
 
 	if getChecksum {
-		script += fmt.Sprintf("if [ -f %q ]; then echo \"  checksum: $(sha256sum %q 2>/dev/null | cut -d' ' -f1 || shasum -a 256 %q 2>/dev/null | cut -d' ' -f1)\"; fi\n", path, path, path)
+		script += fmt.Sprintf("if [ -f %s ]; then echo \"  checksum: $(%s)\"; fi\n", quotedPath, checksumCommandForAlgo(quotedPath, checksumAlgo))
 	}
 
 	if getMd5 {
-		script += fmt.Sprintf("if [ -f %q ]; then echo \"  md5: $(md5sum %q 2>/dev/null | cut -d' ' -f1 || md5 -q %q 2>/dev/null)\"; fi\n", path, path, path)
+		script += fmt.Sprintf("if [ -f %s ]; then echo \"  md5: $(%s)\"; fi\n", quotedPath, checksumCommandForAlgo(quotedPath, "md5"))
 	}
 
 	result, err := client.Execute(script)
@@ -272,15 +289,23 @@ func parseStatOutput(output, path string) map[string]interface{} {
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
 		switch key {
-		case "exists", "isdir", "isfile", "islnk":
+		case "exists", "isdir", "isfile", "islnk", "readable", "executable":
 			stat[key] = value == "true"
+		case "writable", "writeable":
+			b := value == "true"
+			stat["writable"] = b
+			stat["writeable"] = b
 		case "size":
 			if size, err := strconv.ParseInt(value, 10, 64); err == nil {
 				stat[key] = size
 			}
-		case "mtime":
-			if mtime, err := strconv.ParseFloat(value, 64); err == nil {
-				stat[key] = mtime
+		case "uid", "gid":
+			if idVal, err := strconv.Atoi(value); err == nil {
+				stat[key] = idVal
+			}
+		case "mtime", "atime", "ctime":
+			if tVal, err := strconv.ParseFloat(value, 64); err == nil {
+				stat[key] = tVal
 			}
 		default:
 			if value != "" {

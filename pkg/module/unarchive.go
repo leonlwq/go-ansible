@@ -20,6 +20,7 @@ type unarchiveSpec struct {
 	Group     string
 	Mode      string
 	ExtraOpts []string
+	Exclude   []string
 }
 
 func (m *UnarchiveModule) Name() string { return "unarchive" }
@@ -52,6 +53,34 @@ func (m *UnarchiveModule) Execute(client ssh.Connection, params map[string]inter
 		}
 	}
 
+	var excludes []string
+	rawExclude, hasExclude := params["exclude"]
+	if !hasExclude {
+		rawExclude = params["excludes"]
+	}
+	if rawExclude != nil {
+		switch v := rawExclude.(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				parts := strings.Split(v, ",")
+				for _, p := range parts {
+					if s := strings.TrimSpace(p); s != "" {
+						excludes = append(excludes, s)
+					}
+				}
+			}
+		case []string:
+			excludes = v
+		case []interface{}:
+			for _, it := range v {
+				s := strings.TrimSpace(fmt.Sprintf("%v", it))
+				if s != "" {
+					excludes = append(excludes, s)
+				}
+			}
+		}
+	}
+
 	spec := unarchiveSpec{
 		Src:       GetParamString(params, "src", ""),
 		Dest:      GetParamString(params, "dest", ""),
@@ -61,6 +90,7 @@ func (m *UnarchiveModule) Execute(client ssh.Connection, params map[string]inter
 		Group:     GetParamString(params, "group", ""),
 		Mode:      GetParamMode(params, "mode", ""),
 		ExtraOpts: extraOpts,
+		Exclude:   excludes,
 	}
 
 	// 1. 远端 creates 预检：无论是 check 模式还是正常执行，若远端已存在 creates 指定目标，
@@ -109,6 +139,7 @@ func (m *UnarchiveModule) Execute(client ssh.Connection, params map[string]inter
 		RemoteSrc: true,
 		Creates:   spec.Creates,
 		ExtraOpts: spec.ExtraOpts,
+		Exclude:   spec.Exclude,
 	})
 	if err != nil {
 		return nil, err
@@ -135,7 +166,7 @@ func buildUnarchiveCommand(spec unarchiveSpec) (string, error) {
 		return "", fmt.Errorf("unarchive module requires dest")
 	}
 
-	extractCmd, err := archiveExtractCommand(spec.Src, spec.Dest, spec.ExtraOpts)
+	extractCmd, err := archiveExtractCommandWithExclude(spec.Src, spec.Dest, spec.ExtraOpts, spec.Exclude)
 	if err != nil {
 		return "", err
 	}
@@ -158,12 +189,16 @@ func buildUnarchiveCommand(spec unarchiveSpec) (string, error) {
 }
 
 func archiveExtractCommand(src, dest string, extraOpts ...[]string) (string, error) {
-	quotedSrc := shellQuote(src)
-	quotedDest := shellQuote(dest)
 	var opts []string
 	if len(extraOpts) > 0 && len(extraOpts[0]) > 0 {
 		opts = extraOpts[0]
 	}
+	return archiveExtractCommandWithExclude(src, dest, opts, nil)
+}
+
+func archiveExtractCommandWithExclude(src, dest string, opts []string, excludes []string) (string, error) {
+	quotedSrc := shellQuote(src)
+	quotedDest := shellQuote(dest)
 	extra := ""
 	if len(opts) > 0 {
 		extra = " " + strings.Join(opts, " ")
@@ -171,14 +206,29 @@ func archiveExtractCommand(src, dest string, extraOpts ...[]string) (string, err
 
 	switch {
 	case strings.HasSuffix(src, ".tar.gz"), strings.HasSuffix(src, ".tgz"):
+		for _, exc := range excludes {
+			extra += " --exclude=" + shellQuote(exc)
+		}
 		return fmt.Sprintf("tar -xzf %s -C %s%s", quotedSrc, quotedDest, extra), nil
 	case strings.HasSuffix(src, ".tar.bz2"), strings.HasSuffix(src, ".tbz2"):
+		for _, exc := range excludes {
+			extra += " --exclude=" + shellQuote(exc)
+		}
 		return fmt.Sprintf("tar -xjf %s -C %s%s", quotedSrc, quotedDest, extra), nil
 	case strings.HasSuffix(src, ".tar.xz"), strings.HasSuffix(src, ".txz"):
+		for _, exc := range excludes {
+			extra += " --exclude=" + shellQuote(exc)
+		}
 		return fmt.Sprintf("tar -xJf %s -C %s%s", quotedSrc, quotedDest, extra), nil
 	case strings.HasSuffix(src, ".tar"):
+		for _, exc := range excludes {
+			extra += " --exclude=" + shellQuote(exc)
+		}
 		return fmt.Sprintf("tar -xf %s -C %s%s", quotedSrc, quotedDest, extra), nil
 	case strings.HasSuffix(src, ".zip"):
+		for _, exc := range excludes {
+			extra += " -x " + shellQuote(exc)
+		}
 		return fmt.Sprintf("unzip -o %s -d %s%s", quotedSrc, quotedDest, extra), nil
 	default:
 		return "", fmt.Errorf("unsupported archive format: %s", src)

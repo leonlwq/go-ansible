@@ -14,6 +14,15 @@ func (e *Executor) getTaskThrottleSem(task *Task) chan struct{} {
 		return nil
 	}
 	key := fmt.Sprintf("%p_%d", task, task.Throttle)
+	e.throttleMu.RLock()
+	if e.throttleSems != nil {
+		if sem, ok := e.throttleSems[key]; ok {
+			e.throttleMu.RUnlock()
+			return sem
+		}
+	}
+	e.throttleMu.RUnlock()
+
 	e.throttleMu.Lock()
 	defer e.throttleMu.Unlock()
 	if e.throttleSems == nil {
@@ -131,6 +140,7 @@ func (e *Executor) executeTaskForBatchHosts(allHosts []*inventory.Host, activeHo
 			before := hostResult.TaskCount()
 			hostVars := e.taskVarsForHost(host, playVars)
 			if err := e.executeTaskEntryForHost(allHosts, host, task, hostVars, handlers, runOnce, playEnv, hostResult); err != nil {
+				e.markHostFailed(host.Name)
 				return err
 			}
 			if hostResultHasFailure(hostResult, before) {
@@ -165,6 +175,7 @@ func (e *Executor) executeTaskForBatchHosts(allHosts []*inventory.Host, activeHo
 			hostVars := e.taskVarsForHost(h, playVars)
 
 			if err := e.executeTaskEntryForHost(allHosts, h, task, hostVars, handlers, runOnce, playEnv, hostResult); err != nil {
+				e.markHostFailed(h.Name)
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -211,6 +222,7 @@ func (e *Executor) executeTasksFreeStrategy(allHosts []*inventory.Host, batchHos
 				before := hostResult.TaskCount()
 				hostVars := e.taskVarsForHost(host, playVars)
 				if err := e.executeTaskEntryForHost(allHosts, host, task, hostVars, handlers, runOnce, playEnv, hostResult); err != nil {
+					e.markHostFailed(host.Name)
 					return err
 				}
 				if hostResultHasFailure(hostResult, before) {
@@ -272,6 +284,7 @@ func (e *Executor) executeTasksFreeStrategy(allHosts []*inventory.Host, batchHos
 					before := hostResult.TaskCount()
 					hostVars := e.taskVarsForHost(h, playVars)
 					if err := e.executeTaskEntryForHost(allHosts, h, task, hostVars, handlers, runOnce, playEnv, hostResult); err != nil {
+						e.markHostFailed(h.Name)
 						return err
 					}
 					if hostResultHasFailure(hostResult, before) {

@@ -556,6 +556,15 @@ func ApplyFilter(segment string, value interface{}) (interface{}, bool, error) {
 			return TemplateUrlsplit(value), true, nil
 		}
 		return TemplateUrlsplit(ParseFilterLiteral(args[0]), value), true, nil
+	case "version", "version_compare":
+		var target, op string
+		if len(args) > 0 {
+			target = fmt.Sprintf("%v", ParseFilterLiteral(args[0]))
+		}
+		if len(args) > 1 {
+			op = fmt.Sprintf("%v", ParseFilterLiteral(args[1]))
+		}
+		return util.CompareVersions(fmt.Sprintf("%v", value), target, op), true, nil
 	default:
 		return nil, false, nil
 	}

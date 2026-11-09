@@ -262,12 +262,17 @@ func (e *Executor) executeAddHostModule(params map[string]interface{}, vars map[
 		groupNames = append(groupNames, parseGroupList(gVal, e, vars)...)
 	}
 
-	resolvedVars := make(map[string]string)
+	resolvedVars := make(map[string]interface{})
 	for k, v := range params {
 		if k == "name" || k == "hostname" || k == "groups" || k == "group" {
 			continue
 		}
-		resolvedVars[k] = e.resolveString(fmt.Sprintf("%v", v), vars)
+		switch s := v.(type) {
+		case string:
+			resolvedVars[k] = e.resolveString(s, vars)
+		default:
+			resolvedVars[k] = e.resolveValue(v, vars)
+		}
 	}
 
 	e.mu.Lock()
@@ -278,30 +283,17 @@ func (e *Executor) executeAddHostModule(params map[string]interface{}, vars map[
 		e.facts[hostName] = make(map[string]interface{})
 	}
 
-	for k, valStr := range resolvedVars {
-		host.Variables[k] = valStr
-		e.facts[hostName][k] = valStr
-
-		switch k {
-		case "ansible_host":
-			host.Address = valStr
-		case "ansible_port":
-			if p, err := strconv.Atoi(valStr); err == nil {
-				host.Port = p
-			}
-		case "ansible_user":
-			host.User = valStr
-		case "ansible_ssh_pass", "ansible_password":
-			host.Password = valStr
-		case "ansible_ssh_private_key_file":
-			host.PrivateKey = valStr
-		case "ansible_connection":
-			host.Variables["ansible_connection"] = valStr
-		}
+	for k, resolvedVal := range resolvedVars {
+		valStr := fmt.Sprintf("%v", resolvedVal)
+		inventory.ApplyHostVariable(host, k, valStr)
+		e.facts[hostName][k] = resolvedVal
 	}
 	e.mu.Unlock()
 
 	inv.AddHost(host, groupNames...)
+	for k, resolvedVal := range resolvedVars {
+		inv.SetHostVar(hostName, k, resolvedVal)
+	}
 
 	e.invalidateGroupsCache()
 	e.invalidateHostVarsCache()
@@ -555,6 +547,11 @@ func (e *Executor) executeIncludeVarsModule(host *inventory.Host, params map[str
 
 	name := GetString(params, "name", "")
 	ignoreUnknown := util.ToBool(params["ignore_unknown_extensions"])
+	depth := extractInt(params["depth"])
+	filesMatching := strings.TrimSpace(GetString(params, "files_matching", ""))
+	ignoreFiles := extractStringList(params["ignore_files"])
+	extensions := extractStringList(params["extensions"])
+
 	loaded := make(map[string]interface{})
 	files := []string{}
 
@@ -570,7 +567,13 @@ func (e *Executor) executeIncludeVarsModule(host *inventory.Host, params map[str
 
 	if dir != "" {
 		resolvedDir := e.resolvePath(dir)
-		dirFiles, err := includeVarsDirFiles(resolvedDir, ignoreUnknown)
+		dirFiles, err := includeVarsDirFilesWithOpts(resolvedDir, includeVarsDirOptions{
+			IgnoreUnknown: ignoreUnknown,
+			Depth:         depth,
+			FilesMatching: filesMatching,
+			IgnoreFiles:   ignoreFiles,
+			Extensions:    extensions,
+		})
 		if err != nil {
 			return nil, true, err
 		}
@@ -584,47 +587,121 @@ func (e *Executor) executeIncludeVarsModule(host *inventory.Host, params map[str
 		}
 	}
 
-	e.mu.Lock()
-	if e.facts[host.Name] == nil {
-		e.facts[host.Name] = make(map[string]interface{})
-	}
+	var factsToMerge map[string]interface{}
 	if name != "" {
-		e.facts[host.Name][name] = loaded
-	} else {
-		for key, value := range loaded {
-			e.facts[host.Name][key] = value
+		factsToMerge = map[string]interface{}{
+			name: loaded,
 		}
+	} else {
+		factsToMerge = loaded
 	}
-	e.mu.Unlock()
-	e.invalidateHostVarsCache(host.Name)
+	e.mergeAnsibleFacts(host.Name, factsToMerge)
 
 	return &module.Result{
 		Changed: false,
 		Message: fmt.Sprintf("included %d vars file(s)", len(files)),
 		Stdout:  strings.Join(files, "\n"),
+		Data: map[string]interface{}{
+			"ansible_facts":              factsToMerge,
+			"ansible_included_var_files": files,
+		},
 	}, true, nil
 }
 
+type includeVarsDirOptions struct {
+	IgnoreUnknown bool
+	Depth         int
+	FilesMatching string
+	IgnoreFiles   []string
+	Extensions    []string
+}
+
 func includeVarsDirFiles(dir string, ignoreUnknown bool) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
+	return includeVarsDirFilesWithOpts(dir, includeVarsDirOptions{
+		IgnoreUnknown: ignoreUnknown,
+		Depth:         1,
+	})
+}
+
+func includeVarsDirFilesWithOpts(dir string, opts includeVarsDirOptions) ([]string, error) {
+	validExts := map[string]bool{
+		".yml":  true,
+		".yaml": true,
+		".json": true,
+	}
+	if len(opts.Extensions) > 0 {
+		validExts = make(map[string]bool, len(opts.Extensions))
+		for _, ext := range opts.Extensions {
+			ext = strings.ToLower(strings.TrimSpace(ext))
+			if ext != "" && !strings.HasPrefix(ext, ".") {
+				ext = "." + ext
+			}
+			validExts[ext] = true
+		}
 	}
 
-	files := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+	var files []string
+	var walkDir func(currentDir string, currentDepth int) error
+	walkDir = func(currentDir string, currentDepth int) error {
+		entries, err := os.ReadDir(currentDir)
+		if err != nil {
+			return err
 		}
-		ext := strings.ToLower(filepath.Ext(entry.Name()))
-		switch ext {
-		case ".yml", ".yaml", ".json":
-			files = append(files, filepath.Join(dir, entry.Name()))
-		default:
-			if !ignoreUnknown {
-				return nil, fmt.Errorf("unsupported vars file extension: %s", entry.Name())
+		for _, entry := range entries {
+			entryName := entry.Name()
+			fullPath := filepath.Join(currentDir, entryName)
+			if entry.IsDir() {
+				if opts.Depth <= 0 || currentDepth < opts.Depth {
+					if err := walkDir(fullPath, currentDepth+1); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+
+			// 检查 ignore_files
+			ignored := false
+			for _, ig := range opts.IgnoreFiles {
+				ig = strings.TrimSpace(ig)
+				if ig == "" {
+					continue
+				}
+				if matched, _ := filepath.Match(ig, entryName); matched {
+					ignored = true
+					break
+				}
+				if re, err := util.GetRegex(ig); err == nil && re.MatchString(entryName) {
+					ignored = true
+					break
+				}
+			}
+			if ignored {
+				continue
+			}
+
+			// 检查 files_matching 正则
+			if opts.FilesMatching != "" {
+				re, err := util.GetRegex(opts.FilesMatching)
+				if err != nil {
+					return fmt.Errorf("compile files_matching regex %q: %w", opts.FilesMatching, err)
+				}
+				if !re.MatchString(entryName) {
+					continue
+				}
+			}
+
+			ext := strings.ToLower(filepath.Ext(entryName))
+			if validExts[ext] {
+				files = append(files, fullPath)
+			} else if !opts.IgnoreUnknown && opts.FilesMatching == "" {
+				return fmt.Errorf("unsupported vars file extension: %s", entryName)
 			}
 		}
+		return nil
+	}
+
+	if err := walkDir(dir, 1); err != nil {
+		return nil, err
 	}
 	sort.Strings(files)
 	return files, nil
@@ -648,9 +725,40 @@ func (e *Executor) resolveLookupExpr(expr string, vars map[string]interface{}) (
 	}
 
 	name := fmt.Sprintf("%v", parseFilterLiteral(args[0]))
-	key := fmt.Sprintf("%v", parseFilterLiteral(args[1]))
+	rawKey := strings.TrimSpace(args[1])
+	var key string
+	var keyObj interface{}
+	if strings.Contains(rawKey, "~") {
+		var sb strings.Builder
+		for _, part := range strings.Split(rawKey, "~") {
+			part = strings.TrimSpace(part)
+			if (strings.HasPrefix(part, "'") && strings.HasSuffix(part, "'")) ||
+				(strings.HasPrefix(part, "\"") && strings.HasSuffix(part, "\"")) {
+				sb.WriteString(strings.Trim(part, "\"'"))
+			} else if vars != nil {
+				if v, ok := vars[part]; ok {
+					sb.WriteString(fmt.Sprintf("%v", v))
+				} else {
+					sb.WriteString(part)
+				}
+			} else {
+				sb.WriteString(part)
+			}
+		}
+		key = sb.String()
+		keyObj = key
+	} else {
+		parsedVal := parseFilterLiteral(rawKey)
+		keyObj = parsedVal
+		if s, ok := parsedVal.(string); ok {
+			key = s
+		} else {
+			key = fmt.Sprintf("%v", parsedVal)
+		}
+	}
 	if strings.Contains(key, "{{") {
 		key = e.resolveString(key, vars)
+		keyObj = key
 	}
 
 	var extraArgs []interface{}
@@ -659,7 +767,7 @@ func (e *Executor) resolveLookupExpr(expr string, vars map[string]interface{}) (
 		extraArgs = append(extraArgs, val)
 	}
 
-	allArgs := append([]interface{}{key}, extraArgs...)
+	allArgs := append([]interface{}{keyObj}, extraArgs...)
 	val, err := module.ExecuteLookupWithVars(e.baseDir, name, vars, allArgs...)
 	if err != nil {
 		return nil, false

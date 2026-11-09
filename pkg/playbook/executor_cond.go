@@ -68,6 +68,14 @@ func (e *Executor) evaluateWhen(when interface{}, vars map[string]interface{}) b
 			}
 		}
 		return true
+	case []string:
+		// 字符串切片条件列表，需要全部满足
+		for _, cond := range v {
+			if !e.evaluateWhen(cond, vars) {
+				return false
+			}
+		}
+		return true
 	default:
 		return true
 	}
@@ -119,17 +127,47 @@ func (e *Executor) evaluateComparisonCondition(expr string, vars map[string]inte
 			return !ok || !isTaskResultFailed(val), true
 		}
 	}
+	for _, suffix := range []string{" is changed", " is change"} {
+		if strings.HasSuffix(expr, suffix) {
+			name := strings.TrimSpace(strings.TrimSuffix(expr, suffix))
+			val, ok := e.lookupVarExpr(name, vars)
+			return ok && isTaskResultChanged(val), true
+		}
+	}
+	for _, suffix := range []string{" is not changed", " is not change"} {
+		if strings.HasSuffix(expr, suffix) {
+			name := strings.TrimSpace(strings.TrimSuffix(expr, suffix))
+			val, ok := e.lookupVarExpr(name, vars)
+			return !ok || !isTaskResultChanged(val), true
+		}
+	}
+	if strings.HasSuffix(expr, " is not unreachable") {
+		name := strings.TrimSpace(strings.TrimSuffix(expr, " is not unreachable"))
+		val, ok := e.lookupVarExpr(name, vars)
+		return !ok || !isTaskResultUnreachable(val), true
+	}
 	if strings.HasSuffix(expr, " is unreachable") {
 		name := strings.TrimSpace(strings.TrimSuffix(expr, " is unreachable"))
 		val, ok := e.lookupVarExpr(name, vars)
 		return ok && isTaskResultUnreachable(val), true
+	}
+	if strings.HasSuffix(expr, " is not skipped") {
+		name := strings.TrimSpace(strings.TrimSuffix(expr, " is not skipped"))
+		val, ok := e.lookupVarExpr(name, vars)
+		return !ok || !isTaskResultSkipped(val), true
 	}
 	if strings.HasSuffix(expr, " is skipped") {
 		name := strings.TrimSpace(strings.TrimSuffix(expr, " is skipped"))
 		val, ok := e.lookupVarExpr(name, vars)
 		return ok && isTaskResultSkipped(val), true
 	}
-	if idx := strings.Index(expr, " not in "); idx >= 0 {
+
+	// 支持 Ansible 核心版本比较测试语法: is version / is version_compare
+	if val, ok, handled := e.evaluateVersionCondition(expr, vars); handled {
+		return val, ok
+	}
+
+	if idx := findTopLevelSubstr(expr, " not in "); idx >= 0 {
 		left, leftOK := e.resolveConditionOperand(strings.TrimSpace(expr[:idx]), vars)
 		right, rightOK := e.resolveConditionOperand(strings.TrimSpace(expr[idx+len(" not in "):]), vars)
 		if !leftOK || !rightOK {
@@ -137,7 +175,7 @@ func (e *Executor) evaluateComparisonCondition(expr string, vars map[string]inte
 		}
 		return !conditionContains(right, left), true
 	}
-	if idx := strings.Index(expr, " in "); idx >= 0 {
+	if idx := findTopLevelSubstr(expr, " in "); idx >= 0 {
 		left, leftOK := e.resolveConditionOperand(strings.TrimSpace(expr[:idx]), vars)
 		right, rightOK := e.resolveConditionOperand(strings.TrimSpace(expr[idx+len(" in "):]), vars)
 		if !leftOK || !rightOK {
@@ -146,18 +184,153 @@ func (e *Executor) evaluateComparisonCondition(expr string, vars map[string]inte
 		return conditionContains(right, left), true
 	}
 
-	for _, op := range []string{"==", "!=", ">=", "<=", ">", "<"} {
-		if idx := strings.Index(expr, op); idx >= 0 {
-			left, leftOK := e.resolveConditionOperand(strings.TrimSpace(expr[:idx]), vars)
-			right, rightOK := e.resolveConditionOperand(strings.TrimSpace(expr[idx+len(op):]), vars)
-			if !leftOK || !rightOK {
-				return false, false
-			}
-			return compareConditionValues(left, right, op), true
+	if idx, op := findTopLevelComparison(expr); idx >= 0 {
+		left, leftOK := e.resolveConditionOperand(strings.TrimSpace(expr[:idx]), vars)
+		right, rightOK := e.resolveConditionOperand(strings.TrimSpace(expr[idx+len(op):]), vars)
+		if !leftOK || !rightOK {
+			return false, false
 		}
+		return compareConditionValues(left, right, op), true
 	}
 
 	return false, false
+}
+
+func findTopLevelSubstr(expr, substr string) int {
+	var quote byte
+	parenDepth := 0
+	bracketDepth := 0
+	n := len(expr)
+	subLen := len(substr)
+
+	for i := 0; i <= n-subLen; i++ {
+		ch := expr[i]
+		switch {
+		case quote != 0:
+			if ch == quote {
+				quote = 0
+			}
+		case ch == '\'' || ch == '"':
+			quote = ch
+		case ch == '(':
+			parenDepth++
+		case ch == ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case ch == '[':
+			bracketDepth++
+		case ch == ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case parenDepth == 0 && bracketDepth == 0:
+			if expr[i:i+subLen] == substr {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func findTopLevelComparison(expr string) (int, string) {
+	var quote byte
+	parenDepth := 0
+	bracketDepth := 0
+	n := len(expr)
+
+	for i := 0; i < n; i++ {
+		ch := expr[i]
+		switch {
+		case quote != 0:
+			if ch == quote {
+				quote = 0
+			}
+		case ch == '\'' || ch == '"':
+			quote = ch
+		case ch == '(':
+			parenDepth++
+		case ch == ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case ch == '[':
+			bracketDepth++
+		case ch == ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case parenDepth == 0 && bracketDepth == 0:
+			if i+2 <= n {
+				two := expr[i : i+2]
+				if two == "==" || two == "!=" || two == ">=" || two == "<=" {
+					return i, two
+				}
+			}
+			if ch == '>' || ch == '<' {
+				return i, string(ch)
+			}
+		}
+	}
+	return -1, ""
+}
+
+func parseVersionArgs(params string) []string {
+	parts := strings.Split(params, ",")
+	res := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.Trim(p, "\"'")
+		if p != "" {
+			res = append(res, p)
+		}
+	}
+	return res
+}
+
+func (e *Executor) evaluateVersionCondition(expr string, vars map[string]interface{}) (bool, bool, bool) {
+	patterns := []struct {
+		kw    string
+		isNot bool
+	}{
+		{" is not version_compare(", true},
+		{" is not version(", true},
+		{" is version_compare(", false},
+		{" is version(", false},
+	}
+
+	for _, p := range patterns {
+		idx := findTopLevelSubstr(expr, p.kw)
+		if idx >= 0 && strings.HasSuffix(strings.TrimSpace(expr), ")") {
+			leftExpr := strings.TrimSpace(expr[:idx])
+			rawParams := expr[idx+len(p.kw):]
+			rawParams = strings.TrimSpace(rawParams)
+			rawParams = strings.TrimSuffix(rawParams, ")")
+
+			args := parseVersionArgs(rawParams)
+			if len(args) == 0 {
+				return false, false, true
+			}
+			targetVersion := args[0]
+			op := "=="
+			if len(args) > 1 {
+				op = args[1]
+			}
+
+			val, ok := e.resolveConditionOperand(leftExpr, vars)
+			if !ok {
+				return false, false, true
+			}
+
+			res := util.CompareVersions(fmt.Sprintf("%v", val), targetVersion, op)
+			if p.isNot {
+				res = !res
+			}
+			return res, true, true
+		}
+	}
+
+	return false, false, false
 }
 
 func (e *Executor) resolveConditionOperand(operand string, vars map[string]interface{}) (interface{}, bool) {
@@ -371,6 +544,23 @@ func isTaskResultSkipped(val interface{}) bool {
 		return false
 	case *TaskResult:
 		return m.Skipped
+	default:
+		return false
+	}
+}
+
+func isTaskResultChanged(val interface{}) bool {
+	if val == nil {
+		return false
+	}
+	switch m := val.(type) {
+	case map[string]interface{}:
+		if changed, ok := m["changed"]; ok {
+			return extractBool(changed)
+		}
+		return false
+	case *TaskResult:
+		return m.Changed
 	default:
 		return false
 	}
@@ -1196,7 +1386,7 @@ func (e *Executor) evaluateTernaryOperand(operand string, vars map[string]interf
 }
 
 func stripSurroundingParentheses(s string) string {
-	return module.StripSurroundingParentheses(s)
+	return util.StripSurroundingParentheses(s)
 }
 
 func splitTernary(expr string) (string, string, string, bool) {

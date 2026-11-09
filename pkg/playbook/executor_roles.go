@@ -52,7 +52,13 @@ func (e *Executor) executeIncludedRoleForHost(allHosts []*inventory.Host, host *
 	if err != nil {
 		return err
 	}
-	role, err := e.getOrParseRole(rolePath)
+
+	tasksFrom := strings.TrimSpace(e.resolveString(GetString(task.Params, "tasks_from", ""), vars))
+	varsFrom := strings.TrimSpace(e.resolveString(GetString(task.Params, "vars_from", ""), vars))
+	defaultsFrom := strings.TrimSpace(e.resolveString(GetString(task.Params, "defaults_from", ""), vars))
+	handlersFrom := strings.TrimSpace(e.resolveString(GetString(task.Params, "handlers_from", ""), vars))
+
+	role, err := e.getOrParseRoleWithOpts(rolePath, tasksFrom, varsFrom, defaultsFrom, handlersFrom)
 	if err != nil {
 		return fmt.Errorf("parse included role %q: %w", roleName, err)
 	}
@@ -72,9 +78,14 @@ func (e *Executor) executeIncludedRoleForHost(allHosts []*inventory.Host, host *
 			childVars[k] = e.resolveValue(v, vars)
 		}
 	}
+	childVars["role_path"] = rolePath
+	childVars["role_name"] = role.Name
+	childVars["ansible_role_name"] = roleName
 
 	if len(role.Handlers) > 0 {
-		handlers = append(handlers, role.Handlers...)
+		clonedHandlers := cloneHandlers(role.Handlers)
+		handlers = append(handlers, clonedHandlers...)
+		e.registerPlayHandlers(clonedHandlers)
 	}
 
 	// 递归解析并执行前置依赖角色 (dependencies)
@@ -99,6 +110,7 @@ func (e *Executor) executeIncludedRoleForHost(allHosts []*inventory.Host, host *
 	}
 
 	roleTasks := cloneTasks(role.Tasks)
+	injectRoleContextVars(roleTasks, rolePath, role.Name, roleName)
 	applyParentTaskAttributes(task, roleTasks)
 
 	for _, rt := range roleTasks {
@@ -168,16 +180,91 @@ func (e *Executor) executeIncludedTasksForHost(allHosts []*inventory.Host, host 
 }
 
 func (e *Executor) getOrParseRole(rolePath string) (*Role, error) {
-	if val, ok := e.parsedRoles.Load(rolePath); ok {
+	return e.getOrParseRoleWithOpts(rolePath, "main", "main", "main", "main")
+}
+
+func (e *Executor) getOrParseRoleWithOpts(rolePath, tasksFrom, varsFrom, defaultsFrom, handlersFrom string) (*Role, error) {
+	if tasksFrom == "" {
+		tasksFrom = "main"
+	}
+	if varsFrom == "" {
+		varsFrom = "main"
+	}
+	if defaultsFrom == "" {
+		defaultsFrom = "main"
+	}
+	if handlersFrom == "" {
+		handlersFrom = "main"
+	}
+	cacheKey := rolePath
+	if tasksFrom != "main" || varsFrom != "main" || defaultsFrom != "main" || handlersFrom != "main" {
+		cacheKey = fmt.Sprintf("%s|%s|%s|%s|%s", rolePath, tasksFrom, varsFrom, defaultsFrom, handlersFrom)
+	}
+	if val, ok := e.parsedRoles.Load(cacheKey); ok {
 		return val.(*Role), nil
 	}
 	parser := NewParser(e.baseDir)
-	role, err := parser.ParseRole(rolePath)
+	role, err := parser.ParseRoleWithOptions(rolePath, tasksFrom, varsFrom, defaultsFrom, handlersFrom)
 	if err != nil {
 		return nil, err
 	}
-	actual, _ := e.parsedRoles.LoadOrStore(rolePath, role)
+	actual, _ := e.parsedRoles.LoadOrStore(cacheKey, role)
 	return actual.(*Role), nil
+}
+
+func (e *Executor) registerPlayHandlers(newHandlers []*Handler) {
+	if len(newHandlers) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	existing := make(map[string]bool, len(e.currentPlayHandlers))
+	for _, h := range e.currentPlayHandlers {
+		if h != nil && h.Name != "" {
+			existing[h.Name] = true
+		}
+	}
+	for _, nh := range newHandlers {
+		if nh == nil {
+			continue
+		}
+		if nh.Name != "" && existing[nh.Name] {
+			continue
+		}
+		e.currentPlayHandlers = append(e.currentPlayHandlers, nh)
+		if nh.Name != "" {
+			existing[nh.Name] = true
+		}
+	}
+}
+
+func injectRoleContextVars(tasks []*Task, rolePath, roleShortName, fullRoleName string) {
+	for _, t := range tasks {
+		if t == nil {
+			continue
+		}
+		if t.Vars == nil {
+			t.Vars = make(map[string]interface{}, 3)
+		}
+		if _, exists := t.Vars["role_path"]; !exists {
+			t.Vars["role_path"] = rolePath
+		}
+		if _, exists := t.Vars["role_name"]; !exists {
+			t.Vars["role_name"] = roleShortName
+		}
+		if _, exists := t.Vars["ansible_role_name"]; !exists {
+			t.Vars["ansible_role_name"] = fullRoleName
+		}
+		if len(t.Block) > 0 {
+			injectRoleContextVars(t.Block, rolePath, roleShortName, fullRoleName)
+		}
+		if len(t.Rescue) > 0 {
+			injectRoleContextVars(t.Rescue, rolePath, roleShortName, fullRoleName)
+		}
+		if len(t.Always) > 0 {
+			injectRoleContextVars(t.Always, rolePath, roleShortName, fullRoleName)
+		}
+	}
 }
 
 func (e *Executor) getOrParseInclude(includePath string) ([]*Task, error) {
@@ -296,8 +383,9 @@ func (e *Executor) loadPlayRoles(play *Play) ([]*Task, []*Handler, map[string]in
 			roleVars[k] = v
 		}
 
-		// 3. 追加任务和 Handlers (级联应用 when 条件与 tags)
+		// 3. 追加任务和 Handlers (级联应用 when 条件与 tags，并注入角色上下文变量 role_path / role_name / ansible_role_name)
 		roleTasks := cloneTasks(role.Tasks)
+		injectRoleContextVars(roleTasks, rolePath, role.Name, roleName)
 		for _, rt := range roleTasks {
 			if effectiveWhen != nil {
 				rt.When = combineWhen(effectiveWhen, rt.When)

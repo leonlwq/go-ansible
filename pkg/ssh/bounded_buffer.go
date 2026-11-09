@@ -49,12 +49,8 @@ func (b *BoundedBuffer) String() string {
 	return str
 }
 
-// ReadBoundedOutput reads up to maxBytes from r into string, truncating and background-draining if exceeded.
+// ReadBoundedOutput 从 Reader 中安全读取最多 maxBytes 字节，超出时在后台排空管道并追加截断提示以防御 OOM。
 func ReadBoundedOutput(r io.Reader, maxBytes int64) (string, error) {
-	return readBoundedOutput(r, maxBytes)
-}
-// it stops reading further and appends a truncation notice.
-func readBoundedOutput(r io.Reader, maxBytes int64) (string, error) {
 	if maxBytes <= 0 {
 		maxBytes = MaxCommandOutputBytes
 	}
@@ -71,5 +67,10 @@ func readBoundedOutput(r io.Reader, maxBytes int64) (string, error) {
 		return string(data[:maxBytes]) + "\n...[output truncated: exceeded maximum limit of 16MB]...", nil
 	}
 	return string(data), nil
+}
+
+// readBoundedOutput 保留小写别名以兼容内部历史测试
+func readBoundedOutput(r io.Reader, maxBytes int64) (string, error) {
+	return ReadBoundedOutput(r, maxBytes)
 }
 

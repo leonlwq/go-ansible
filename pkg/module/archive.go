@@ -10,23 +10,25 @@ import (
 type ArchiveModule struct{}
 
 type archiveSpec struct {
-	Paths  []string
-	Dest   string
-	Format string
-	Remove bool
-	Backup bool
-	Mode   string
-	Owner  string
-	Group  string
+	Paths       []string
+	ExcludePath []string
+	Dest        string
+	Format      string
+	Remove      bool
+	Backup      bool
+	Mode        string
+	Owner       string
+	Group       string
 }
 
 func (m *ArchiveModule) Name() string { return "archive" }
 
 func (m *ArchiveModule) Validate(params map[string]interface{}) error {
 	spec := archiveSpec{
-		Paths:  archivePaths(params),
-		Dest:   GetParamString(params, "dest", ""),
-		Format: normalizeArchiveFormat(GetParamString(params, "format", "")),
+		Paths:       archivePaths(params),
+		ExcludePath: archiveExcludePaths(params),
+		Dest:        GetParamString(params, "dest", ""),
+		Format:      normalizeArchiveFormat(GetParamString(params, "format", "")),
 	}
 	if len(spec.Paths) == 0 {
 		return fmt.Errorf("archive module requires path")
@@ -40,14 +42,15 @@ func (m *ArchiveModule) Validate(params map[string]interface{}) error {
 
 func (m *ArchiveModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
 	spec := archiveSpec{
-		Paths:  archivePaths(params),
-		Dest:   GetParamString(params, "dest", ""),
-		Format: normalizeArchiveFormat(GetParamString(params, "format", "")),
-		Remove: GetParamBool(params, "remove", false),
-		Backup: GetParamBool(params, "backup", false),
-		Mode:   GetParamMode(params, "mode", ""),
-		Owner:  GetParamString(params, "owner", ""),
-		Group:  GetParamString(params, "group", ""),
+		Paths:       archivePaths(params),
+		ExcludePath: archiveExcludePaths(params),
+		Dest:        GetParamString(params, "dest", ""),
+		Format:      normalizeArchiveFormat(GetParamString(params, "format", "")),
+		Remove:      GetParamBool(params, "remove", false),
+		Backup:      GetParamBool(params, "backup", false),
+		Mode:        GetParamMode(params, "mode", ""),
+		Owner:       GetParamString(params, "owner", ""),
+		Group:       GetParamString(params, "group", ""),
 	}
 
 	if IsCheckMode(params) {
@@ -73,7 +76,58 @@ func (m *ArchiveModule) Execute(client ssh.Connection, params map[string]interfa
 		return result, err
 	}
 	HandleChangedMarker(result)
+	if !result.Changed && (spec.Mode != "" || spec.Owner != "" || spec.Group != "") {
+		permChanged, permErr := CheckOrSetFilePermissions(client, spec.Dest, spec.Mode, spec.Owner, spec.Group, false, false)
+		if permErr != nil {
+			return nil, fmt.Errorf("set archive file permissions: %w", permErr)
+		}
+		if permChanged {
+			result.Changed = true
+			result.Message = "archive permissions updated"
+		}
+	}
 	return result, nil
+}
+
+func archiveExcludePaths(params map[string]interface{}) []string {
+	raw, ok := params["exclude_path"]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s := strings.TrimSpace(fmt.Sprintf("%v", item))
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s := strings.TrimSpace(item)
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		s := strings.TrimSpace(fmt.Sprintf("%v", raw))
+		if s == "" {
+			return nil
+		}
+		parts := strings.Split(s, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
 }
 
 func archivePaths(params map[string]interface{}) []string {
@@ -203,17 +257,30 @@ func createArchiveCommand(spec archiveSpec) (string, error) {
 		paths = append(paths, shellQuote(path))
 	}
 
+	tarExcludes := ""
+	zipExcludes := ""
+	if len(spec.ExcludePath) > 0 {
+		tParts := make([]string, 0, len(spec.ExcludePath))
+		zParts := make([]string, 0, len(spec.ExcludePath))
+		for _, ex := range spec.ExcludePath {
+			tParts = append(tParts, "--exclude="+shellQuote(ex))
+			zParts = append(zParts, shellQuote(ex))
+		}
+		tarExcludes = strings.Join(tParts, " ") + " "
+		zipExcludes = " -x " + strings.Join(zParts, " ")
+	}
+
 	switch spec.Format {
 	case "tar.gz":
-		return fmt.Sprintf("tar -cf - %s | gzip -n > \"$tmp_archive\"", strings.Join(paths, " ")), nil
+		return fmt.Sprintf("tar -cf - %s%s | gzip -n > \"$tmp_archive\"", tarExcludes, strings.Join(paths, " ")), nil
 	case "tar":
-		return fmt.Sprintf("tar -cf \"$tmp_archive\" %s", strings.Join(paths, " ")), nil
+		return fmt.Sprintf("tar -cf \"$tmp_archive\" %s%s", tarExcludes, strings.Join(paths, " ")), nil
 	case "tar.bz2":
-		return fmt.Sprintf("tar -cf - %s | bzip2 -c > \"$tmp_archive\"", strings.Join(paths, " ")), nil
+		return fmt.Sprintf("tar -cf - %s%s | bzip2 -c > \"$tmp_archive\"", tarExcludes, strings.Join(paths, " ")), nil
 	case "tar.xz":
-		return fmt.Sprintf("tar -cf - %s | xz -c > \"$tmp_archive\"", strings.Join(paths, " ")), nil
+		return fmt.Sprintf("tar -cf - %s%s | xz -c > \"$tmp_archive\"", tarExcludes, strings.Join(paths, " ")), nil
 	case "zip":
-		return fmt.Sprintf("zip -qr \"$tmp_archive\" %s", strings.Join(paths, " ")), nil
+		return fmt.Sprintf("zip -qr \"$tmp_archive\" %s%s", strings.Join(paths, " "), zipExcludes), nil
 	default:
 		return "", fmt.Errorf("unsupported archive format: %s", spec.Format)
 	}

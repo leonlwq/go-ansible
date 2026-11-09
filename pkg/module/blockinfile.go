@@ -111,7 +111,7 @@ func (m *BlockinfileModule) Execute(client ssh.Connection, params map[string]int
 
 	if !changed {
 		if exists && (owner != "" || group != "" || mode != "") {
-			permChanged, err := SetFilePermissions(client, path, mode, owner, group, false)
+			permChanged, err := CheckOrSetFilePermissions(client, path, mode, owner, group, false, checkMode)
 			if err != nil {
 				return nil, fmt.Errorf("set file permissions: %w", err)
 			}

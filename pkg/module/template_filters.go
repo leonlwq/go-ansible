@@ -159,10 +159,49 @@ func buildTemplateFuncMap() template.FuncMap {
 		"int":           TemplateInt,
 		"float":         TemplateFloat,
 		"abs":           TemplateAbs,
-		"hash":          TemplateHash,
-		"checksum":      TemplateChecksum,
-		"urlsplit":      TemplateUrlsplit,
+		"hash":            TemplateHash,
+		"checksum":        TemplateChecksum,
+		"urlsplit":        TemplateUrlsplit,
+		"version":         TemplateVersionCompare,
+		"version_compare": TemplateVersionCompare,
 	}
+}
+
+// TemplateVersionCompare 实现 Ansible version 与 version_compare 过滤器
+func TemplateVersionCompare(args ...interface{}) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if len(args) == 1 {
+		return true
+	}
+	var v1, v2, op string
+	if len(args) == 2 {
+		v1 = fmt.Sprintf("%v", args[1])
+		v2 = fmt.Sprintf("%v", args[0])
+		op = "=="
+	} else {
+		a1 := strings.TrimSpace(fmt.Sprintf("%v", args[1]))
+		switch strings.ToLower(a1) {
+		case "==", "!=", ">", ">=", "<", "<=", "=", "eq", "ne", "gt", "ge", "lt", "le":
+			op = a1
+			v2 = fmt.Sprintf("%v", args[0])
+			v1 = fmt.Sprintf("%v", args[2])
+		default:
+			a2 := strings.TrimSpace(fmt.Sprintf("%v", args[2]))
+			switch strings.ToLower(a2) {
+			case "==", "!=", ">", ">=", "<", "<=", "=", "eq", "ne", "gt", "ge", "lt", "le":
+				v1 = fmt.Sprintf("%v", args[0])
+				v2 = fmt.Sprintf("%v", args[1])
+				op = a2
+			default:
+				v1 = fmt.Sprintf("%v", args[len(args)-1])
+				v2 = fmt.Sprintf("%v", args[0])
+				op = fmt.Sprintf("%v", args[1])
+			}
+		}
+	}
+	return util.CompareVersions(v1, v2, op)
 }
 
 func TemplateDefaultValue(args ...interface{}) interface{} {
@@ -1525,9 +1564,208 @@ func ExecuteLookupWithVars(baseDir string, pluginName string, vars map[string]in
 			return "", nil
 		}
 		return strings.TrimRight(string(body), "\r\n"), nil
+	case "vars", "varnames":
+		if vars != nil {
+			if v, ok := vars[key]; ok {
+				return v, nil
+			}
+			if strings.Contains(key, ".") {
+				parts := strings.Split(key, ".")
+				var cur interface{} = vars
+				found := true
+				for _, part := range parts {
+					if m, ok := cur.(map[string]interface{}); ok {
+						if next, exists := m[part]; exists {
+							cur = next
+						} else {
+							found = false
+							break
+						}
+					} else {
+						found = false
+						break
+					}
+				}
+				if found {
+					return cur, nil
+				}
+			}
+		}
+		if len(args) > 1 {
+			return args[1], nil
+		}
+		return nil, fmt.Errorf("variable %q not found in context", key)
+	case "lines":
+		output, err := exec.Command("/bin/sh", "-c", key).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("lookup 'lines' failed to execute %q: %v (%s)", key, err, strings.TrimSpace(string(output)))
+		}
+		trimmed := strings.TrimRight(string(output), "\r\n")
+		if trimmed == "" {
+			return []string{}, nil
+		}
+		return util.SplitLines(trimmed), nil
+	case "sequence":
+		return executeSequenceLookup(key, args)
+	case "random_choice":
+		var candidates []interface{}
+		if len(args) > 1 {
+			candidates = append(candidates, args...)
+		} else {
+			switch v := args[0].(type) {
+			case []interface{}:
+				candidates = append(candidates, v...)
+			case []string:
+				for _, item := range v {
+					candidates = append(candidates, item)
+				}
+			default:
+				strVal := strings.TrimSpace(fmt.Sprintf("%v", v))
+				if vars != nil {
+					if val, ok := vars[strVal]; ok {
+						if list, ok := val.([]interface{}); ok {
+							candidates = append(candidates, list...)
+						} else if list, ok := val.([]string); ok {
+							for _, it := range list {
+								candidates = append(candidates, it)
+							}
+						}
+					}
+				}
+				if len(candidates) == 0 {
+					clean := strings.Trim(strVal, "[]")
+					if strings.Contains(clean, ",") {
+						for _, item := range strings.Split(clean, ",") {
+							if s := strings.Trim(strings.TrimSpace(item), "\"'"); s != "" {
+								candidates = append(candidates, s)
+							}
+						}
+					} else if clean != "" {
+						candidates = append(candidates, clean)
+					}
+				}
+			}
+		}
+		if len(candidates) == 0 {
+			return "", nil
+		}
+		bigN, err := crand.Int(crand.Reader, big.NewInt(int64(len(candidates))))
+		if err != nil {
+			return candidates[0], nil
+		}
+		return candidates[bigN.Int64()], nil
+	case "dict":
+		var targetMap map[string]interface{}
+		switch v := args[0].(type) {
+		case map[string]interface{}:
+			targetMap = v
+		case map[string]string:
+			targetMap = make(map[string]interface{}, len(v))
+			for mk, mv := range v {
+				targetMap[mk] = mv
+			}
+		default:
+			strKey := strings.TrimSpace(fmt.Sprintf("%v", v))
+			if vars != nil {
+				if vm, ok := vars[strKey].(map[string]interface{}); ok {
+					targetMap = vm
+				} else if vm, ok := vars[strKey].(map[string]string); ok {
+					targetMap = make(map[string]interface{}, len(vm))
+					for mk, mv := range vm {
+						targetMap[mk] = mv
+					}
+				}
+			}
+			if targetMap == nil && strings.HasPrefix(strKey, "{") {
+				var parsed map[string]interface{}
+				if err := json.Unmarshal([]byte(strKey), &parsed); err == nil {
+					targetMap = parsed
+				}
+			}
+		}
+		if targetMap == nil {
+			return []map[string]interface{}{}, nil
+		}
+		keys := make([]string, 0, len(targetMap))
+		for k := range targetMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		result := make([]map[string]interface{}, 0, len(keys))
+		for _, k := range keys {
+			result = append(result, map[string]interface{}{
+				"key":   k,
+				"value": targetMap[k],
+			})
+		}
+		return result, nil
 	default:
 		return key, nil
 	}
+}
+
+func executeSequenceLookup(key string, args []interface{}) ([]string, error) {
+	full := key
+	for _, a := range args[1:] {
+		full += " " + fmt.Sprintf("%v", a)
+	}
+	pairs := strings.Fields(full)
+	var (
+		start  = 1
+		end    = -1
+		count  = -1
+		stride = 1
+		format = "%d"
+	)
+
+	for _, p := range pairs {
+		if strings.Contains(p, "=") {
+			kv := strings.SplitN(p, "=", 2)
+			k := strings.ToLower(strings.TrimSpace(kv[0]))
+			v := strings.TrimSpace(kv[1])
+			switch k {
+			case "start":
+				if s, err := strconv.Atoi(v); err == nil {
+					start = s
+				}
+			case "end":
+				if e, err := strconv.Atoi(v); err == nil {
+					end = e
+				}
+			case "count":
+				if c, err := strconv.Atoi(v); err == nil {
+					count = c
+				}
+			case "stride":
+				if st, err := strconv.Atoi(v); err == nil && st != 0 {
+					stride = st
+				}
+			case "format":
+				format = v
+			}
+		} else if c, err := strconv.Atoi(p); err == nil && count == -1 && end == -1 {
+			count = c
+		}
+	}
+
+	if count > 0 && end == -1 {
+		end = start + (count-1)*stride
+	}
+	if end == -1 {
+		end = start
+	}
+
+	var result []string
+	if stride > 0 {
+		for i := start; i <= end; i += stride {
+			result = append(result, fmt.Sprintf(format, i))
+		}
+	} else if stride < 0 {
+		for i := start; i >= end; i += stride {
+			result = append(result, fmt.Sprintf(format, i))
+		}
+	}
+	return result, nil
 }
 
 // TemplateLookup 实现了与 Playbook 表达式一致的 lookup 插件函数，可在 Jinja2 模板与表达式中无缝调用

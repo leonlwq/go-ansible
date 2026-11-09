@@ -12,14 +12,20 @@ import (
 type URIModule struct{}
 
 type uriSpec struct {
-	URL           string
-	Method        string
-	Headers       map[string]string
-	Body          string
-	StatusCodes   []int
-	Timeout       int
-	ReturnContent bool
-	ValidateCerts bool
+	URL            string
+	Method         string
+	Headers        map[string]string
+	Body           string
+	StatusCodes    []int
+	Timeout        int
+	ReturnContent  bool
+	ValidateCerts  bool
+	URLUsername    string
+	URLPassword    string
+	ForceBasicAuth bool
+	ClientCert     string
+	ClientKey      string
+	BodyFormat     string
 }
 
 func (m *URIModule) Name() string { return "uri" }
@@ -106,6 +112,9 @@ func newURISpec(params map[string]interface{}) (uriSpec, error) {
 		method = "GET"
 	}
 
+	bodyFormat := strings.ToLower(strings.TrimSpace(GetParamString(params, "body_format", "")))
+	headers := ParseHeadersParam(params["headers"])
+
 	var body string
 	if bVal, ok := params["body"]; ok && bVal != nil {
 		switch bv := bVal.(type) {
@@ -123,41 +132,43 @@ func newURISpec(params map[string]interface{}) (uriSpec, error) {
 			body = fmt.Sprintf("%v", bv)
 		}
 	}
+	if bodyFormat == "json" {
+		if body != "" && !strings.HasPrefix(strings.TrimSpace(body), "{") && !strings.HasPrefix(strings.TrimSpace(body), "[") {
+			if jsonBytes, err := json.Marshal(body); err == nil {
+				body = string(jsonBytes)
+			}
+		}
+		hasContentType := false
+		for k := range headers {
+			if strings.EqualFold(k, "Content-Type") {
+				hasContentType = true
+				break
+			}
+		}
+		if !hasContentType {
+			headers["Content-Type"] = "application/json"
+		}
+	}
 	if method == "GET" && body != "" {
 		method = "POST"
 	}
 
 	return uriSpec{
-		URL:           strings.TrimSpace(GetParamString(params, "url", "")),
-		Method:        method,
-		Headers:       parseURIHeaders(params["headers"]),
-		Body:          body,
-		StatusCodes:   statusCodes,
-		Timeout:       timeout,
-		ReturnContent: GetParamBool(params, "return_content", false),
-		ValidateCerts: getOptionalBool(params, "validate_certs", true),
+		URL:            strings.TrimSpace(GetParamString(params, "url", "")),
+		Method:         method,
+		Headers:        headers,
+		Body:           body,
+		StatusCodes:    statusCodes,
+		Timeout:        timeout,
+		ReturnContent:  GetParamBool(params, "return_content", false),
+		ValidateCerts:  getOptionalBool(params, "validate_certs", true),
+		URLUsername:    GetParamString(params, "url_username", ""),
+		URLPassword:    GetParamString(params, "url_password", ""),
+		ForceBasicAuth: GetParamBool(params, "force_basic_auth", false),
+		ClientCert:     GetParamString(params, "client_cert", ""),
+		ClientKey:      GetParamString(params, "client_key", ""),
+		BodyFormat:     bodyFormat,
 	}, nil
-}
-
-func parseURIHeaders(value interface{}) map[string]string {
-	headers := map[string]string{}
-	switch v := value.(type) {
-	case map[string]string:
-		for key, val := range v {
-			key = strings.TrimSpace(key)
-			if key != "" {
-				headers[key] = val
-			}
-		}
-	case map[string]interface{}:
-		for key, val := range v {
-			key = strings.TrimSpace(key)
-			if key != "" {
-				headers[key] = fmt.Sprintf("%v", val)
-			}
-		}
-	}
-	return headers
 }
 
 func parseURIStatusCodes(value interface{}) ([]int, error) {
@@ -229,6 +240,22 @@ func buildURICommand(spec uriSpec) string {
 	}
 	if !spec.ValidateCerts {
 		args = append(args, "-k")
+	}
+	if spec.ClientCert != "" {
+		args = append(args, "--cert", shellQuote(spec.ClientCert))
+	}
+	if spec.ClientKey != "" {
+		args = append(args, "--key", shellQuote(spec.ClientKey))
+	}
+	if spec.URLUsername != "" {
+		auth := spec.URLUsername
+		if spec.URLPassword != "" {
+			auth += ":" + spec.URLPassword
+		}
+		if spec.ForceBasicAuth {
+			args = append(args, "--basic")
+		}
+		args = append(args, "-u", shellQuote(auth))
 	}
 	for key, value := range spec.Headers {
 		args = append(args, "-H", shellQuote(fmt.Sprintf("%s: %s", key, value)))

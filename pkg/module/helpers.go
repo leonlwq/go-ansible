@@ -399,11 +399,44 @@ func safeParamQuote(val string) string {
 	return val
 }
 
+// ResolvePreserveFileMode 根据源文件探测并解析待保留的八进制权限字符串（如 0644、0755）
+func ResolvePreserveFileMode(client ssh.Connection, src string, remoteSrc bool) string {
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return ""
+	}
+	if remoteSrc {
+		if client != nil {
+			statCmd := fmt.Sprintf("stat -c '%%a' %s 2>/dev/null || stat -f '%%Lp' %s 2>/dev/null", shellQuote(src), shellQuote(src))
+			if res, err := client.Execute(statCmd); err == nil && res != nil && res.ExitCode == 0 {
+				m := strings.TrimSpace(res.Stdout)
+				if m != "" {
+					return m
+				}
+			}
+		}
+		return ""
+	}
+	if fi, err := os.Stat(src); err == nil {
+		return fmt.Sprintf("%04o", fi.Mode().Perm())
+	}
+	return ""
+}
+
 // SetFilePermissions 统一对远程文件/目录应用 mode、owner、group 权限与属组设置，
 // 自动转义路径，支持递归 (-R)，支持仅指定 group（通过 chgrp），
 // 并具备幂等探测（非递归模式下预检当前权限属组，已一致时免执行 chmod/chown），返回是否有变更和错误。
 func SetFilePermissions(client ssh.Connection, path, mode, owner, group string, recurse bool) (bool, error) {
-	if client == nil || path == "" {
+	return CheckOrSetFilePermissions(client, path, mode, owner, group, recurse, false)
+}
+
+// CheckOrSetFilePermissions 检查或设置远程文件/目录的 mode、owner、group 权限与属组。
+// 当 checkMode 为 true 时，仅通过只读 stat 探测远端当前权限并计算是否需要变更，绝不执行写操作。
+func CheckOrSetFilePermissions(client ssh.Connection, path, mode, owner, group string, recurse, checkMode bool) (bool, error) {
+	if mode == "preserve" {
+		mode = ""
+	}
+	if client == nil || path == "" || (mode == "" && owner == "" && group == "") {
 		return false, nil
 	}
 	changed := false
@@ -440,6 +473,10 @@ func SetFilePermissions(client ssh.Connection, path, mode, owner, group string, 
 				}
 			}
 		}
+	}
+
+	if checkMode {
+		return needChmod || needChown || needChgrp, nil
 	}
 
 	if needChmod {
@@ -534,12 +571,40 @@ func GetOptionalBoolParam(params map[string]interface{}, key string) (bool, bool
 	}
 }
 
-// 兼容包内小写调用的内部别名
-func mergeModuleResults(base, next *Result, changed bool) *Result {
-	return MergeModuleResults(base, next, changed)
-}
-
-func getOptionalBoolParam(params map[string]interface{}, key string) (bool, bool) {
-	return GetOptionalBoolParam(params, key)
+// ParseHeadersParam 统一解析 HTTP 请求头参数，兼容 map[string]interface{}、map[string]string 与按行切分的 Header: Value 字符串。
+func ParseHeadersParam(value interface{}) map[string]string {
+	if value == nil {
+		return map[string]string{}
+	}
+	result := make(map[string]string)
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for k, item := range v {
+			k = strings.TrimSpace(k)
+			if k != "" {
+				result[k] = fmt.Sprintf("%v", item)
+			}
+		}
+	case map[string]string:
+		for k, item := range v {
+			k = strings.TrimSpace(k)
+			if k != "" {
+				result[k] = item
+			}
+		}
+	case string:
+		lines := strings.Split(v, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if idx := strings.Index(line, ":"); idx != -1 {
+				k := strings.TrimSpace(line[:idx])
+				val := strings.TrimSpace(line[idx+1:])
+				if k != "" {
+					result[k] = val
+				}
+			}
+		}
+	}
+	return result
 }
 

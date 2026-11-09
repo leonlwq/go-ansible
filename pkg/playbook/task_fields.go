@@ -36,6 +36,7 @@ var reservedTaskFields = map[string]struct{}{
 	"no_log":             {},
 	"delegate_to":        {},
 	"delegate_facts":     {},
+	"action":             {},
 	"local_action":       {},
 	"run_once":           {},
 	"tags":               {},
@@ -56,6 +57,7 @@ var reservedTaskFields = map[string]struct{}{
 
 var reservedHandlerFields = map[string]struct{}{
 	"name":               {},
+	"action":             {},
 	"listen":             {},
 	"notify":             {},
 	"loop":               {},

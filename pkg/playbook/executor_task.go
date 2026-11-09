@@ -232,9 +232,64 @@ func handlerMatchesName(handler *Handler, name string) bool {
 	return false
 }
 
+func (e *Executor) handlerMatchesResolved(handler *Handler, rawName, resolvedName string, vars map[string]interface{}) bool {
+	if handler == nil {
+		return false
+	}
+	if handlerMatchesName(handler, rawName) || handlerMatchesName(handler, resolvedName) {
+		return true
+	}
+	if vars != nil {
+		if strings.Contains(handler.Name, "{{") {
+			rName := strings.TrimSpace(e.resolveString(handler.Name, vars))
+			if rName == rawName || rName == resolvedName {
+				return true
+			}
+		}
+		if strings.Contains(handler.Listen, "{{") {
+			rListen := strings.TrimSpace(e.resolveString(handler.Listen, vars))
+			if rListen == rawName || rListen == resolvedName {
+				return true
+			}
+		}
+		for _, l := range handler.Listens {
+			if strings.Contains(l, "{{") {
+				rL := strings.TrimSpace(e.resolveString(l, vars))
+				if rL == rawName || rL == resolvedName {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // notifyHandlers 通知 handlers
 func (e *Executor) notifyHandlers(notify interface{}, host *inventory.Host, vars map[string]interface{}, env map[string]string, handlers []*Handler) {
-	if handlers == nil || len(handlers) == 0 {
+	e.mu.RLock()
+	playHandlers := e.currentPlayHandlers
+	e.mu.RUnlock()
+
+	allHandlers := handlers
+	if len(playHandlers) > 0 {
+		seen := make(map[*Handler]bool, len(handlers)+len(playHandlers))
+		combined := make([]*Handler, 0, len(handlers)+len(playHandlers))
+		for _, h := range handlers {
+			if h != nil && !seen[h] {
+				seen[h] = true
+				combined = append(combined, h)
+			}
+		}
+		for _, h := range playHandlers {
+			if h != nil && !seen[h] {
+				seen[h] = true
+				combined = append(combined, h)
+			}
+		}
+		allHandlers = combined
+	}
+
+	if len(allHandlers) == 0 {
 		return
 	}
 
@@ -254,11 +309,16 @@ func (e *Executor) notifyHandlers(notify interface{}, host *inventory.Host, vars
 		return
 	}
 
-	// 查找匹配的 handler (支持 Name 精确匹配与 Listen 广播一对多匹配)
+	// 查找匹配的 handler (支持 Name 精确匹配与 Listen 广播一对多匹配，支持 Jinja2 模板动态解析)
 	queuedThisTime := make(map[string]bool)
-	for _, name := range handlerNames {
-		for _, handler := range handlers {
-			if handlerMatchesName(handler, name) {
+	for _, rawName := range handlerNames {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		resolvedName := strings.TrimSpace(e.resolveString(name, vars))
+		for _, handler := range allHandlers {
+			if e.handlerMatchesResolved(handler, name, resolvedName, vars) {
 				queueKey := fmt.Sprintf("%s-%s", handler.Name, host.Name)
 				if queuedThisTime[queueKey] {
 					continue
@@ -495,13 +555,16 @@ func (e *Executor) executeBlockTaskForHost(allHosts []*inventory.Host, host *inv
 
 	beforeBlock := hostResult.TaskCount()
 	var blockErr error
+	var failedBlockTask *Task
 	for _, blockTask := range blockTasks {
 		childVars := e.taskVarsForHost(host, vars)
 		if err := e.executeTaskEntryForHost(allHosts, host, blockTask, childVars, handlers, runOnce, playEnv, hostResult); err != nil {
 			blockErr = err
+			failedBlockTask = blockTask
 			break
 		}
 		if hostResultHasFailure(hostResult, beforeBlock) {
+			failedBlockTask = blockTask
 			break
 		}
 	}
@@ -525,9 +588,13 @@ func (e *Executor) executeBlockTaskForHost(allHosts []*inventory.Host, host *inv
 			tr := tasksSnapshot[i]
 			if tr.Failed {
 				failedTaskName = tr.Name
+				mergeMap(failedResult, tr.Data)
+				failedResult["failed"] = true
 				failedResult["msg"] = tr.Message
 				failedResult["stdout"] = tr.Stdout
 				failedResult["stderr"] = tr.Stderr
+				failedResult["stdout_lines"] = splitLines(tr.Stdout)
+				failedResult["stderr_lines"] = splitLines(tr.Stderr)
 				failedResult["rc"] = tr.ExitCode
 				failedResult["changed"] = tr.Changed
 				break
@@ -544,6 +611,14 @@ func (e *Executor) executeBlockTaskForHost(allHosts []*inventory.Host, host *inv
 		failedTaskMap := map[string]interface{}{
 			"name": failedTaskName,
 		}
+		if failedBlockTask != nil {
+			if failedTaskName == "" {
+				failedTaskMap["name"] = e.resolveString(failedBlockTask.Name, vars)
+			}
+			failedTaskMap["action"] = failedBlockTask.ModuleName
+			failedTaskMap["module"] = failedBlockTask.ModuleName
+			failedTaskMap["args"] = e.resolveVariables(failedBlockTask.Params, vars)
+		}
 		rescueVars["ansible_failed_task"] = failedTaskMap
 		rescueVars["ansible_failed_result"] = failedResult
 
@@ -555,6 +630,7 @@ func (e *Executor) executeBlockTaskForHost(allHosts []*inventory.Host, host *inv
 			e.facts[host.Name]["ansible_failed_task"] = failedTaskMap
 			e.facts[host.Name]["ansible_failed_result"] = failedResult
 			e.mu.Unlock()
+			e.invalidateHostVarsCache(host.Name)
 		}
 
 		var rescueErr error
@@ -611,6 +687,16 @@ func applyParentTaskAttributes(parent *Task, tasks []*Task) {
 		return
 	}
 
+	if parent.Params != nil {
+		if applyRaw, ok := parent.Params["apply"]; ok && applyRaw != nil {
+			if applyMap := extractInterfaceMap(applyRaw); len(applyMap) > 0 {
+				applyHolder := &Task{}
+				extractTaskCommonFields(applyMap, applyHolder)
+				applyParentTaskAttributes(applyHolder, tasks)
+			}
+		}
+	}
+
 	for _, task := range tasks {
 		task.Tags = mergeTags(parent.Tags, task.Tags)
 		task.Vars = mergeTaskVars(parent.Vars, task.Vars)
@@ -623,6 +709,15 @@ func applyParentTaskAttributes(parent *Task, tasks []*Task) {
 		}
 		if parent.BecomeUser != "" && task.BecomeUser == "" {
 			task.BecomeUser = parent.BecomeUser
+		}
+		if parent.BecomeMethod != "" && task.BecomeMethod == "" {
+			task.BecomeMethod = parent.BecomeMethod
+		}
+		if parent.BecomePass != "" && task.BecomePass == "" {
+			task.BecomePass = parent.BecomePass
+		}
+		if parent.IgnoreError && !task.IgnoreError {
+			task.IgnoreError = true
 		}
 		if parent.IgnoreUnreachable && !task.IgnoreUnreachable {
 			task.IgnoreUnreachable = true
@@ -720,11 +815,19 @@ func combineWhen(parentWhen, childWhen interface{}) interface{} {
 	result := make([]interface{}, 0, 2)
 	if parentList, ok := parentWhen.([]interface{}); ok {
 		result = append(result, parentList...)
+	} else if strList, ok := parentWhen.([]string); ok {
+		for _, s := range strList {
+			result = append(result, s)
+		}
 	} else {
 		result = append(result, parentWhen)
 	}
 	if childList, ok := childWhen.([]interface{}); ok {
 		result = append(result, childList...)
+	} else if strList, ok := childWhen.([]string); ok {
+		for _, s := range strList {
+			result = append(result, s)
+		}
 	} else {
 		result = append(result, childWhen)
 	}
@@ -829,65 +932,18 @@ func (e *Executor) executeTask(host *inventory.Host, task *Task, vars map[string
 	return e.executeTaskWithEnv(host, task, vars, handlers, nil)
 }
 
-func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map[string]interface{}, handlers []*Handler, playEnv map[string]string) ([]*TaskResult, error) {
-	// Copy-on-Write (COW): 当任务无专属 task.Vars 且无 extraVars 时，直接复用上游变量字典，彻底消除每任务全量深拷贝
-	allVars := vars
-	if task != nil && len(task.Vars) > 0 {
-		e.mu.RLock()
-		hasExtraVars := len(e.extraVars) > 0
-		extraCount := len(task.Vars)
-		if hasExtraVars {
-			extraCount += len(e.extraVars)
-		}
-		e.mu.RUnlock()
-
-		allVars = make(map[string]interface{}, len(vars)+extraCount)
-		for k, v := range vars {
-			allVars[k] = v
-		}
-
-		resolvedTaskVars := e.resolveVariables(task.Vars, allVars)
-		for k, v := range resolvedTaskVars {
-			allVars[k] = v
-		}
-
-		if hasExtraVars {
-			e.mu.RLock()
-			for k, v := range e.extraVars {
-				allVars[k] = v
-			}
-			e.mu.RUnlock()
-		}
+func (e *Executor) setupTaskExecutionHost(baseHost *inventory.Host, task *Task, vars map[string]interface{}) (inventory.Host, string, error) {
+	execHost := *baseHost
+	execHost.Variables = make(map[string]string, len(baseHost.Variables))
+	for k, v := range baseHost.Variables {
+		execHost.Variables[k] = v
 	}
-	combinedEnv := make(map[string]string)
-	for k, v := range playEnv {
-		combinedEnv[k] = v
-	}
-	if task != nil && len(task.Environment) > 0 {
-		for k, v := range task.Environment {
-			combinedEnv[k] = v
-		}
-	}
-	resolvedEnv := e.resolveEnvironment(combinedEnv, allVars)
 
-	e.log("Executing task: %s on host: %s", task.Name, host.Name)
-	e.log("Task tags: %v, Filter tags: %v", task.Tags, e.tags)
-
-	execHost := *host
-	var delegateHost *inventory.Host
-	if task.DelegateTo != "" {
-		var err error
-		delegateHost, _, err = e.resolveDelegateHost(task.DelegateTo, allVars)
+	factTargetHost := baseHost.Name
+	if task != nil && task.DelegateTo != "" {
+		delegateHost, _, err := e.resolveDelegateHost(task.DelegateTo, vars)
 		if err != nil {
-			result := &TaskResult{
-				Name:    e.resolveString(task.Name, allVars),
-				Host:    host.Name,
-				Failed:  true,
-				Message: err.Error(),
-				Start:   time.Now(),
-				End:     time.Now(),
-			}
-			return []*TaskResult{result}, nil
+			return execHost, factTargetHost, err
 		}
 		if delegateHost != nil {
 			execHost = *delegateHost
@@ -896,7 +952,7 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 				execHost.Variables[k] = v
 			}
 			// 继承目标委派主机在 hostvars 中的连接变量
-			if hostvarsRaw, ok := allVars["hostvars"]; ok {
+			if hostvarsRaw, ok := vars["hostvars"]; ok {
 				switch hv := hostvarsRaw.(type) {
 				case map[string]map[string]interface{}:
 					if dVars, ok := hv[delegateHost.Name]; ok {
@@ -919,34 +975,105 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 				}
 			}
 			// 继承当前任务显式声明的 ansible_* 连接覆盖变量
-			if task != nil && len(task.Vars) > 0 {
+			if len(task.Vars) > 0 {
 				for k, v := range task.Vars {
 					if strings.HasPrefix(k, "ansible_") {
 						inventory.ApplyHostVariable(&execHost, k, fmt.Sprintf("%v", v))
 					}
 				}
 			}
+			if task.DelegateFacts {
+				factTargetHost = delegateHost.Name
+			}
 		}
 	}
 
-	factTargetHost := host.Name
-	if task.DelegateTo != "" && task.DelegateFacts && delegateHost != nil {
-		factTargetHost = delegateHost.Name
+	if task != nil {
+		if task.Become != nil {
+			execHost.Become = *task.Become
+		}
+		if task.BecomeUser != "" {
+			execHost.Become = true
+			execHost.BecomeUser = task.BecomeUser
+		}
+		if task.BecomeMethod != "" {
+			execHost.Become = true
+			execHost.BecomeMethod = task.BecomeMethod
+		}
+		if task.BecomePass != "" {
+			execHost.Become = true
+			execHost.BecomePass = task.BecomePass
+		}
 	}
-	if task.Become != nil {
-		execHost.Become = *task.Become
+
+	return execHost, factTargetHost, nil
+}
+
+func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map[string]interface{}, handlers []*Handler, playEnv map[string]string) ([]*TaskResult, error) {
+	// Copy-on-Write (COW): 当任务无专属 task.Vars 且无 extraVars 且无 CheckMode/Diff 覆盖时，直接复用上游变量字典，彻底消除每任务全量深拷贝
+	allVars := vars
+	needsClone := task != nil && (len(task.Vars) > 0 || task.CheckMode != nil || task.Diff != nil)
+	if needsClone {
+		e.mu.RLock()
+		hasExtraVars := len(e.extraVars) > 0
+		extraCount := len(task.Vars) + 2
+		if hasExtraVars {
+			extraCount += len(e.extraVars)
+		}
+		e.mu.RUnlock()
+
+		allVars = make(map[string]interface{}, len(vars)+extraCount)
+		for k, v := range vars {
+			allVars[k] = v
+		}
+
+		if len(task.Vars) > 0 {
+			resolvedTaskVars := e.resolveVariables(task.Vars, allVars)
+			for k, v := range resolvedTaskVars {
+				allVars[k] = v
+			}
+		}
+
+		if hasExtraVars {
+			e.mu.RLock()
+			for k, v := range e.extraVars {
+				allVars[k] = v
+			}
+			e.mu.RUnlock()
+		}
+
+		if task.CheckMode != nil {
+			allVars["ansible_check_mode"] = e.isTaskCheckMode(task)
+		}
+		if task.Diff != nil {
+			allVars["ansible_diff_mode"] = e.isTaskDiffMode(task)
+		}
 	}
-	if task.BecomeUser != "" {
-		execHost.Become = true
-		execHost.BecomeUser = task.BecomeUser
+	combinedEnv := make(map[string]string)
+	for k, v := range playEnv {
+		combinedEnv[k] = v
 	}
-	if task.BecomeMethod != "" {
-		execHost.Become = true
-		execHost.BecomeMethod = task.BecomeMethod
+	if task != nil && len(task.Environment) > 0 {
+		for k, v := range task.Environment {
+			combinedEnv[k] = v
+		}
 	}
-	if task.BecomePass != "" {
-		execHost.Become = true
-		execHost.BecomePass = task.BecomePass
+	resolvedEnv := e.resolveEnvironment(combinedEnv, allVars)
+
+	e.log("Executing task: %s on host: %s", task.Name, host.Name)
+	e.log("Task tags: %v, Filter tags: %v", task.Tags, e.tags)
+
+	execHost, factTargetHost, err := e.setupTaskExecutionHost(host, task, allVars)
+	if err != nil {
+		result := &TaskResult{
+			Name:    e.resolveString(task.Name, allVars),
+			Host:    host.Name,
+			Failed:  true,
+			Message: err.Error(),
+			Start:   time.Now(),
+			End:     time.Now(),
+		}
+		return []*TaskResult{result}, nil
 	}
 
 	result := &TaskResult{
@@ -1010,6 +1137,28 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 			}
 			loopVars["ansible_loop"] = buildAnsibleLoopContext(index, items)
 
+			// 动态委派支持：若任务声明了 delegate_to，在每个循环项内根据 loopVars 动态重新解析目标主机
+			iterExecHost := execHost
+			iterFactTargetHost := factTargetHost
+			if task.DelegateTo != "" {
+				h, factH, err := e.setupTaskExecutionHost(host, task, loopVars)
+				if err != nil {
+					itemResult := &TaskResult{
+						Name:    e.resolveString(task.Name, loopVars),
+						Host:    host.Name,
+						Start:   time.Now(),
+						End:     time.Now(),
+						Failed:  true,
+						Message: err.Error(),
+						Item:    resolvedItem,
+					}
+					results = append(results, itemResult)
+					continue
+				}
+				iterExecHost = h
+				iterFactTargetHost = factH
+			}
+
 			// 创建单个 item 的结果
 			displayItem := resolvedItem
 			if task.LoopControl.Label != "" {
@@ -1017,7 +1166,7 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 			}
 			itemResult := &TaskResult{
 				Name:    e.resolveString(task.Name, loopVars),
-				Host:    host.Name,
+				Host:    iterExecHost.Name,
 				Start:   time.Now(),
 				Changed: false,
 				Failed:  false,
@@ -1044,7 +1193,7 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 					moduleName = task.ModuleName
 				}
 
-				e.applyBecomeParams(params, execHost)
+				e.applyBecomeParams(params, iterExecHost)
 				params = e.withEnvironmentParams(params, resolvedEnv, moduleName)
 
 				if task.NoLog {
@@ -1052,7 +1201,7 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 				} else {
 					e.log("Resolved params: %+v", params)
 				}
-				modResult, err := e.executeTaskModule(&execHost, moduleName, params, task, loopVars, localAction)
+				modResult, err := e.executeTaskModule(&iterExecHost, moduleName, params, task, loopVars, localAction)
 				e.applyExecutionOutcome(itemResult, task, modResult, err)
 
 				if modResult != nil {
@@ -1069,7 +1218,7 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 					itemResult.Data = modResult.Data
 					if modResult.Data != nil {
 						if facts, ok := modResult.Data["ansible_facts"].(map[string]interface{}); ok {
-							e.mergeAnsibleFacts(factTargetHost, facts)
+							e.mergeAnsibleFacts(iterFactTargetHost, facts)
 						}
 					}
 				}
@@ -1077,7 +1226,7 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 				e.applyNoLogMask(itemResult, task)
 
 				if e.shouldTriggerDebugger(task, itemResult) {
-					action := e.runDebugger(&execHost, task, itemResult, loopVars)
+					action := e.runDebugger(&iterExecHost, task, itemResult, loopVars)
 					if action == DebuggerRedo {
 						itemResult.Failed = false
 						itemResult.Changed = false
@@ -1098,7 +1247,7 @@ func (e *Executor) executeTaskWithEnv(host *inventory.Host, task *Task, vars map
 
 			// notify handlers if changed
 			if task.Notify != nil && itemResult.Changed {
-				e.notifyHandlers(task.Notify, &execHost, loopVars, resolvedEnv, handlers)
+				e.notifyHandlers(task.Notify, &iterExecHost, loopVars, resolvedEnv, handlers)
 			}
 
 			itemResult.End = time.Now()
@@ -1198,22 +1347,48 @@ func (e *Executor) executeTaskModule(host *inventory.Host, moduleName string, pa
 			params["vars"] = vars
 		}
 	}
-	if (moduleName == "template" || moduleName == "copy") && e.baseDir != "" {
+	if moduleName == "template" || moduleName == "copy" {
 		if src, ok := params["src"].(string); ok && src != "" && !filepath.IsAbs(src) {
 			if !module.GetParamBool(params, "remote_src", false) {
-				candidate := filepath.Join(e.baseDir, src)
-				if _, err := os.Stat(candidate); err == nil {
-					params["src"] = candidate
-				} else if moduleName == "template" {
-					tmplCandidate := filepath.Join(e.baseDir, "templates", src)
-					if _, err := os.Stat(tmplCandidate); err == nil {
-						params["src"] = tmplCandidate
+				resolvedSrc := ""
+				if rolePath, ok := vars["role_path"].(string); ok && rolePath != "" {
+					var roleCandidates []string
+					if moduleName == "template" {
+						roleCandidates = []string{
+							filepath.Join(rolePath, "templates", src),
+							filepath.Join(rolePath, src),
+						}
+					} else {
+						roleCandidates = []string{
+							filepath.Join(rolePath, "files", src),
+							filepath.Join(rolePath, src),
+						}
 					}
-				} else if moduleName == "copy" {
-					fileCandidate := filepath.Join(e.baseDir, "files", src)
-					if _, err := os.Stat(fileCandidate); err == nil {
-						params["src"] = fileCandidate
+					for _, rc := range roleCandidates {
+						if _, err := os.Stat(rc); err == nil {
+							resolvedSrc = rc
+							break
+						}
 					}
+				}
+				if resolvedSrc == "" && e.baseDir != "" {
+					candidate := filepath.Join(e.baseDir, src)
+					if _, err := os.Stat(candidate); err == nil {
+						resolvedSrc = candidate
+					} else if moduleName == "template" {
+						tmplCandidate := filepath.Join(e.baseDir, "templates", src)
+						if _, err := os.Stat(tmplCandidate); err == nil {
+							resolvedSrc = tmplCandidate
+						}
+					} else if moduleName == "copy" {
+						fileCandidate := filepath.Join(e.baseDir, "files", src)
+						if _, err := os.Stat(fileCandidate); err == nil {
+							resolvedSrc = fileCandidate
+						}
+					}
+				}
+				if resolvedSrc != "" {
+					params["src"] = resolvedSrc
 				}
 			}
 		}
@@ -2201,24 +2376,27 @@ func (e *Executor) applyNoLogMask(result *TaskResult, task *Task) {
 	e.maskNoLog(result, task.NoLog)
 }
 
+func newLocalHost(inv *inventory.Inventory) *inventory.Host {
+	if inv != nil {
+		if h, err := inv.GetHost("localhost"); err == nil && h != nil {
+			return h
+		}
+	}
+	return &inventory.Host{
+		Name:       "localhost",
+		Address:    "localhost",
+		Connection: "local",
+		Variables:  make(map[string]string),
+	}
+}
+
 func (e *Executor) resolveDelegateHost(delegateTo string, vars map[string]interface{}) (*inventory.Host, bool, error) {
 	resolved := strings.TrimSpace(e.resolveString(delegateTo, vars))
 	if resolved == "" {
 		return nil, false, fmt.Errorf("delegate_to resolved to empty host")
 	}
 	if isLocalDelegate(resolved, nil) {
-		localHost := &inventory.Host{
-			Name:       "localhost",
-			Address:    "localhost",
-			Connection: "local",
-			Variables:  make(map[string]string),
-		}
-		if e.inventory != nil {
-			if h, err := e.inventory.GetHost("localhost"); err == nil && h != nil {
-				localHost = h
-			}
-		}
-		return localHost, true, nil
+		return newLocalHost(e.inventory), true, nil
 	}
 
 	if e.inventory != nil {

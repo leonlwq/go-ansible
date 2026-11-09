@@ -16,7 +16,8 @@ type ReplaceModule struct{}
 func (m *ReplaceModule) Name() string { return "replace" }
 
 func (m *ReplaceModule) Validate(params map[string]interface{}) error {
-	if GetParamString(params, "path", "") == "" {
+	path := GetParamString(params, "path", GetParamString(params, "dest", GetParamString(params, "destfile", GetParamString(params, "name", ""))))
+	if path == "" {
 		return fmt.Errorf("replace module requires path")
 	}
 	regexpText := GetParamString(params, "regexp", "")
@@ -49,7 +50,7 @@ func (m *ReplaceModule) Validate(params map[string]interface{}) error {
 }
 
 func (m *ReplaceModule) Execute(client ssh.Connection, params map[string]interface{}) (*Result, error) {
-	path := GetParamString(params, "path", "")
+	path := GetParamString(params, "path", GetParamString(params, "dest", GetParamString(params, "destfile", GetParamString(params, "name", ""))))
 	pattern := GetParamString(params, "regexp", "")
 	searchString := GetParamString(params, "search_string", "")
 	replacement := GetParamString(params, "replace", "")
@@ -59,6 +60,9 @@ func (m *ReplaceModule) Execute(client ssh.Connection, params map[string]interfa
 	newline := GetParamString(params, "newline", "")
 	backup := GetParamBool(params, "backup", false)
 	validate := GetParamString(params, "validate", "")
+	owner := GetParamString(params, "owner", "")
+	group := GetParamString(params, "group", "")
+	mode := GetParamMode(params, "mode", "")
 	checkMode := IsCheckMode(params)
 	diffMode := IsDiffMode(params)
 
@@ -85,6 +89,32 @@ func (m *ReplaceModule) Execute(client ssh.Connection, params map[string]interfa
 	}
 	after = applyNewlineMode(after, newline)
 	if after == before {
+		if owner != "" || group != "" || mode != "" {
+			permChanged, err := CheckOrSetFilePermissions(client, path, mode, owner, group, false, checkMode)
+			if err != nil {
+				return nil, fmt.Errorf("set file permissions: %w", err)
+			}
+			if permChanged {
+				msg := "file permissions updated"
+				if checkMode {
+					msg = "check mode: file permissions would be updated"
+				}
+				return &Result{
+					Changed: true,
+					Message: msg,
+					Data: map[string]interface{}{
+						"path":     path,
+						"matched":  false,
+						"count":    0,
+						"action":   "permissions",
+						"encoding": normalizedEncoding,
+						"newline":  normalizeNewlineMode(newline),
+						"before":   before,
+						"after":    after,
+					},
+				}, nil
+			}
+		}
 		return &Result{
 			Changed: false,
 			Message: "content already in desired state",
@@ -153,6 +183,11 @@ func (m *ReplaceModule) Execute(client ssh.Connection, params map[string]interfa
 	result, err := writeRemoteEncodedContent(client, path, after, normalizedEncoding)
 	if err != nil {
 		return result, err
+	}
+	if owner != "" || group != "" || mode != "" {
+		if _, err := SetFilePermissions(client, path, mode, owner, group, false); err != nil {
+			return nil, fmt.Errorf("set file permissions: %w", err)
+		}
 	}
 	result.Changed = true
 	result.Message = "content replaced successfully"

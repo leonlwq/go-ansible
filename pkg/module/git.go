@@ -22,6 +22,7 @@ type gitSpec struct {
 	AcceptHostKey bool
 	Depth         int
 	SingleBranch  bool
+	Recursive     bool
 }
 
 func (m *GitModule) Name() string { return "git" }
@@ -54,9 +55,18 @@ func (m *GitModule) Execute(client ssh.Connection, params map[string]interface{}
 		AcceptHostKey: GetParamBool(params, "accept_hostkey", false),
 		Depth:         GetParamInt(params, "depth", 0),
 		SingleBranch:  GetParamBool(params, "single_branch", false),
+		Recursive:     GetParamBool(params, "recursive", true),
 	}
 
-	cmd, err := buildGitCommand(spec)
+	var (
+		cmd string
+		err error
+	)
+	if IsCheckMode(params) {
+		cmd, err = buildGitCheckCommand(spec)
+	} else {
+		cmd, err = buildGitCommand(spec)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +77,111 @@ func (m *GitModule) Execute(client ssh.Connection, params map[string]interface{}
 	}
 
 	HandleChangedMarker(result)
+	parseGitRevisions(result)
 	return result, nil
+}
+
+const (
+	gitBeforePrefix = "__go_ansible_git_before__="
+	gitAfterPrefix  = "__go_ansible_git_after__="
+)
+
+func parseGitRevisions(result *Result) {
+	if result == nil {
+		return
+	}
+	var (
+		before   string
+		after    string
+		hasRevs  bool
+		keptLine []string
+	)
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, gitBeforePrefix) {
+			before = strings.TrimPrefix(trimmed, gitBeforePrefix)
+			hasRevs = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, gitAfterPrefix) {
+			after = strings.TrimPrefix(trimmed, gitAfterPrefix)
+			hasRevs = true
+			continue
+		}
+		keptLine = append(keptLine, line)
+	}
+	if hasRevs {
+		result.Stdout = strings.TrimSpace(strings.Join(keptLine, "\n"))
+		if result.Data == nil {
+			result.Data = make(map[string]interface{})
+		}
+		result.Data["before"] = before
+		result.Data["after"] = after
+	}
+}
+
+func buildGitCheckCommand(spec gitSpec) (string, error) {
+	if spec.Dest == "" {
+		return "", fmt.Errorf("git module requires dest")
+	}
+	if spec.State != "absent" && spec.Repo == "" {
+		return "", fmt.Errorf("git module requires repo")
+	}
+	lines := []string{"set -e"}
+	if envLine := buildGitSSHEnv(spec); envLine != "" {
+		lines = append(lines, envLine)
+	}
+	quotedDest := shellQuote(spec.Dest)
+	if spec.State == "absent" {
+		lines = append(lines, fmt.Sprintf(`if [ ! -e %[1]s ]; then
+  echo %[2]s
+else
+  before_rev="$(git -C %[1]s rev-parse HEAD 2>/dev/null || true)"
+  echo "%[4]s$before_rev"
+  echo "%[5]s"
+  echo %[3]s
+fi`, quotedDest, changeMarkerFalse, changeMarkerTrue, gitBeforePrefix, gitAfterPrefix))
+		return strings.Join(lines, "\n"), nil
+	}
+
+	quotedRepo := shellQuote(spec.Repo)
+	targetVer := spec.Version
+	if targetVer == "" {
+		targetVer = "HEAD"
+	}
+	quotedVer := shellQuote(targetVer)
+
+	lines = append(lines, fmt.Sprintf(`if [ ! -d %[1]s/.git ]; then
+  if [ "%[5]t" != "true" ]; then
+    echo %[2]s
+    exit 0
+  fi
+  remote_rev="$(git ls-remote %[4]s %[6]s 2>/dev/null | head -n 1 | awk '{print $1}' || true)"
+  echo "%[7]s"
+  echo "%[8]s$remote_rev"
+  echo %[3]s
+  exit 0
+fi
+before_rev="$(git -C %[1]s rev-parse HEAD 2>/dev/null || true)"
+if [ "%[9]t" != "true" ]; then
+  echo "%[7]s$before_rev"
+  echo "%[8]s$before_rev"
+  echo %[2]s
+  exit 0
+fi
+remote_rev="$(git ls-remote %[4]s %[6]s 2>/dev/null | head -n 1 | awk '{print $1}' || true)"
+if [ -z "$remote_rev" ]; then
+  remote_rev="$(git -C %[1]s rev-parse %[6]s 2>/dev/null || echo "$before_rev")"
+fi
+echo "%[7]s$before_rev"
+echo "%[8]s$remote_rev"
+if [ -n "$remote_rev" ] && [ "$before_rev" != "$remote_rev" ]; then
+  echo %[3]s
+else
+  echo %[2]s
+fi`, quotedDest, changeMarkerFalse, changeMarkerTrue, quotedRepo, spec.Clone, quotedVer, gitBeforePrefix, gitAfterPrefix, spec.Update))
+
+	return strings.Join(lines, "\n"), nil
 }
 
 func normalizeGitState(state string) string {
@@ -134,6 +248,9 @@ func buildGitPresentScript(spec gitSpec) string {
 	if spec.SingleBranch {
 		cloneArgs = append(cloneArgs, "--single-branch")
 	}
+	if spec.Recursive {
+		cloneArgs = append(cloneArgs, "--recursive")
+	}
 	if spec.Version != "" && spec.Version != "HEAD" && !looksLikeCommit(spec.Version) {
 		cloneArgs = append(cloneArgs, "--branch", spec.Version)
 	}
@@ -155,6 +272,12 @@ func buildGitPresentScript(spec gitSpec) string {
     git -C %[1]s fetch --all --tags --prune >/dev/null 2>&1 || git -C %[1]s fetch --all --tags --prune
     git -C %[1]s checkout -q %[3]s
   fi
+  if [ "%[13]t" = "true" ] && [ -f %[1]s/.gitmodules ]; then
+    git -C %[1]s submodule update --init --recursive >/dev/null 2>&1 || git -C %[1]s submodule update --init --recursive
+  fi
+  after_rev="$(git -C %[1]s rev-parse HEAD 2>/dev/null || true)"
+  echo "__go_ansible_git_before__="
+  echo "__go_ansible_git_after__=$after_rev"
   echo %[7]s
   exit 0
 fi
@@ -162,9 +285,13 @@ fi
 origin_url="$(git -C %[1]s config --get remote.origin.url || true)"
 if [ -n "$origin_url" ] && [ "$origin_url" != %[4]s ]; then
   if [ "%[8]t" = "true" ]; then
+    before_rev="$(git -C %[1]s rev-parse HEAD 2>/dev/null || true)"
     rm -rf %[1]s
     mkdir -p "$(dirname %[1]s)"
     %[6]s
+    after_rev="$(git -C %[1]s rev-parse HEAD 2>/dev/null || true)"
+    echo "__go_ansible_git_before__=$before_rev"
+    echo "__go_ansible_git_after__=$after_rev"
     echo %[7]s
     exit 0
   fi
@@ -173,6 +300,10 @@ if [ -n "$origin_url" ] && [ "$origin_url" != %[4]s ]; then
 fi
 
 before_rev="$(git -C %[1]s rev-parse HEAD 2>/dev/null || true)"
+if [ "%[8]t" = "true" ]; then
+  git -C %[1]s reset --hard HEAD >/dev/null 2>&1 || true
+  git -C %[1]s clean -fd >/dev/null 2>&1 || true
+fi
 if [ "%[9]t" = "true" ]; then
   git -C %[1]s fetch --all --tags --prune >/dev/null 2>&1 || git -C %[1]s fetch --all --tags --prune
 fi
@@ -195,12 +326,18 @@ elif [ "%[9]t" = "true" ]; then
   fi
 fi
 
+if [ "%[13]t" = "true" ] && [ -f %[1]s/.gitmodules ]; then
+  git -C %[1]s submodule update --init --recursive >/dev/null 2>&1 || git -C %[1]s submodule update --init --recursive
+fi
+
 after_rev="$(git -C %[1]s rev-parse HEAD 2>/dev/null || true)"
+echo "__go_ansible_git_before__=$before_rev"
+echo "__go_ansible_git_after__=$after_rev"
 if [ "$before_rev" = "$after_rev" ]; then
   echo %[2]s
 else
   echo %[7]s
-fi`, quotedDest, changeMarkerFalse, quotedVersion, quotedRepo, spec.Clone, buildShellCommand(cloneArgs), changeMarkerTrue, spec.Force, spec.Update, quotedLocalRef, quotedRemoteRef, quotedOriginBranch)
+fi`, quotedDest, changeMarkerFalse, quotedVersion, quotedRepo, spec.Clone, buildShellCommand(cloneArgs), changeMarkerTrue, spec.Force, spec.Update, quotedLocalRef, quotedRemoteRef, quotedOriginBranch, spec.Recursive)
 
 	return script
 }

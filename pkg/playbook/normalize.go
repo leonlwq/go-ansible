@@ -190,13 +190,42 @@ func normalizeTask(raw rawTask) (*Task, error) {
 			task.Module = map[string]interface{}{"block": raw["block"]}
 			return task, nil
 		}
-		if task.LocalAction == "" {
+		if rawAction, ok := raw["action"]; ok && rawAction != nil {
+			moduleName, params, err = parseActionValue(rawAction)
+			if err != nil {
+				return nil, err
+			}
+		} else if rawLocalAction, ok := raw["local_action"]; ok && rawLocalAction != nil {
+			moduleName, params, err = parseActionValue(rawLocalAction)
+			if err != nil {
+				return nil, err
+			}
+			if task.LocalAction == "" {
+				if s, ok := rawLocalAction.(string); ok {
+					task.LocalAction = s
+				} else {
+					task.LocalAction = moduleName
+				}
+			}
+			if task.DelegateTo == "" {
+				task.DelegateTo = "localhost"
+			}
+		} else if task.LocalAction != "" {
+			moduleName, params, err = parseActionValue(task.LocalAction)
+			if err != nil {
+				return nil, err
+			}
+		} else {
 			return nil, err
 		}
+	}
 
-		moduleName, params, err = parseInlineAction(task.LocalAction)
-		if err != nil {
-			return nil, err
+	// 支持 task / handler 级别的 args: 语法糖，将 args 字典中的参数合并到 params 中
+	if rawArgs, ok := raw["args"]; ok {
+		if argsMap := extractInterfaceMap(rawArgs); argsMap != nil {
+			for k, val := range argsMap {
+				params[k] = val
+			}
 		}
 	}
 
@@ -262,29 +291,110 @@ func normalizeHandler(raw rawTask) (*Handler, error) {
 
 	moduleName, params, err := extractModule(raw, reservedHandlerFields)
 	if err != nil {
-		return nil, err
+		if rawAction, ok := raw["action"]; ok && rawAction != nil {
+			moduleName, params, err = parseActionValue(rawAction)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	// 支持 handler 级别的 args: 语法糖
+	if rawArgs, ok := raw["args"]; ok {
+		if argsMap := extractInterfaceMap(rawArgs); argsMap != nil {
+			for k, val := range argsMap {
+				params[k] = val
+			}
+		}
 	}
 
 	handler.ModuleName = moduleName
-	handler.Module = map[string]interface{}{moduleName: raw[moduleName]}
+	if rawVal, ok := raw[moduleName]; ok {
+		handler.Module = map[string]interface{}{moduleName: rawVal}
+	} else {
+		handler.Module = map[string]interface{}{moduleName: params}
+	}
 	handler.Params = params
 	return handler, nil
+}
+
+func parseActionValue(v interface{}) (string, map[string]interface{}, error) {
+	switch val := v.(type) {
+	case string:
+		return parseInlineAction(val)
+	case map[string]interface{}:
+		return parseDictAction(val)
+	case rawTask:
+		return parseDictAction(map[string]interface{}(val))
+	default:
+		return "", nil, fmt.Errorf("invalid action format: %T", v)
+	}
+}
+
+func parseDictAction(m map[string]interface{}) (string, map[string]interface{}, error) {
+	var moduleName string
+	if mod, ok := m["module"].(string); ok && strings.TrimSpace(mod) != "" {
+		moduleName = strings.TrimSpace(mod)
+	}
+	if moduleName == "" {
+		if len(m) == 1 {
+			for k, v := range m {
+				moduleName = k
+				params := make(map[string]interface{})
+				if subMap, ok := v.(map[string]interface{}); ok {
+					for sk, sv := range subMap {
+						params[sk] = sv
+					}
+				} else if s, ok := v.(string); ok {
+					params["_raw_params"] = s
+				} else if v != nil {
+					params["_raw_params"] = fmt.Sprintf("%v", v)
+				}
+				return normalizeModuleName(moduleName), params, nil
+			}
+		}
+		return "", nil, fmt.Errorf("action dict requires 'module' key: %v", m)
+	}
+	moduleName = normalizeModuleName(moduleName)
+	params := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		if k == "module" {
+			continue
+		}
+		params[k] = v
+	}
+	return moduleName, params, nil
 }
 
 func parseInlineAction(action string) (string, map[string]interface{}, error) {
 	parts := strings.Fields(strings.TrimSpace(action))
 	if len(parts) == 0 {
-		return "", nil, fmt.Errorf("local_action is empty")
+		return "", nil, fmt.Errorf("action is empty")
 	}
 
-	moduleName := parts[0]
+	var moduleName string
+	var remaining []string
+
+	if strings.HasPrefix(parts[0], "module=") {
+		moduleName = strings.TrimPrefix(parts[0], "module=")
+		remaining = parts[1:]
+	} else if strings.Contains(parts[0], "=") {
+		return "", nil, fmt.Errorf("action missing module name: %s", action)
+	} else {
+		moduleName = parts[0]
+		remaining = parts[1:]
+	}
+
+	moduleName = normalizeModuleName(moduleName)
 	params := make(map[string]interface{})
-	if len(parts) == 1 {
+	if len(remaining) == 0 {
 		return moduleName, params, nil
 	}
 
-	rawParams := make([]string, 0, len(parts)-1)
-	for _, part := range parts[1:] {
+	rawParams := make([]string, 0, len(remaining))
+	for _, part := range remaining {
 		if idx := strings.Index(part, "="); idx > 0 {
 			params[part[:idx]] = part[idx+1:]
 			continue
